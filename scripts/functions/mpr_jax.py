@@ -265,7 +265,7 @@ class ParMPR:
     nn: int = 0  
     method: str = struct.field(default="default", pytree_node=False)  
     seed: int = 0
-    initial_state: jnp.ndarray = jnp.array([])
+    initial_state: jnp.ndarray = struct.field(default_factory=lambda: jnp.array([]))
     noise_amp: float = 0.037
     sigma_r: float = 0.0  
     sigma_v: float = 0.0  
