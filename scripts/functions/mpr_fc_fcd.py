@@ -56,46 +56,35 @@ def timer(func):
 def create_sde(par):
     return mpr_jax.MPR_sde.create(par)
 
-@timer
-def simulate_old(sde, g_val):
-    #profiler.start_trace("/tmp/jax_profiler")
-    data = sde.run({"G": g_val})
-    #profiler.stop_trace()
-    rv_t = data["rv_t"]
-    rv_d = data["rv_d"]
-    nn = sde.P.nn#.shape[0]  # assuming sde.par exists
-    r = rv_d[:, :nn]
-    v = rv_d[:, nn:]
-    bold_d = data["bold_d"]
-    bold_t = data["bold_t"]
-    return rv_t, r, v, bold_t, bold_d
-
-
-
 #@jax.jit
-def simulate(sde, g_val, nn):#, key
-    data = sde.run({"G": g_val})#, key=key  # Modify run() to accept key
+#@timer
+def simulate(sde, g_val, nn, seed):
+    # Generate a JAX PRNG key from the scalar seed
+    key = jax.random.PRNGKey(seed)
+    
+    # run with functional PRNG key
+    data = sde.run({"G": g_val, "seed": seed})  # modify run to accept seed
     rv_t = data["rv_t"]
     rv_d = data["rv_d"]
-    #nn = sde.P.nn
     r = rv_d[:, :nn]
     v = rv_d[:, nn:]
     bold_d = data["bold_d"]
     bold_t = data["bold_t"]
-    return (rv_t, r, v, bold_t, bold_d)#, key
+    return (rv_t, r, v, bold_t, bold_d)
 
+@timer
+def batched_simulate(sde, g_vals, nn, seed):
+    # Generate N different seeds for N runs
+    seeds = jnp.arange(seed, seed + len(g_vals))
+    
+    def single_sim(inputs):
+        g, s = inputs
+        return simulate(sde, g, nn, s)
+    
+    # vmap over (g_vals, seeds)
+    results = jax.vmap(single_sim)((g_vals, seeds))
+    return results
 
-def batched_simulate(sde, g_vals, nn):#, key
-    keys = jax.random.split(key, len(g_vals))
-
-    # Define a mapped function over g and key
-    def single_sim(g):#, k
-        return simulate(sde, g, nn)#, k
-
-    # vmap over (g_vals, keys)
-    results = jax.vmap(single_sim)(g_vals)#, keys
-
-    return results#, new_keys
 
 
 
@@ -215,9 +204,6 @@ if __name__ == "__main__":
         logging.info("Calling plot_fc_fcd function")
         plot_fc_fcd(rv_t, r, bold_t, bold_d, FC, FCD, g_val, results_path, sim_filename)
         
-        
-
-
 
     if args.do_simulation:
         sde = create_sde(params)
@@ -225,11 +211,14 @@ if __name__ == "__main__":
         # to simulate for multiple than one G value is convenient to keep use the loop 
         g_vals = jnp.array([0.0,0.5,0.7])  
         #g_vals = jnp.array([g_val])
+        #g_vals = jnp.arange(10)/11
 
         key = sde.key  # initial key
+        seed = sde.P.seed
         nn = int(sde.P.nn)
-        results = batched_simulate(sde, g_vals, nn)#, key
+        results = batched_simulate(sde, g_vals, nn, seed)
         rv_t_all, r_all, v_all, bold_t_all, bold_d_all = results
+        logging.info(f't_end = {sde.key}')
         logging.info(f"Simulation done!")
 
         for i, g in enumerate(g_vals):

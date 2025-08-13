@@ -419,7 +419,8 @@ class MPR_sde:
         key, new_key = jax.random.split(self.key)
         new_self = self.replace(P=P, key=new_key)
 
-        return integrate_jitted(nn, 
+        #result= , 
+        return integrate_jitted(nn,
                          new_self.P, 
                          self.B, 
                          #method=heun_sde, 
@@ -429,6 +430,7 @@ class MPR_sde:
                          nt=nt,
                          rv_decimate=rv_decimate,
                          bold_decimate=bold_decimate)
+        #return new_self, result
 
 
 #@jax.jit(static_argnames=["nn"])
