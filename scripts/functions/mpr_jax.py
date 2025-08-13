@@ -1,20 +1,17 @@
-# Implemented by: Abolfazl Ziaeemehr
-# Original code comes from Virtual Brain inference (VBI) package
-# https://github.com/ins-amu/vbi
-# Date: 2025-01-01
-
 import warnings
 import jax 
 import jax.numpy as jnp
 from dataclasses import dataclass
 from flax import struct
 from functools import partial
+import time
 
 import numpy as np
 
 
 # is P is a static argument, use @partial(jit, static_argnames=["P"])
-#@partial(jax.jit, static_argnames=["nn", "method", "output"])
+#@partial(jax.jit, static_argnames=["nn"])
+#@jax.jit
 def f_mpr(x, t, P, nn): #, nn, method, output
     """
     MPR model
@@ -40,6 +37,8 @@ def f_mpr(x, t, P, nn): #, nn, method, output
     )
 
     dxdt = jnp.concatenate([dx0, dx1])
+    dxdt = jnp.clip(dxdt, -10.0, 10.0)
+    #dxdt = 50.0 * jnp.tanh(dxdt/50.0)
     return dxdt
 
 
@@ -52,6 +51,12 @@ def heun_sde(x, t, P, key, nn):
     dt = P.dt
 
     key_r, key_v = jax.random.split(key)
+
+    #keys_r = jax.random.split(key_r, nn)
+    #keys_v = jax.random.split(key_v, nn)    
+
+    #dW_r = P.sigma_r * jax.vmap(lambda k: jax.random.normal(k, shape=()))(keys_r) #jax.random.normal(key_r, shape=(nn,))
+    #dW_v = P.sigma_v * jax.vmap(lambda k: jax.random.normal(k, shape=()))(keys_v) #jax.random.normal(key_v, shape=(nn,))
 
     dW_r = P.sigma_r * jax.random.normal(key_r, shape=(nn,))
     dW_v = P.sigma_v * jax.random.normal(key_v, shape=(nn,))
@@ -112,7 +117,7 @@ def do_bold_step(r_in, s, f, ftilde, vtilde, qtilde, v, q, dtt, P):
     return s1, f1, ftilde1, vtilde1, qtilde1, v1, q1
 
 
-def integrate(nn, P, B, method, key, record_rv, record_bold, nt, rv_decimate, bold_decimate):
+def integrate(nn, P, B, key, record_rv, record_bold, nt, rv_decimate, bold_decimate):
     """
     Simulates neural dynamics + BOLD using the Montbrió + Balloon-Windkessel model, in JAX.
 
@@ -151,13 +156,15 @@ def integrate(nn, P, B, method, key, record_rv, record_bold, nt, rv_decimate, bo
     v = jnp.ones(nn)
     q = jnp.ones(nn)
 
-    #if RECORD_RV:
-    if record_rv:
-        rv_d = jnp.zeros((nt // rv_decimate, 2 * nn), dtype=jnp.float32)
-        rv_t = jnp.zeros((nt // rv_decimate,), dtype=jnp.float32)
-    else:
-        rv_d = jnp.zeros((1, 2 * nn))
-        rv_t = jnp.zeros((1,))
+    rv_d = jnp.zeros((nt // rv_decimate, 2 * nn), dtype=jnp.float32)
+    rv_t = jnp.zeros((nt // rv_decimate,), dtype=jnp.float32)
+
+    rv_d, rv_t = jax.lax.cond(
+        record_rv,
+        lambda _: (rv_d, rv_t),
+        lambda _: (rv_d.at[1:].set(0), rv_t.at[1:].set(0)),  # same shape, just zeroed or masked
+        operand=None
+    )
 
     #if RECORD_BOLD:
     if record_bold:
@@ -175,51 +182,67 @@ def integrate(nn, P, B, method, key, record_rv, record_bold, nt, rv_decimate, bo
 
         t_current = i * dt
         key, subkey = jax.random.split(key)
-        rv_current = method(rv_current, t_current, P, subkey, nn)
+        rv_current = heun_sde(rv_current, t_current, P, subkey, nn)
 
-        def save_rv(i, rv_current, rv_d, rv_t):
-            idx = i // rv_decimate
-            rv_d = rv_d.at[idx].set(rv_current)
-            rv_t = rv_t.at[idx].set(i * dt)
-            return rv_d, rv_t
-
-        #if RECORD_RV:
-        if record_rv:
+        # ----- Record RV if record_rv=True -----
+        def save_rv_step(carry):
+            rv_d, rv_t = carry
             do_record_rv = (i % rv_decimate == 0)
-            rv_d, rv_t = jax.lax.cond(
-                do_record_rv,
-                lambda carry: save_rv(i, rv_current, *carry),
-                lambda carry: carry,
-                (rv_d, rv_t)
-            )
 
+            def save_fn(carry):
+                rv_d, rv_t = carry
+                idx = i // rv_decimate
+                rv_d = rv_d.at[idx].set(rv_current)
+                rv_t = rv_t.at[idx].set(i * dt)
+                return rv_d, rv_t
 
-        def save_bold(i, v, q, vv, qq):
-            idx = i // bold_decimate
-            vv = vv.at[idx].set(v)
-            qq = qq.at[idx].set(q)
-            return vv, qq
+            return jax.lax.cond(do_record_rv, save_fn, lambda x: x, (rv_d, rv_t))
 
-        #if RECORD_BOLD:
-        if record_bold:
+        def skip_rv_step(carry):
+            return carry
+
+        rv_d, rv_t = jax.lax.cond(
+            record_rv,
+            save_rv_step,
+            skip_rv_step,
+            (rv_d, rv_t)
+        )
+
+        # ----- Record BOLD if record_bold=True -----
+        def save_bold_step(carry):
+            s, f, ftilde, vtilde, qtilde, v, q, vv, qq = carry
             s, f, ftilde, vtilde, qtilde, v, q = do_bold_step(
                 rv_current[:nn], s, f, ftilde, vtilde, qtilde, v, q, dtt, B
             )
             do_record_bold = (i % bold_decimate == 0)
-            vv, qq = jax.lax.cond(
-                do_record_bold,
-                lambda carry: save_bold(i, v, q, *carry),
-                lambda carry: carry,
-                (vv, qq)
-            )
 
+            def save_fn(carry):
+                s, f, ftilde, vtilde, qtilde, v, q, vv, qq = carry
+                idx = i // bold_decimate
+                vv = vv.at[idx].set(v)
+                qq = qq.at[idx].set(q)
+                return s, f, ftilde, vtilde, qtilde, v, q, vv, qq
 
+            return jax.lax.cond(do_record_bold, save_fn, lambda x: x, (s, f, ftilde, vtilde, qtilde, v, q, vv, qq))
 
-        new_carry = (
-            rv_current, s, f, ftilde, vtilde, qtilde, v, q,
-            rv_d, rv_t, vv, qq, key
+        def skip_bold_step(carry):
+            return carry
+
+        s, f, ftilde, vtilde, qtilde, v, q, vv, qq = jax.lax.cond(
+            record_bold,
+            save_bold_step,
+            skip_bold_step,
+            (s, f, ftilde, vtilde, qtilde, v, q, vv, qq)
         )
-        return new_carry, None
+
+        return (
+            (rv_current, s, f, ftilde, vtilde, qtilde, v, q,
+            rv_d, rv_t, vv, qq, key),
+            jnp.array(0, dtype=jnp.int32)  # dummy per-step output
+        )
+
+
+    #print("rv_current shape before scan:", rv_current.shape)
 
     init_carry = (
         rv_current, s, f, ftilde, vtilde, qtilde, v, q,
@@ -248,7 +271,10 @@ def integrate(nn, P, B, method, key, record_rv, record_bold, nt, rv_decimate, bo
         "bold_d": bold_d.astype(jnp.float32),
     }
 
-integrate = jax.jit(integrate, static_argnames=["nn","method", "record_rv", "record_bold", "nt", "rv_decimate", "bold_decimate"])
+#integrate = jax.jit(integrate, static_argnames=["nn","method", "record_rv", "record_bold", "nt", "rv_decimate", "bold_decimate"])
+#integrate = partial(integrate, method=heun_sde)
+integrate_jitted = jax.jit(integrate, static_argnames=["nn",  "record_bold", "nt", "rv_decimate", "bold_decimate"])
+
 
 @struct.dataclass
 class ParMPR:
@@ -264,7 +290,7 @@ class ParMPR:
     t_end: float = 1000.0
     nn: int = 0  
     method: str = struct.field(default="default", pytree_node=False)  
-    seed: int = 0
+    seed: int = 42
     initial_state: jnp.ndarray = struct.field(default_factory=lambda: jnp.array([]))
     noise_amp: float = 0.037
     sigma_r: float = 0.0  
@@ -284,7 +310,7 @@ class ParMPR:
         noise_amp = kwargs.get("noise_amp", 0.037)
         sigma_r = jnp.sqrt(dt) * jnp.sqrt(2 * noise_amp)
         sigma_v = jnp.sqrt(dt) * jnp.sqrt(4 * noise_amp)
-        nn = weights.shape[0]
+        nn = int(weights.shape[0])
 
         return cls(
             sigma_r=sigma_r,
@@ -334,13 +360,18 @@ class MPR_sde:
             par_mpr["weights"] = weights
 
         P = ParMPR.create(**par_mpr)
+        if hasattr(P, "nn"):
+            P = P.replace(nn=int(P.nn))
         B = ParBold()
         key = jax.random.PRNGKey(P.seed)
         return MPR_sde(P=P, B=B, key=key)
-
+    
     def with_initial_state(self) -> "MPR_sde":
         key, subkey = jax.random.split(self.key)
-        init_state = set_initial_state(self.P.nn, subkey)
+        nn = self.P.nn
+        if isinstance(nn, jnp.ndarray):
+            nn = int(nn.item())
+        init_state = set_initial_state(nn, subkey)
         return self.replace(initial_state=init_state, INITIAL_STATE_SET=True, key=key)
 
     def check_input(self):
@@ -385,12 +416,14 @@ class MPR_sde:
         rv_decimate = new_self.P.rv_decimate 
         r_period = new_self.P.dt * rv_decimate
         bold_decimate = int(jnp.round(new_self.P.tr / r_period))
+        key, new_key = jax.random.split(self.key)
+        new_self = self.replace(P=P, key=new_key)
 
-        return integrate(nn, 
+        return integrate_jitted(nn, 
                          new_self.P, 
                          self.B, 
-                         method=heun_sde, 
-                         key=key, 
+                         #method=heun_sde, 
+                         key=new_self.key, 
                          record_rv=new_self.P.RECORD_RV, 
                          record_bold=new_self.P.RECORD_BOLD,
                          nt=nt,
@@ -398,8 +431,7 @@ class MPR_sde:
                          bold_decimate=bold_decimate)
 
 
-
-#@jax.jit
+#@jax.jit(static_argnames=["nn"])
 def set_initial_state(nn, key):
 
     key_r, key_v = jax.random.split(key)
