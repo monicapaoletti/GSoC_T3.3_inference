@@ -206,8 +206,9 @@ def integrate(P, B):
                 ) 
                 #optionally record the v and q for BOLD signal (downsampled)
                 if (i % bold_decimate) == 0:
-                    vv[i // bold_decimate] = v[1]
-                    qq[i // bold_decimate] = q[1]
+                    if i // bold_decimate < vv.shape[0]:
+                        vv[i // bold_decimate] = v[1]
+                        qq[i // bold_decimate] = q[1]
 
         if RECORD_BOLD:
             bold_d = vo * (k1 * (1 - qq) + k2 * (1 - qq / vv) + k3 * (1 - vv))
