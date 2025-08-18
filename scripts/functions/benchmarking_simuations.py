@@ -1,3 +1,6 @@
+"""
+run multiple simulations from the mpr model both in JAX and in NUMBA in order to do benchmarking both on CPUs and GPUs
+"""
 import time
 import jax.numpy as jnp
 import jax

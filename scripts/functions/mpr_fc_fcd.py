@@ -1,5 +1,5 @@
 """
-simulate the mpr model and store the output
+simulate the mpr model, calculate FC and FCD, store the output and, optionally, plot it (e.g. to reproduce fig S1 of the paper)
 """
 import argparse
 import site
