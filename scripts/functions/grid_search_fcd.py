@@ -38,16 +38,16 @@ def grid_search_FCD_vmap(sde, obs_flat, G_values, wwidth, maxNwindows, olap):
     
     Returns:
         KS: array of KS distances for each G
-        best_idx_KS: index of best KS
+        best_idx_KS: index of best G value identified by KS
         best_G_KS: G value with min KS
         KL: array of KL distances for each G
-        best_idx_KL: index of best KL
+        best_idx_KL: index of best G values identified by KL
         best_G_KL: G value with min KL
     """
     
 
     def single_run(G):
-        # Run simulation
+        # Run single simulation
         data = sde.run({"G": G})
         bold_d = data["bold_d"]
         
@@ -62,7 +62,7 @@ def grid_search_FCD_vmap(sde, obs_flat, G_values, wwidth, maxNwindows, olap):
         return jnp.ravel(FCD_sim)  # returns flatteed FCD
 
 
-    # Vectorize over G values
+    # Vectorize the single run over G values (run for all G values)
     FCD_sims_flat = jax.vmap(single_run)(G_values)
 
     # Convert to NumPy for scipy functions

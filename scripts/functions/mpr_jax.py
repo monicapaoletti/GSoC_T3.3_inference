@@ -15,7 +15,7 @@ import numpy as np
 def f_mpr(x, t, P, nn): #, nn, method, output
     """
     MPR model
-    x: state vector at time t split into x0 and x1 (r and v), t time variable, P parameter object strucure
+    x: state vector at time t split into x0 and x1 (r and v), t time variable (time step at which r and v are calculated), P parameter object strucure
 
     """
 
@@ -44,7 +44,7 @@ def f_mpr(x, t, P, nn): #, nn, method, output
 
 def heun_sde(x, t, P, key, nn):
     """
-    heun method, to numerically integrate stochastic differential equations (see paper for the formula)
+    heun method, to numerically integrate stochastic differential equations (see paper on heun methods for SDEs for the formula)
     x: state vector split into x0, x1. t: current time, P paramter vector
     """
     #nn = P.nn
@@ -80,7 +80,7 @@ def heun_sde(x, t, P, key, nn):
 #@jax.jit
 def do_bold_step(r_in, s, f, ftilde, vtilde, qtilde, v, q, dtt, P):
     """balloon windkessel model
-    r_in: averge firing rate form the Montbriò model
+    r_in: averge firing rate form the Montbriò model (mpr)
     s: vasoactive signal (s[0] is current, s[1] is next)
     f: blood inf low
     f_tilde, v_tilde, q_tilde: log transformed versions of f,v,q for numerical stability

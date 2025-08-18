@@ -4,10 +4,13 @@ import datetime
 # Define the root directory of your project
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..','..'))
 
-# Define paths for different sections of the project
+# Define paths for results and data
 RESULTS_ROOT = os.path.join(PROJECT_ROOT, 'results')
 DATA_ROOT = os.path.join(PROJECT_ROOT, 'data')
 
+# call as:
+# import utils
+# results_path = utils.results_folder()
 def results_folder():
     today = datetime.date.today().strftime('%Y-%m-%d') 
     folder = os.path.join(RESULTS_ROOT, today)  

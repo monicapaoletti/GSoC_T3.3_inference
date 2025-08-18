@@ -2,12 +2,51 @@ import jax
 import jax.numpy as jnp
 
 def get_fc(bold):
+    """
+    Extract the functional correlation (pearson correlation) of the input (bold_d.T from running the mpr model)
+    """
     FC = jnp.corrcoef(bold)
     FC = FC * (FC > 0)
     FC = FC - jnp.diag(jnp.diag(FC))
     return FC
 
-def extract_FCD(data, wwidth=1000, maxNwindows=100, olap=0.9, coldata=False, mode='corr'):
+def extract_FCD(data, wwidth=30, maxNwindows=200, olap=0.94, coldata=False, mode='corr'):
+    """
+    Extract Functional Connectivity Dynamics (FCD) from time series data.  
+
+    This function computes time-resolved functional connectivity using a sliding window approach and 
+    derives the Functional Connectivity Dynamics (FCD) matrix by correlating the vectorized FC matrices across windows. 
+    It supports multiple modes of FC computation: correlation, phase synchronization, phase locking, and time-delayed correlation.
+
+    Parameters
+    ----------
+    data : jax.numpy.ndarray
+        Time series data of shape (nodes, timepoints) (e.g. bold_d.T) or (timepoints, nodes) if `coldata=True`.
+    wwidth : int, optional
+        Width of the sliding window in time points (default is 30).
+    maxNwindows : int, optional
+        Maximum number of windows to compute (default is 200).
+    olap : float, optional
+        Fractional overlap between consecutive windows (must be <1, default is 0.94).
+    coldata : bool, optional
+        If True, assumes data is organized as (timepoints, nodes) and will be transposed internally (default is False).
+    mode : str, optional
+        Functional connectivity mode to use. Options:
+        - 'corr': Pearson correlation (default)
+        - 'psync': phase synchronization
+        - 'plock': phase locking
+        - 'tdcorr': time-delayed correlation
+
+    Returns
+    -------
+    fcd_matrix : jax.numpy.ndarray
+        Functional Connectivity Dynamics (FCD) matrix of shape (Nwindows, Nwindows), representing
+        correlations between vectorized FC matrices across all windows.
+    corr_vectors : jax.numpy.ndarray
+        Array of vectorized FC matrices of shape (Nwindows, nnodes*(nnodes-1)/2).
+    shift : int
+        Number of timepoints between the start of consecutive windows.
+    """
     if olap >= 1.0:
         raise ValueError("olap must be lower than 1")
     if coldata:
