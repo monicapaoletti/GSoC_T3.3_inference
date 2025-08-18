@@ -1,2 +1,11 @@
 __pycache__/
 slurm*
+../../results/*
+!../../results/benchmarking_CPU.png
+!../../results/benchmarking_GPU.png
+!../../results/FC_FCD_KS_KL_g_0.0.png
+!../../results/FC_FCD_KS_KL_g_0.5.png
+!../../results/FC_FCD_KS_KL_g_0.7.png
+!../../results/sim_G_0.000_tend_300000.0.png
+!../../results/sim_G_0.500_tend_300000.0.png
+!../../results/sim_G_0.700_tend_300000.0.png
