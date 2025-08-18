@@ -79,12 +79,14 @@ def plot_benchmark(Ns, times_jax, times_numba, resultspath, cpugpu):
 
     plt.xlabel(r"Number of simulations ($10^n$)")
     plt.ylabel("Time (s)")
+    plt.yscale("log")
     plt.title(f"Benchmarking  simulation cost of JAX vs Numba mpr model, tested on {cpugpu}")
     plt.legend()
     plt.grid(True, which='both', linestyle='--', alpha=0.6)
 
     results_folder = utils.results_folder()
-    filename = f'benchmarking_{cpugpu}.png'
+    filename = f'benchmarking_{cpugpu}_100m.png'
+    np.savez(os.path.join(resultspath, filename + '.npz'), Ns=Ns, times_jax=times_jax, times_numba=times_numba)
     plt.savefig(os.path.join(resultspath, filename), dpi=300)
     plt.close()
 
@@ -93,6 +95,8 @@ def plot_benchmark(Ns, times_jax, times_numba, resultspath, cpugpu):
 if __name__ == "__main__":
 
     t_end = 10_000
+
+    print('check for jax.devices() = '+str(jax.devices()))
 
     if any(device.platform == "gpu" for device in jax.devices()):
         device_type = "GPU"
@@ -125,7 +129,7 @@ if __name__ == "__main__":
     #elapsed = benchmark_sde_run_vmap(sde_jax, 10)
     #print("Test done!")
 
-    Ns = [10, 100, 1000, 10000, 100000, 1000000]#, 10000000
+    Ns = [10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000]
     #Ns = [1]
 
     times_jax = []
