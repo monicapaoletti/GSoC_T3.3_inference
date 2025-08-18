@@ -1,9 +1,12 @@
 # GSoC_T3.3_inference
--- 
+--- 
 ## Project Overview
 
-This repository implements simulations and inference of the Montbrió et al. neural mass model to study whole-brain dynamics. The focus is on estimating the global coupling parameter \(G\) by comparing simulated functional connectivity (FC) and functional connectivity dynamics (FCD) to empirical data. Both Numba and JAX implementations of the model are provided, along with benchmarking tools and inference scripts.
 
+This project is part of the **Google Summer of Code (GSoC)** program. The repository provides an implementation and inference of the **Montbrió et al. neural mass model** to study whole-brain dynamics. The focus is on estimating the **global coupling parameter (G)** by comparing simulated **functional connectivity (FC)** and **functional connectivity dynamics (FCD)** to empirical data. Both **Numba** and **JAX** implementations of the model are provided, along with benchmarking tools and inference scripts.
+
+**Contributor / Author:** Monica Paoletti (mpaolett@sissa.it)  
+**Mentors:** Meysam Hashemi and Daniele Marinazzo
 ---
 
 ## Repository Structure
