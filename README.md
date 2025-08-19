@@ -16,6 +16,7 @@ Mentors: Meysam Hashemi and Daniele Marinazzo
   - scripts/
     - notebook/  # Example notebooks
       - mpr_jax.ipynb  # Jupyter notebook with JAX simulations
+      - mpr_jax_inference.ipynb #notebook for optimization and Bayesian inference
     - functions/  # Core simulation and inference scripts
       - mpr.py  # Montbrió model implemented in Numba
       - mpr_jax.py  # Montbrió model implemented in Python/JAX
