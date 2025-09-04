@@ -413,24 +413,29 @@ class MPR_sde:
         new_self.check_input()
         nn = int(new_self.P.nn)
         nt = int(new_self.P.t_end / new_self.P.dt)
-        rv_decimate = new_self.P.rv_decimate 
-        r_period = new_self.P.dt * rv_decimate
-        bold_decimate = int(jnp.round(new_self.P.tr / r_period))
+
+        dt = float(new_self.P.dt)
+        tr = float(new_self.P.tr)
+        rv_decimate = int(new_self.P.rv_decimate)
+        r_period = dt * rv_decimate
+        bold_decimate = int(np.round(tr / r_period))
         key, new_key = jax.random.split(self.key)
         new_self = self.replace(P=P, key=new_key)
 
-        #result= , 
-        return integrate_jitted(nn,
-                         new_self.P, 
-                         self.B, 
-                         #method=heun_sde, 
-                         key=new_self.key, 
-                         record_rv=new_self.P.RECORD_RV, 
-                         record_bold=new_self.P.RECORD_BOLD,
-                         nt=nt,
-                         rv_decimate=rv_decimate,
-                         bold_decimate=bold_decimate)
-        #return new_self, result
+        result = integrate_jitted(
+                        nn,
+                        new_self.P,
+                        self.B,
+                        key=new_self.key,
+                        record_rv=new_self.P.RECORD_RV,
+                        record_bold=new_self.P.RECORD_BOLD,
+                        nt=int(new_self.P.t_end / new_self.P.dt),
+                        rv_decimate=rv_decimate,
+                        bold_decimate=bold_decimate)
+
+        """It's paramount to call block_until_ready(), either here, or during pmap/vmap.
+        Otherwise it'd seem that the simulation has been completed, when it fact it hasn't!""" 
+        return jax.block_until_ready(result)
 
 
 #@jax.jit(static_argnames=["nn"])
