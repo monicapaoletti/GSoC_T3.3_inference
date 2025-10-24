@@ -56,6 +56,7 @@ def extract_FCD(data, wwidth=30, maxNwindows=200, olap=0.94, coldata=False, mode
 
     est_windows = (lenseries - wwidth * olap) // (wwidth * (1 - olap))
     Nwindows = int(min(est_windows, maxNwindows))
+    #print(est_windows,Nwindows)
     if Nwindows < 1:
         raise ValueError("Too few windows")
     shift = int((lenseries - wwidth) // (Nwindows - 1)) if Nwindows > 1 else lenseries - wwidth
@@ -99,3 +100,23 @@ def extract_FCD(data, wwidth=30, maxNwindows=200, olap=0.94, coldata=False, mode
     fcd_matrix = jnp.corrcoef(CV_centered)
 
     return fcd_matrix, corr_vectors, shift
+
+
+
+@jax.jit
+def extract_FCD_jax(data, wwidth=30, olap=0.9, shift=None):
+    nnodes, T = data.shape
+    shift = jnp.round(wwidth * (1 - olap)).astype(int)
+    starts = jnp.arange(0, T - wwidth + 1, shift, dtype=int)
+
+    def compute_fc(start):
+        window = data[:, start:start+wwidth]
+        fc = jnp.corrcoef(window)
+        fc = fc * (fc > 0)
+        tril_idx = jnp.tril_indices(nnodes, -1)
+        return fc[tril_idx]
+
+    corr_vectors = jax.vmap(compute_fc)(starts)
+    CV_centered = corr_vectors - jnp.mean(corr_vectors, axis=1, keepdims=True)
+    fcd_matrix = jnp.corrcoef(CV_centered)
+    return fcd_matrix

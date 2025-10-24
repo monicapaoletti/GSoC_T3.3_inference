@@ -16,7 +16,7 @@ def f_mpr(x, t, P, nn): #, nn, method, output
     """
     MPR model
     x: state vector at time t split into x0 and x1 (r and v), t time variable (time step at which r and v are calculated), P parameter object strucure
-
+    
     """
 
     #nn = P.nn #cancel if partially jitted
@@ -345,12 +345,12 @@ class MPR_sde:
     INITIAL_STATE_SET: bool = False
 
     @staticmethod
-    def create(par_mpr: dict = {}) -> "MPR_sde":
+    def create(par_mpr: dict = {}, key: jax.Array = None) -> "MPR_sde":
 
         valid_par = list(ParMPR.__annotations__.keys())
-        for key in par_mpr:
-            if key not in valid_par:
-                raise ValueError(f"Invalid parameter: {key}")
+        for dictkey in par_mpr:
+            if dictkey not in valid_par:
+                raise ValueError(f"Invalid parameter: {dictkey}")
 
         if "initial_state" in par_mpr:
             par_mpr["initial_state"] = jnp.array(par_mpr["initial_state"])
@@ -363,8 +363,11 @@ class MPR_sde:
         if hasattr(P, "nn"):
             P = P.replace(nn=int(P.nn))
         B = ParBold()
-        key = jax.random.PRNGKey(P.seed)
-        return MPR_sde(P=P, B=B, key=key)
+        if key is not None:
+            set_key = key
+        else:
+            set_key = jax.random.PRNGKey(P.seed)
+        return MPR_sde(P=P, B=B, key=set_key)
     
     def with_initial_state(self) -> "MPR_sde":
         key, subkey = jax.random.split(self.key)
