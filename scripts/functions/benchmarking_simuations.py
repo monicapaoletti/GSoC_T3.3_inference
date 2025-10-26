@@ -24,16 +24,17 @@ def benchmark_sde_run_vmap(sde, N):
     Only time is returned; results are discarded.
     """
     seeds = jnp.arange(sde.P.seed, sde.P.seed + N, dtype=jnp.int32)
+    g_values = jnp.arange(0,N)/N
 
-    def single_run(seed):
+    def single_run(seed,g):
         # Pass seed as JAX scalar, not Python int
-        data = sde.run({"seed": seed})
+        data = sde.run({"G": g, "seed": seed})
         return 0  # dummy output to satisfy vmap
 
     vmap_run = jax.vmap(single_run)
 
     start = time.time()
-    vmap_run(seeds)
+    vmap_run(seeds, g_values)
     elapsed = time.time() - start
 
     return elapsed
@@ -50,9 +51,10 @@ def benchmark_sde_run_loop(sde, N):
     Run sde.run({}) N times sequentially for Numba version.
     Only time is returned; results are discarded.
     """
+    g_values = np.arange(0,N)/N
     start = time.time()
     for i in range(N):
-        sde.run({"seed": sde.P.seed + i})
+        sde.run({"G": g_values[i],"seed": sde.P.seed + i})
     elapsed = time.time() - start
     return elapsed
 
