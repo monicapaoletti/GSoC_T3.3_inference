@@ -104,7 +104,7 @@ def extract_FCD(data, wwidth=30, maxNwindows=200, olap=0.94, coldata=False, mode
 
 
 @jax.jit
-def extract_FCD_jax(data, wwidth=30, olap=0.9, shift=None):
+def extract_FCD_jax_old(data, wwidth=30, olap=0.9, shift=None):
     nnodes, T = data.shape
     shift = jnp.round(wwidth * (1 - olap)).astype(int)
     starts = jnp.arange(0, T - wwidth + 1, shift, dtype=int)
@@ -120,3 +120,34 @@ def extract_FCD_jax(data, wwidth=30, olap=0.9, shift=None):
     CV_centered = corr_vectors - jnp.mean(corr_vectors, axis=1, keepdims=True)
     fcd_matrix = jnp.corrcoef(CV_centered)
     return fcd_matrix
+
+
+#before calling the next functions, compute nnodes, T = data.shape
+
+def precompute_shift_and_starts(T, wwidth, olap):
+    shift = (jnp.round(wwidth * (1 - olap)).astype(int)).astype(int)
+    starts = jnp.arange(0, T - wwidth + 1, shift, dtype=int)
+    return shift, starts
+
+#@jax.jit(static_argnums=(2, 3))
+def extract_FCD_jax(data, starts, nnodes, wwidth=30, olap=0.9):
+    def compute_fc(start):
+        window = jax.lax.dynamic_slice(data, (0, start), (nnodes, wwidth))
+        #print("Window shape:", window.shape)
+        fc = jnp.corrcoef(window)
+        fc = fc * (fc > 0)
+        tril_idx = jnp.tril_indices(nnodes, -1)
+        return fc[tril_idx]
+
+    # Vectorized loop over the starting indices
+    corr_vectors = jax.vmap(compute_fc)(starts)
+
+    # Center the correlation vectors
+    CV_centered = corr_vectors - jnp.mean(corr_vectors, axis=1, keepdims=True)
+
+    # Compute FCD matrix as the correlation of the centered vectors
+    fcd_matrix = jnp.corrcoef(CV_centered)
+
+    return fcd_matrix
+
+extract_FCD_jax_jitted = jax.jit(extract_FCD_jax, static_argnums=(2, 3))

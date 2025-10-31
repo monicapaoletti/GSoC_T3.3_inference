@@ -21,12 +21,16 @@ matplotlib.use("Agg")
 import networkx as nx
 import seaborn as sns
 import pandas as pd
+import time
 
 import arviz as az
 import numpyro as npr
 from numpyro import plate
 import numpyro.distributions as dist
-from numpyro.infer import MCMC, NUTS, Predictive, init_to_value
+from numpyro.infer import MCMC, NUTS, Predictive, init_to_value#, Pathfinder
+import blackjax
+from numpyro.infer.util import initialize_model
+
 
 # local modules
 import utils
@@ -42,25 +46,28 @@ def parse_args():
     parser.add_argument("--G", type=float, default=0.33)
 
     # scale the next three parameters together 
-    parser.add_argument("--t_end", type=int, default=30000)
-    parser.add_argument("--tr", type=int, default=50)
-    parser.add_argument("--cut", type=int, default=1000)
+    parser.add_argument("--t_end", type=int, default=3000)
+    parser.add_argument("--tr", type=int, default=5)
+    parser.add_argument("--cut", type=int, default=10)
 
     parser.add_argument("--wwidth", type=int, default=30)
     parser.add_argument("--maxWindows", type=int, default=200)
     parser.add_argument("--olap", type=float, default=0.5)
 
     # Inference settings
-    parser.add_argument("--obs_err", type=float, default=0.01)
-    parser.add_argument("--n_prior", type=int, default=30)
+    parser.add_argument("--obs_err", type=float, default=0.001)
+    parser.add_argument("--n_prior", type=int, default=100)
     parser.add_argument("--n_warmup", type=int, default=20)
     parser.add_argument("--n_samples", type=int, default=20)
-    parser.add_argument("--n_chains", type=int, default=2)
-    parser.add_argument("--scale", type=int, default=1, help="prior scale")
+    parser.add_argument("--n_chains", type=int, default=1)
+    parser.add_argument("--scale", type=int, default=2, help="prior scale")
+    parser.add_argument("--sampler", type=str, default="pathfinder",
+                    choices=["nuts", "pathfinder"], help="Choose inference method")
+
     # Misc
     parser.add_argument("--save_dir", type=str, default=None)
-    parser.add_argument("--seed", type=int, default=0)
-
+    parser.add_argument("--seed", type=int, default=int(time.time()))
+    # SC matrix type
     parser.add_argument("--SC_type", type=str, default="data",
                     help="Type of structural connectivity: 'sim' for simulated, 'data' for real data")
     parser.add_argument("--SC_size", type=int, default=88,
@@ -81,15 +88,18 @@ def timer(func):
 
 # ------------------ Wrapper ------------------
 @timer
-def wrapper(G, par, cut):
+def wrapper(G, par, cut, tr, starts, nn):
     par = deepcopy(par)
     par["G"] = G
     sde = mpr_jax.MPR_sde.create(par)
     data = sde.run({})
     bold_d = data["bold_d"]
 
-    FC_full = get_fc(bold_d[int(cut):].T)   # <<< ensure int(cut)
-    tri_idx = jnp.triu_indices(FC_full.shape[0], k=1)
+    bold_d_sub = bold_d[cut::tr].T
+
+    FC_full = extract_FCD_jax(bold_d_sub, starts, nn, wwidth=30, olap=0.94) #FC_full = get_fc(bold_d[int(cut):].T)   # <<< ensure int(cut)
+    #print(FC_full)
+    tri_idx = jnp.triu_indices(FC_full.shape[0], k=30) #1
     return FC_full[tri_idx]
 
 
@@ -105,9 +115,10 @@ def calcula_map(chains_):
 
 
 def plot_trace_chains(mcmc, theta_true, var_names, savepath=None):
-    az_obj = az.from_numpyro(mcmc)
+    #az_obj = az.from_numpyro(mcmc)
     out = az.plot_trace(
-        az_obj,
+        #az_obj,
+        mcmc,
         var_names=var_names,
         compact=True,
         kind="trace",
@@ -126,7 +137,7 @@ def plot_trace_chains(mcmc, theta_true, var_names, savepath=None):
         for ax in [axes[i, 1]]:
             ax.axhline(y=true_val, color="red", linestyle="--")
 
-    fig.suptitle("Converged NUTS", fontsize=16)
+    fig.suptitle("Posterior samples", fontsize=16)
     fig.tight_layout()
     if savepath:
         fig.savefig(savepath, dpi=300, bbox_inches="tight")
@@ -162,10 +173,10 @@ def plot_posterior_pooled(var_names, theta_true, prior_predictions, chains_poole
 def model_fc(data, prior_specs):
     FC_obs = data["FC_obs"]
     n_obs = FC_obs.shape[0]
-    G = npr.sample("G", dist.HalfNormal(scale=prior_specs['scale_G']))
+    G = npr.sample("G", dist.HalfNormal(scale=prior_specs['scale_G']))#dist.Beta(2.0, 3.0)
     params_sim = dict(data["params"])
     params_sim["G"] = G
-    FC_hat_flat = wrapper(G, params_sim, cut=data["cut"])
+    FC_hat_flat = wrapper(G, params_sim, cut=data["cut"], tr=data["tr"], starts=data["starts"], nn=data["nn"])
     obs_err = data["obs_err"]
     with plate("fc_elements", n_obs):
         npr.sample("FC_obs", dist.Normal(FC_hat_flat, obs_err), obs=FC_obs)
@@ -186,6 +197,7 @@ def main():
     SC_type = args.SC_type.lower()
     SC_size = args.SC_size
     scale = args.scale
+    sampler = args.sampler
     resultspath = args.save_dir or utils.results_folder()
 
     print("Running inference with parameters:")
@@ -195,7 +207,7 @@ def main():
           f"n_samples = {n_samples}, n_chains = {n_chains}")
 
     # --- parameter tag for filenames ---  # <<< added
-    tag = f"G{G}_cut{cut}_tr{tr}_seed{seed}_tend{t_end}_ns{n_samples}_nc{n_chains}_SC_{SC_size}"
+    tag = f"G{G}_cut{cut}_tr{tr}_seed{seed}_tend{t_end}_ns{n_samples}_nc{n_chains}_SC_{SC_size}_sampler_{sampler}"
     print(f"\nSaving all outputs with tag: {tag}\n")
 
     # --- file paths ---  # <<< added
@@ -213,6 +225,7 @@ def main():
     elif SC_type == "data":
         datapath = utils.DATA_ROOT
         weights = np.loadtxt(os.path.join(datapath, "weights.txt"))
+        weights = weights[:SC_size,:SC_size]
         nn = len(weights)
         SC = jnp.array(weights) / jnp.max(weights)
     else:
@@ -223,8 +236,11 @@ def main():
         "noise_amp": 0.037, "tr": 1.0, "seed": seed
     }
 
-    FC_obs_flat = wrapper(G=G, par=params, cut=cut)
-    data = {"FC_obs": FC_obs_flat, "params": params, "obs_err": obs_err, "cut": cut}
+    T = (t_end-cut)//tr
+    shift, starts = precompute_shift_and_starts(T, wwidth=30, olap=0.94)
+
+    FC_obs_flat = wrapper(G=G, par=params, cut=cut, tr=tr, starts=starts, nn=nn)
+    data = {"FC_obs": FC_obs_flat, "params": params, "obs_err": obs_err, "cut": cut, "tr":tr, "starts":starts, "nn":nn}
     prior_specs = {"scale_G": scale}
 
     os.makedirs(resultspath, exist_ok=True)
@@ -234,7 +250,7 @@ def main():
     prior_predictive = Predictive(model_fc, num_samples=n_prior)
     prior_predictions = prior_predictive(rng_key, data, prior_specs)
 
-    plt.hist(np.asarray(prior_predictions["G"]), bins=15, color="#295785", alpha=0.8)
+    plt.hist(np.asarray(prior_predictions["G"]), bins=20, color="#295785", alpha=0.8)
     plt.axvline(params["G"], color="r", linestyle="--", label="True G")
     plt.title("Prior Predictive Check for G")
     plt.xlabel("G"); plt.legend(frameon=False); plt.tight_layout()
@@ -242,43 +258,103 @@ def main():
 
     # --- inference ---
     theta_true = np.array([params["G"]])
-    tails_5th = jnp.percentile(prior_predictions["G"], 5, axis=0)
-    init_to_low_prob = init_to_value(values={"G": tails_5th})
-    kernel = NUTS(model_fc, init_strategy=init_to_low_prob)
-    mcmc = MCMC(kernel, num_warmup=n_warmup, num_samples=n_samples, num_chains=n_chains, chain_method="parallel")
 
-    print("Running NUTS inference...")
-    start_time = time.time()
-    mcmc.run(rng_key, data, prior_specs, extra_fields=("potential_energy", "num_steps", "diverging"))
-    runtime = time.time() - start_time
-    print(f"NUTS sampling took {runtime:.2f} seconds")
+    rng_key, rng_key_run = jax.random.split(rng_key)
+
+    if sampler == "nuts":
+        print("Running NUTS inference...")
+        tails_5th = jnp.percentile(prior_predictions["G"], 5, axis=0)
+        init_to_low_prob = init_to_value(values={"G": tails_5th})
+        kernel = NUTS(model_fc, init_strategy=init_to_low_prob)
+        mcmc = MCMC(kernel, num_warmup=n_warmup, num_samples=n_samples,
+                    num_chains=n_chains, chain_method="parallel")
+        start_time = time.time()
+        mcmc.run(rng_key_run, data, prior_specs, extra_fields=("potential_energy", "num_steps", "diverging"))
+        runtime = time.time() - start_time
+        posterior_samples = az.from_numpyro(mcmc)
+
+        # --- potential energy ---
+        lp = -mcmc.get_extra_fields()["potential_energy"]
+        plt.figure()
+        plt.plot(lp, label="Potential energy")
+        plt.xlabel("Iteration"); plt.ylabel("Log joint density")
+        plt.title("Potential energy over sampling")
+        plt.legend(frameon=False)
+        plt.tight_layout()
+        plt.savefig(fname_logjoint, dpi=300)
+        plt.close()
+
+        # --- summary CSV ---
+        az_summary = az.summary(mcmc, var_names=["G"]).reset_index().rename(columns={"index": "parameter"})
+        az_summary["runtime_sec"] = runtime
+        az_summary.to_csv(fname_summary_csv, index=False)
+        print(f"Summary saved to {fname_summary_csv}")
+
+        
+    elif sampler == "pathfinder":
+        print("Running Pathfinder inference via BlackJAX...")
+
+        # Initialize the model in unconstrained space
+        rng_key, rng_key_init = jax.random.split(rng_key_run)
+        param_info, potential_fn, postprocess_fn, *_ = initialize_model(
+            rng_key_init, model_fc, model_args=(data, prior_specs), dynamic_args=True
+        )
+        initial_position = param_info.z  # unconstrained initial position
+        print('initial_position',initial_position)
+        # Define log density function for Pathfinder
+        logdensity_fn = lambda z: -potential_fn(data, prior_specs)(z)  # use original args
+
+        # Run Pathfinder approximation
+        rng_key, rng_key_pf = jax.random.split(rng_key)
+        pf_state, diagnostics = blackjax.vi.pathfinder.approximate(
+            rng_key=rng_key_pf, 
+            logdensity_fn=logdensity_fn, 
+            initial_position=initial_position, 
+            num_samples=200,
+            ftol=1e-05,#1e-4, #
+            maxiter=30,#200, #
+            maxcor=10, #100, 
+            gtol=1e-08,#1e-06 #
+            #num_steps=100
+        )
+        print(pf_state)
+        print('diagnostics',diagnostics)
+
+        # Sample from the approximate posterior
+        rng_key, rng_key_samp = jax.random.split(rng_key)
+        samples_unconstrained, _ = blackjax.vi.pathfinder.sample(
+            rng_key=rng_key_samp, 
+            state=pf_state, 
+            num_samples=1000
+        )
+        print(samples_unconstrained)
+
+        # Transform to constrained (original) space
+        samples = jax.vmap(
+            lambda z: postprocess_fn(data, prior_specs)(z)
+            )(samples_unconstrained)
+        print(samples)
+
+        # Convert to ArviZ InferenceData
+        posterior_samples = az.from_dict(posterior={k: np.asarray(v) for k, v in samples.items()})
+        mcmc = posterior_samples
+        print(posterior_samples)
+
+
 
     # --- diagnostics and plots ---
     summary = az.summary(mcmc, var_names=["G"])
     print(summary)
     plot_trace_chains(mcmc, theta_true, ["G"], savepath=fname_trace)
-    az_obj = az.from_numpyro(mcmc)
-    az.to_netcdf(az_obj, fname_netcdf)
+    
+    #az_obj = az.from_numpyro(mcmc)
+    #print(mcmc['G'])
+    #print(az_obj)
+    #az.to_netcdf(posterior_samples, fname_netcdf)
 
-    chains_pooled = az_obj.posterior["G"].values.reshape(1, -1)
+    chains_pooled = posterior_samples.posterior["G"].values.reshape(1, -1)
     plot_posterior_pooled(["G"], theta_true, prior_predictions, chains_pooled, "Pooled Posteriors", savepath=fname_posteriors)
 
-    # --- potential energy ---
-    lp = -mcmc.get_extra_fields()["potential_energy"]
-    plt.figure()
-    plt.plot(lp, label="Potential energy")
-    plt.xlabel("Iteration"); plt.ylabel("Log joint density")
-    plt.title("Potential energy over sampling")
-    plt.legend(frameon=False)
-    plt.tight_layout()
-    plt.savefig(fname_logjoint, dpi=300)
-    plt.close()
-
-    # --- summary CSV ---
-    az_summary = az.summary(mcmc, var_names=["G"]).reset_index().rename(columns={"index": "parameter"})
-    az_summary["runtime_sec"] = runtime
-    az_summary.to_csv(fname_summary_csv, index=False)
-    print(f"Summary saved to {fname_summary_csv}")
 
     print(f"\nAll results and plots saved in:\n{resultspath}\n")
 
