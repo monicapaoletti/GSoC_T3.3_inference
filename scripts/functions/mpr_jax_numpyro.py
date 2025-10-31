@@ -45,6 +45,9 @@ def parse_args():
     # Model/simulation parameters
     parser.add_argument("--G", type=float, default=0.33)
 
+    # Statistics
+    parser.add_argument("--which_stat", type=str, default="FCD")
+
     # scale the next three parameters together 
     parser.add_argument("--t_end", type=int, default=3000)
     parser.add_argument("--tr", type=int, default=5)
@@ -55,12 +58,12 @@ def parse_args():
     parser.add_argument("--olap", type=float, default=0.5)
 
     # Inference settings
-    parser.add_argument("--obs_err", type=float, default=0.001)
+    parser.add_argument("--obs_err", type=float, default=0.1)
     parser.add_argument("--n_prior", type=int, default=100)
     parser.add_argument("--n_warmup", type=int, default=20)
     parser.add_argument("--n_samples", type=int, default=20)
     parser.add_argument("--n_chains", type=int, default=1)
-    parser.add_argument("--scale", type=int, default=2, help="prior scale")
+    parser.add_argument("--scale", type=int, default=1, help="prior scale")
     parser.add_argument("--sampler", type=str, default="pathfinder",
                     choices=["nuts", "pathfinder"], help="Choose inference method")
 
@@ -88,7 +91,20 @@ def timer(func):
 
 # ------------------ Wrapper ------------------
 @timer
-def wrapper(G, par, cut, tr, starts, nn):
+def wrapper_fc(G, par, cut, tr, starts, nn):
+    par = deepcopy(par)
+    par["G"] = G
+    sde = mpr_jax.MPR_sde.create(par)
+    data = sde.run({})
+    bold_d = data["bold_d"]
+
+    FC_full = get_fc(bold_d[int(cut):].T)   # <<< ensure int(cut)
+    #print(FC_full)
+    tri_idx = jnp.triu_indices(FC_full.shape[0], k=1) 
+    return FC_full[tri_idx]
+
+@timer
+def wrapper_fcd(G, par, cut, tr, starts, nn):
     par = deepcopy(par)
     par["G"] = G
     sde = mpr_jax.MPR_sde.create(par)
@@ -97,10 +113,10 @@ def wrapper(G, par, cut, tr, starts, nn):
 
     bold_d_sub = bold_d[cut::tr].T
 
-    FC_full = extract_FCD_jax(bold_d_sub, starts, nn, wwidth=30, olap=0.94) #FC_full = get_fc(bold_d[int(cut):].T)   # <<< ensure int(cut)
-    #print(FC_full)
-    tri_idx = jnp.triu_indices(FC_full.shape[0], k=30) #1
-    return FC_full[tri_idx]
+    FCD_full = extract_FCD_jax_jitted(bold_d_sub, starts, nn, wwidth=30, olap=0.94) #FC_full = get_fc(bold_d[int(cut):].T)   # <<< ensure int(cut)
+    #print(FCD_full)
+    tri_idx = jnp.triu_indices(FCD_full.shape[0], k=30)
+    return FCD_full[tri_idx]
 
 
 # ------------------ Helpers ------------------
@@ -176,7 +192,20 @@ def model_fc(data, prior_specs):
     G = npr.sample("G", dist.HalfNormal(scale=prior_specs['scale_G']))#dist.Beta(2.0, 3.0)
     params_sim = dict(data["params"])
     params_sim["G"] = G
-    FC_hat_flat = wrapper(G, params_sim, cut=data["cut"], tr=data["tr"], starts=data["starts"], nn=data["nn"])
+    FC_hat_flat = wrapper_fc(G, params_sim, cut=data["cut"], tr=data["tr"], starts=data["starts"], nn=data["nn"])
+    obs_err = data["obs_err"]
+    with plate("fc_elements", n_obs):
+        npr.sample("FC_obs", dist.Normal(FC_hat_flat, obs_err), obs=FC_obs)
+    npr.deterministic("FC_hat", FC_hat_flat)
+
+
+def model_fcd(data, prior_specs):
+    FC_obs = data["FC_obs"]
+    n_obs = FC_obs.shape[0]
+    G = npr.sample("G", dist.HalfNormal(scale=prior_specs['scale_G']))#dist.Beta(2.0, 3.0)
+    params_sim = dict(data["params"])
+    params_sim["G"] = G
+    FC_hat_flat = wrapper_fcd(G, params_sim, cut=data["cut"], tr=data["tr"], starts=data["starts"], nn=data["nn"])
     obs_err = data["obs_err"]
     with plate("fc_elements", n_obs):
         npr.sample("FC_obs", dist.Normal(FC_hat_flat, obs_err), obs=FC_obs)
@@ -198,6 +227,7 @@ def main():
     SC_size = args.SC_size
     scale = args.scale
     sampler = args.sampler
+    which_stat = args.which_stat.upper()
     resultspath = args.save_dir or utils.results_folder()
 
     print("Running inference with parameters:")
@@ -207,7 +237,7 @@ def main():
           f"n_samples = {n_samples}, n_chains = {n_chains}")
 
     # --- parameter tag for filenames ---  # <<< added
-    tag = f"G{G}_cut{cut}_tr{tr}_seed{seed}_tend{t_end}_ns{n_samples}_nc{n_chains}_SC_{SC_size}_sampler_{sampler}"
+    tag = f"G{G}_cut{cut}_tr{tr}_seed{seed}_tend{t_end}_ns{n_samples}_nc{n_chains}_SC_{SC_size}_sampler_{sampler}_which_stat_{which_stat}"
     print(f"\nSaving all outputs with tag: {tag}\n")
 
     # --- file paths ---  # <<< added
@@ -236,10 +266,21 @@ def main():
         "noise_amp": 0.037, "tr": 1.0, "seed": seed
     }
 
+    # --- setup model features  and data --
+    if which_stat == "FC":
+        wrapper = wrapper_fc
+        model = model_fc
+    elif which_stat == "FCD":
+        wrapper = wrapper_fcd
+        model = model_fcd
+    else:
+        raise ValueError(f"Invalid Functional Connectivity type '{which_stat}'. Must be 'FC' or 'FCD'.")
+
     T = (t_end-cut)//tr
     shift, starts = precompute_shift_and_starts(T, wwidth=30, olap=0.94)
 
     FC_obs_flat = wrapper(G=G, par=params, cut=cut, tr=tr, starts=starts, nn=nn)
+    print(FC_obs_flat)
     data = {"FC_obs": FC_obs_flat, "params": params, "obs_err": obs_err, "cut": cut, "tr":tr, "starts":starts, "nn":nn}
     prior_specs = {"scale_G": scale}
 
@@ -247,7 +288,8 @@ def main():
 
     # --- prior predictive ---
     rng_key = jax.random.PRNGKey(seed)
-    prior_predictive = Predictive(model_fc, num_samples=n_prior)
+    
+    prior_predictive = Predictive(model, num_samples=n_prior)
     prior_predictions = prior_predictive(rng_key, data, prior_specs)
 
     plt.hist(np.asarray(prior_predictions["G"]), bins=20, color="#295785", alpha=0.8)
@@ -265,7 +307,7 @@ def main():
         print("Running NUTS inference...")
         tails_5th = jnp.percentile(prior_predictions["G"], 5, axis=0)
         init_to_low_prob = init_to_value(values={"G": tails_5th})
-        kernel = NUTS(model_fc, init_strategy=init_to_low_prob)
+        kernel = NUTS(model, init_strategy=init_to_low_prob)
         mcmc = MCMC(kernel, num_warmup=n_warmup, num_samples=n_samples,
                     num_chains=n_chains, chain_method="parallel")
         start_time = time.time()
@@ -297,7 +339,7 @@ def main():
         # Initialize the model in unconstrained space
         rng_key, rng_key_init = jax.random.split(rng_key_run)
         param_info, potential_fn, postprocess_fn, *_ = initialize_model(
-            rng_key_init, model_fc, model_args=(data, prior_specs), dynamic_args=True
+            rng_key_init, model, model_args=(data, prior_specs), dynamic_args=True
         )
         initial_position = param_info.z  # unconstrained initial position
         print('initial_position',initial_position)
