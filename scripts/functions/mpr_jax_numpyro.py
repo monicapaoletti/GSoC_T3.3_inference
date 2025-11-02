@@ -58,7 +58,7 @@ def parse_args():
     parser.add_argument("--olap", type=float, default=0.5)
 
     # Inference settings
-    parser.add_argument("--obs_err", type=float, default=0.1)
+    parser.add_argument("--obs_err", type=float, default=0.01)
     parser.add_argument("--n_prior", type=int, default=100)
     parser.add_argument("--n_warmup", type=int, default=20)
     parser.add_argument("--n_samples", type=int, default=20)
@@ -361,6 +361,8 @@ def main():
         )
         print(pf_state)
         print('diagnostics',diagnostics)
+
+        #import pdb; pdb.set_trace() #debug mode for tracing the code and inspect variables manually
 
         # Sample from the approximate posterior
         rng_key, rng_key_samp = jax.random.split(rng_key)

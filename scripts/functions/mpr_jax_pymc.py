@@ -34,9 +34,9 @@ import pytensor
 import pytensor.tensor as pt
 
 from pytensor.compile.ops import as_op
-from scipy.integrate import odeint
 from scipy.optimize import least_squares
 
+from mpr_pytensor_model import pytensor_forward_model_matrix
 
 
 # local modules
@@ -44,13 +44,6 @@ import utils
 from FCD_jax import *    
 import mpr_jax
 mpr_jax = __import__("mpr_jax")
-
-PARAMS = None
-CUT = None
-TR_ = None    
-STARTS = None
-NN = None
-OBS_ERR = None
 
 # ------------------ Argument parser ------------------
 def parse_args():
@@ -63,33 +56,34 @@ def parse_args():
     parser.add_argument("--which_stat", type=str, default="FCD")
 
     # scale the next three parameters together 
-    parser.add_argument("--t_end", type=int, default=30000)
-    parser.add_argument("--tr", type=int, default=50)
-    parser.add_argument("--cut", type=int, default=100)
+    parser.add_argument("--t_end", type=int, default=30000) #300000
+    parser.add_argument("--tr", type=int, default=50) #500
+    parser.add_argument("--cut", type=int, default=1000) #10000
 
     parser.add_argument("--wwidth", type=int, default=30)
     parser.add_argument("--maxWindows", type=int, default=200)
-    parser.add_argument("--olap", type=float, default=0.5)
+    parser.add_argument("--olap", type=float, default=0.94)
 
     # Inference settings
     parser.add_argument("--obs_err", type=float, default=0.01)
     parser.add_argument("--n_prior", type=int, default=10000)
     parser.add_argument("--n_warmup", type=int, default=100)
     parser.add_argument("--n_samples", type=int, default=100)
-    parser.add_argument("--n_chains", type=int, default=1)
-    parser.add_argument("--scale", type=int, default=1, help="prior scale")
-    parser.add_argument("--sampler", type=str, default="slice",
+    parser.add_argument("--n_chains", type=int, default=4)
+
+    parser.add_argument("--sampler", type=str, default="smcabc",
                     choices=["slice", "metropolis", "demetropolisz", "demetropolis", "smclik", "smcabc"], help="Choose inference method")
-    parser.add_argument("--epsilon", type=float, default=1, help="epsilon parameter for smc algorithm")
+    parser.add_argument("--epsilon", type=float, default=10, help="epsilon parameter for smc abc algorithm")
+    parser.add_argument("--threshold", type=float, default=0.4, help="threshold parameter for smc algorithm")
+    parser.add_argument("--correlation_threshold", type=float, default=0.05, help="correlation_threshold parameter for smc algorithm")
 
     # Misc
-    parser.add_argument("--save_dir", type=str, default=None)
     parser.add_argument("--seed", type=int, default=int(time.time()))
     # SC matrix type
     parser.add_argument("--SC_type", type=str, default="data",
                     help="Type of structural connectivity: 'sim' for simulated, 'data' for real data")
     parser.add_argument("--SC_size", type=int, default=6,
-                        help="Number of nodes if using simulated SC") #change to 6 or 10 for small networks
+                        help="Number of nodes in SC") #change to 6 or 10 for small networks
 
     return parser.parse_args()
 
@@ -114,11 +108,11 @@ def wrapper_fc(G, par, cut, tr, starts, nn):
     bold_d = data["bold_d"]
 
     FC_full = get_fc(bold_d[int(cut):].T)   # <<< ensure int(cut)
-    #print(FC_full)
+    
     tri_idx = jnp.triu_indices(FC_full.shape[0], k=1) 
     return FC_full[tri_idx]
 
-@timer
+#@timer
 def wrapper_fcd(G, par, cut, tr, starts, nn):
     par = deepcopy(par)
     par["G"] = G
@@ -127,44 +121,32 @@ def wrapper_fcd(G, par, cut, tr, starts, nn):
     bold_d = data["bold_d"]
 
     bold_d_sub = bold_d[cut::tr].T
-
-    FCD_full = extract_FCD_jax_jitted(bold_d_sub, starts, nn, wwidth=30, olap=0.94) #FC_full = get_fc(bold_d[int(cut):].T)   # <<< ensure int(cut)
-    #print(FCD_full)
-    tri_idx = jnp.triu_indices(FCD_full.shape[0], k=30)
+    #print(starts,nn)
+    FCD_full = extract_FCD_jax_jitted(bold_d_sub, starts, nn, wwidth=30, olap=0.94) 
+    
+    tri_idx = jnp.triu_indices(FCD_full.shape[0], k=30) 
+    #print(len(bold_d),len(bold_d_sub.T),np.shape(FCD_full),len(FCD_full[tri_idx]))
     return FCD_full[tri_idx]
 
 
 # decorator with input and output types a Pytensor double float tensors
-@as_op(itypes=[pt.dvector], otypes=[pt.dvector])
-def pytensor_forward_model_matrix(G):
-    #if parse_args().SC_type == "sim":
-    #    SC = nx.to_numpy_array(nx.complete_graph(SC_size))
-    #elif parse_args().SC_type == "data":
-    #    datapath = utils.DATA_ROOT
-    #    weights = np.loadtxt(os.path.join(datapath, "weights.txt"))
-    #    weights = weights[:parse_args().SC_size,:parse_args().SC_size]
-    #    nn = len(weights)
-    #    SC = jnp.array(weights) / jnp.max(weights)
-    #else:
-    #    raise ValueError(f"Invalid SC_type '{parse_args().SC_type}'. Must be 'sim' or 'data'.")
-    #params = {
-    #    "G": G, "weights": SC, "t_end": parse_args().t_end,
-    #    "dt": 0.01, "eta": jnp.array([-4.6]), "rv_decimate": 10,
-    #    "noise_amp": 0.037, "tr": 1.0, "seed": parse_args().seed
-    #}
-    if PARAMS is None:
-        raise RuntimeError("Globals not set: set PARAMS and STARTS before building model.")
-    result =  wrapper_fcd(G=float(np.atleast_1d(G).item()), 
-                          par=PARAMS, 
-                          cut=CUT, 
-                          tr=TR_, 
-                          starts=STARTS, 
-                          nn=NN)
-    return np.asarray(result, dtype=np.float64).flatten()
+#@as_op(itypes=[pt.dvector], otypes=[pt.dvector])
+#def pytensor_forward_model_matrix(G):
+
+#    if PARAMS is None:
+#        raise RuntimeError("Globals not set: set PARAMS and STARTS before building model.")
+#    result =  wrapper_fcd(G=float(np.atleast_1d(G).item()), 
+#                          par=PARAMS, 
+#                          cut=CUT, 
+#                          tr=TR_, 
+#                          starts=STARTS, 
+#                          nn=NN)
+#    return np.asarray(result, dtype=np.float64).flatten()
 
 
 # ------------------ Helpers ------------------
 def tails_percentile(my_var_names, prior_predictions, thr):
+
     tails_xth_percentile = {}
     for key, value in prior_predictions.items():
         if key in my_var_names:
@@ -195,11 +177,6 @@ def plot_trace(trace, my_var_names, theta_true, sampler, fname=None):
     return axes   
 
 def rmse_fit_mean(wrapper, trace, theta_true, my_var_names, params, cut, tr, starts, nn, FC_obs_flat):
-#     with model:
-#          pp = pm.sample_posterior_predictive(trace,  var_names=["xpy_obs"], predictions=True, random_seed=rng)
-#          theta_err=np.sum((theta_true-az.summary(trace, var_names=my_var_names).values[:,0])**2)
-#          x_ppc=np.mean(np.mean(pp.predictions['xpy_obs'][:,:,:,0], axis=0), axis=0)
-#          xs_err=np.sum((x_ppc-data.pyramidal)**2)
 
     theta_mean=np.mean(az.extract(trace).to_dataframe()[my_var_names], axis=0).to_numpy()
     theta_err=np.sqrt(np.mean(theta_mean-theta_true)**2)
@@ -209,6 +186,7 @@ def rmse_fit_mean(wrapper, trace, theta_true, my_var_names, params, cut, tr, sta
     return (theta_err), np.mean(xs_err)
 
 def calcula_map(chains_):
+
     params_map = []
     for i in range(int(chains_.shape[0])):
         y = chains_[i]
@@ -218,11 +196,6 @@ def calcula_map(chains_):
     return params_map
 
 def rmse_fit_map(wrapper, trace, theta_true, my_var_names, params, cut, tr, starts, nn, FC_obs_flat):
-#     with model:
-#          pp = pm.sample_posterior_predictive(trace,  var_names=["xpy_obs"], predictions=True, random_seed=rng)
-#          theta_err=np.sum((theta_true-az.summary(trace, var_names=my_var_names).values[:,0])**2)
-#          x_ppc=np.mean(np.mean(pp.predictions['xpy_obs'][:,:,:,0], axis=0), axis=0)
-#          xs_err=np.sum((x_ppc-data.pyramidal)**2)
 
     chains_pooled = trace.posterior["G"].values.reshape(1, -1)
     theta_map=calcula_map(chains_pooled)
@@ -234,6 +207,7 @@ def rmse_fit_map(wrapper, trace, theta_true, my_var_names, params, cut, tr, star
     return (theta_err), np.mean(xs_err)
 
 def tails_percentile(my_var_names, prior_predictions, thr):
+
     tails_xth_percentile = {}
     for key, value in prior_predictions.items():
         if key in my_var_names:
@@ -250,16 +224,15 @@ def main():
     # --- unpack args ---
     G, t_end, tr, cut = args.G, args.t_end, args.tr, args.cut
     wwidth, maxWindows, olap = args.wwidth, args.maxWindows, args.olap
-    obs_err, n_prior, n_warmup, n_samples, n_chains, epsilon = (
-        args.obs_err, args.n_prior, args.n_warmup, args.n_samples, args.n_chains, args.epsilon
+    obs_err, n_prior, n_warmup, n_samples, n_chains, epsilon, threshold, correlation_threshold = (
+        args.obs_err, args.n_prior, args.n_warmup, args.n_samples, args.n_chains, args.epsilon, args.threshold, args.correlation_threshold
     )
     seed = args.seed
     SC_type = args.SC_type.lower()
     SC_size = args.SC_size
-    scale = args.scale
     sampler = args.sampler
     which_stat = args.which_stat.upper()
-    resultspath = args.save_dir or utils.results_folder()
+    resultspath = utils.results_folder()
 
     # --- setup params ---
     if SC_type == "sim":
@@ -274,7 +247,7 @@ def main():
         raise ValueError(f"Invalid SC_type '{SC_type}'. Must be 'sim' or 'data'.")
     
     T = (t_end-cut)//tr
-    shift, starts = precompute_shift_and_starts(T, wwidth=30, olap=0.94)
+    shift, starts = precompute_shift_and_starts(T, wwidth=wwidth, olap=olap)
 
     params = {
         "G": G, "weights": SC, "t_end": t_end,
@@ -283,13 +256,6 @@ def main():
     }
 
     # set globals used by pytensor function
-    global PARAMS, CUT, TR_, STARTS, NN, OBS_ERR
-    PARAMS = params
-    CUT = cut
-    TR_ = tr
-    STARTS = starts
-    NN = nn
-    OBS_ERR = obs_err
 
     print("Running inference with parameters:")
     print(f"G = {G}, t_end = {t_end}, tr = {tr}, cut = {cut}, wwidth = {wwidth}, "
@@ -297,17 +263,15 @@ def main():
     print(f"obs_err = {obs_err}, n_prior = {n_prior}, n_warmup = {n_warmup}, "
           f"n_samples = {n_samples}, n_chains = {n_chains}")
 
-    # --- parameter tag for filenames ---  # <<< added
+    # --- parameter tag for filenames ---  
     tag = f"G{G}_cut{cut}_tr{tr}_seed{seed}_tend{t_end}_ns{n_samples}_nc{n_chains}_SC_{SC_size}_sampler_{sampler}_which_stat_{which_stat}"
     print(f"\nSaving all outputs with tag: {tag}\n")
 
-    # --- file paths ---  # <<< added
+    # --- file paths ---  
     fname_prior_pred = os.path.join(resultspath, f"prior_predictive_G_{tag}.png")
     fname_trace = os.path.join(resultspath, f"trace_G_{tag}.png")
-    #fname_posteriors = os.path.join(resultspath, f"pooled_posteriors_{tag}.png")
-    #fname_logjoint = os.path.join(resultspath, f"log_joint_density_{tag}.png")
-    fname_postpred_summary = os.path.join(resultspath, f"posterior_predictive_summary_{tag}.png")
     fname_summary_csv = os.path.join(resultspath, f"summary_{tag}.csv")
+    fname_summary_RMSE_csv = os.path.join(resultspath, f"summary_RMSE_{tag}.csv")
     fname_netcdf = os.path.join(resultspath, f"inference_results_{tag}.nc")
 
     # --- setup model features  and data --
@@ -321,8 +285,10 @@ def main():
         raise ValueError(f"Invalid Functional Connectivity type '{which_stat}'. Must be 'FC' or 'FCD'.")
 
     # --- Generate observed data ---
+    #print("Using wrapper:", wrapper.__name__)
+    #print(G,params,cut,tr,starts,nn)
     FC_obs_flat = wrapper(G=G, par=params, cut=cut, tr=tr, starts=starts, nn=nn)
-    print(FC_obs_flat)
+    #print('FC_obs_flat_shape',np.shape(FC_obs_flat))
     data = {"FC_obs": FC_obs_flat, "params": params, "obs_err": obs_err, "cut": cut, "tr":tr, "starts":starts, "nn":nn}
     prior_specs = {"mu_G" : 0.5, "sigma": 0.7, "lower": 0}
     my_var_names = ['G']
@@ -419,12 +385,11 @@ def main():
         with model:
             trace_SMC_like = pm.sample_smc(draws=n_samples,         
                                         kernel=pm.smc.IMH,  
-                                        #threshold=0.1,  
-                                        #correlation_threshold=0.9,  
+                                        threshold=threshold,  
+                                        correlation_threshold=correlation_threshold,  
                                         progressbar=False, 
                                         chains=n_chains,
-                                        cores=1,
-                                        #parallel=False
+                                        cores=n_chains
                                         )
         crudetime_SMC_like=time.time() - start_time
         print("---running took: %s seconds ---" % crudetime_SMC_like)
@@ -436,6 +401,7 @@ def main():
             theta = G 
             mu = wrapper(G=G.item(), par=params, cut=cut, tr=tr, starts=starts, nn=nn).reshape(-1, 1)
             return rng.normal(mu, obs_err)
+        
         with pm.Model() as model:
             # Priors
             G = pm.TruncatedNormal("G", mu=prior_specs["mu_G"], lower=prior_specs["lower"])
@@ -450,32 +416,37 @@ def main():
                 observed=FC_obs_flat,)
             
         sampler = f"SMC_epsilon = {epsilon}"
+
         start_time = time.time()
+
         with model:
             # Run the SMC sampler
             trace_SMC_e = pm.sample_smc(draws=n_samples,         
                                         kernel=pm.smc.IMH,  
-                                        threshold=0.4,  #default 0.5
-                                        correlation_threshold=0.05,  #defaul 0.01
+                                        threshold=threshold,  #default 0.5
+                                        correlation_threshold=correlation_threshold,  #defaul 0.01
                                         progressbar=False, 
                                         chains=n_chains,
-                                        cores=2)
+                                        cores=n_chains)
         crudetime_SMC_e1=time.time() - start_time
+
         print("---running took: %s seconds ---" % crudetime_SMC_e1)
         trace = trace_SMC_e
 
     else: 
         ValueError(f"Invalid sampler: {sampler}")
 
-    
-    az.to_netcdf(trace, fname_netcdf)
+    #print(trace.sample_stats.beta)
+
+    az.to_netcdf(trace.posterior, fname_netcdf)
     print(f"Trace saved to: {fname_netcdf}")
 
     summary_df = az.summary(trace)
     summary_df.to_csv(fname_summary_csv)
+    print(summary_df)
     print(f"Summary saved to: {fname_summary_csv}")
 
-    plot_trace(trace, my_var_names, np.array([0.33]), sampler, fname=fname_trace)
+    plot_trace(trace, my_var_names, theta_true, sampler, fname=fname_trace)
 
     rmse_paramsmean, rmse_fitmean  = rmse_fit_mean(wrapper, trace, theta_true, my_var_names, params, cut, tr, starts, nn, FC_obs_flat)
     print ('RMSE to true parameters', rmse_paramsmean),
@@ -492,9 +463,10 @@ def main():
         "RMSE_fit_map": [rmse_fitmap],
     }
 
-    summary_df = pd.DataFrame(summary_data)
-    summary_df.to_csv(fname_summary_csv, index=False)
-    print(f"RMSE summary saved to: {fname_summary_csv}")
+    summary_df_RMSE = pd.DataFrame(summary_data)
+    summary_df_RMSE.to_csv(fname_summary_RMSE_csv, index=False)
+    print(f"RMSE summary saved to: {fname_summary_RMSE_csv}")
 
 if __name__ == "__main__":
+
     main()

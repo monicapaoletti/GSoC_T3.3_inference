@@ -130,7 +130,7 @@ def precompute_shift_and_starts(T, wwidth, olap):
     return shift, starts
 
 #@jax.jit(static_argnums=(2, 3))
-def extract_FCD_jax(data, starts, nnodes, wwidth=30, olap=0.9):
+def extract_FCD_jax(data, starts, nnodes, wwidth=30, olap=0.94):
     def compute_fc(start):
         window = jax.lax.dynamic_slice(data, (0, start), (nnodes, wwidth))
         #print("Window shape:", window.shape)
