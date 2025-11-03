@@ -36,14 +36,13 @@ import pytensor.tensor as pt
 from pytensor.compile.ops import as_op
 from scipy.optimize import least_squares
 
-from mpr_pytensor_model import pytensor_forward_model_matrix
-
-
 # local modules
 import utils
 from FCD_jax import *    
 import mpr_jax
 mpr_jax = __import__("mpr_jax")
+#import config
+#from mpr_pytensor_model import pytensor_forward_model_matrix
 
 # ------------------ Argument parser ------------------
 def parse_args():
@@ -113,9 +112,12 @@ def wrapper_fc(G, par, cut, tr, starts, nn):
     return FC_full[tri_idx]
 
 #@timer
-def wrapper_fcd(G, par, cut, tr, starts, nn):
-    par = deepcopy(par)
+def wrapper_fcd(G, weights, t_end, cut, tr, starts, nn):
+    #par = deepcopy(par)
+    par={}
     par["G"] = G
+    par['weights'] = weights
+    par['t_end'] = t_end
     sde = mpr_jax.MPR_sde.create(par)
     data = sde.run({})
     bold_d = data["bold_d"]
@@ -130,19 +132,24 @@ def wrapper_fcd(G, par, cut, tr, starts, nn):
 
 
 # decorator with input and output types a Pytensor double float tensors
-#@as_op(itypes=[pt.dvector], otypes=[pt.dvector])
-#def pytensor_forward_model_matrix(G):
 
-#    if PARAMS is None:
-#        raise RuntimeError("Globals not set: set PARAMS and STARTS before building model.")
-#    result =  wrapper_fcd(G=float(np.atleast_1d(G).item()), 
-#                          par=PARAMS, 
-#                          cut=CUT, 
-#                          tr=TR_, 
-#                          starts=STARTS, 
-#                          nn=NN)
-#    return np.asarray(result, dtype=np.float64).flatten()
 
+@as_op(itypes=[pt.dvector, pt.dmatrix, pt.dscalar, pt.dscalar, pt.dscalar, pt.dvector, pt.dscalar], otypes=[pt.dvector])
+def pytensor_forward_model_matrix(G, weights, t_end, cut, tr, starts, nn):
+    # inputs inside op are numpy arrays / scalars
+    G_val = float(np.atleast_1d(G))
+    weights_np = np.asarray(weights, dtype=np.float64)
+    t_end_val = int(float(t_end))
+    cut_val = int(float(cut))
+    tr_val = int(float(tr))
+    starts_np = np.asarray(starts, dtype=np.int64)   # if you need ints inside wrapper
+    nn_val = int(float(nn))
+
+    # call your wrapper which expects python/numpy/jax types:
+    return np.asarray(
+        wrapper_fcd(G_val, weights_np, t_end_val, cut_val, tr_val, starts_np, nn_val),
+        dtype=np.float64
+    ).flatten()
 
 # ------------------ Helpers ------------------
 def tails_percentile(my_var_names, prior_predictions, thr):
@@ -176,11 +183,11 @@ def plot_trace(trace, my_var_names, theta_true, sampler, fname=None):
 
     return axes   
 
-def rmse_fit_mean(wrapper, trace, theta_true, my_var_names, params, cut, tr, starts, nn, FC_obs_flat):
+def rmse_fit_mean(wrapper, trace, theta_true, my_var_names, weights, t_end, cut, tr, starts, nn, FC_obs_flat):
 
     theta_mean=np.mean(az.extract(trace).to_dataframe()[my_var_names], axis=0).to_numpy()
     theta_err=np.sqrt(np.mean(theta_mean-theta_true)**2)
-    xs_= wrapper(G=theta_mean, par=params, cut=cut, tr=tr, starts=starts, nn=nn)
+    xs_= wrapper(G=theta_mean, weights=weights, t_end=t_end, cut=cut, tr=tr, starts=starts, nn=nn)
     xs_err=np.sqrt(np.mean((xs_-FC_obs_flat)**2))
     
     return (theta_err), np.mean(xs_err)
@@ -195,13 +202,13 @@ def calcula_map(chains_):
         params_map.append(x_value_at_peak)
     return params_map
 
-def rmse_fit_map(wrapper, trace, theta_true, my_var_names, params, cut, tr, starts, nn, FC_obs_flat):
+def rmse_fit_map(wrapper, trace, theta_true, my_var_names, weights, t_end, cut, tr, starts, nn, FC_obs_flat):
 
     chains_pooled = trace.posterior["G"].values.reshape(1, -1)
     theta_map=calcula_map(chains_pooled)
     theta_map =jnp.array(theta_map)
     theta_err=np.sqrt(np.mean(theta_map-theta_true)**2)
-    xs_= wrapper(G=theta_map, par=params, cut=cut, tr=tr, starts=starts, nn=nn)
+    xs_= wrapper(G=theta_map, weights=weights, t_end=t_end, cut=cut, tr=tr, starts=starts, nn=nn)
     xs_err=np.sqrt(np.mean((xs_-FC_obs_flat)**2))
     
     return (theta_err), np.mean(xs_err)
@@ -250,12 +257,8 @@ def main():
     shift, starts = precompute_shift_and_starts(T, wwidth=wwidth, olap=olap)
 
     params = {
-        "G": G, "weights": SC, "t_end": t_end,
-        "dt": 0.01, "eta": jnp.array([-4.6]), "rv_decimate": 10,
-        "noise_amp": 0.037, "tr": 1.0, "seed": seed
+        "G": G, "weights": SC, "t_end": t_end, "tr": 1.0, "seed": seed
     }
-
-    # set globals used by pytensor function
 
     print("Running inference with parameters:")
     print(f"G = {G}, t_end = {t_end}, tr = {tr}, cut = {cut}, wwidth = {wwidth}, "
@@ -284,10 +287,11 @@ def main():
     else:
         raise ValueError(f"Invalid Functional Connectivity type '{which_stat}'. Must be 'FC' or 'FCD'.")
 
+
     # --- Generate observed data ---
-    #print("Using wrapper:", wrapper.__name__)
+    print("Using wrapper:", wrapper.__name__)
     #print(G,params,cut,tr,starts,nn)
-    FC_obs_flat = wrapper(G=G, par=params, cut=cut, tr=tr, starts=starts, nn=nn)
+    FC_obs_flat = wrapper(G, weights, t_end, cut, tr, starts, nn)#(G=G, par=params, cut=cut, tr=tr, starts=starts, nn=nn)
     #print('FC_obs_flat_shape',np.shape(FC_obs_flat))
     data = {"FC_obs": FC_obs_flat, "params": params, "obs_err": obs_err, "cut": cut, "tr":tr, "starts":starts, "nn":nn}
     prior_specs = {"mu_G" : 0.5, "sigma": 0.7, "lower": 0}
@@ -316,8 +320,16 @@ def main():
         params_samples = [G]
         
         # Ode solution function
-        FC_hat_flat = pytensor_forward_model_matrix(pm.math.stack(params_samples))
-        
+        #FC_hat_flat = pytensor_forward_model_matrix(pm.math.stack(params_samples))
+        FC_hat_flat = pytensor_forward_model_matrix(pm.math.stack(params_samples), 
+                                                    pt.as_tensor_variable(np.array(weights)),   
+                                                    pt.as_tensor_variable(np.array(float(t_end))),
+                                                    pt.as_tensor_variable(np.array(float(cut))),
+                                                    pt.as_tensor_variable(np.array(float(tr))),
+                                                    pt.as_tensor_variable(np.asarray(starts, dtype=np.float64)),    
+                                                    pt.as_tensor_variable(np.array(float(nn)))
+                                                    )
+                                                        
         # Likelihood
         pm.Normal("FC_obs", mu=FC_hat_flat, sigma=obs_err, observed=FC_obs_flat)
 
@@ -347,7 +359,7 @@ def main():
         sampler = "Metropolis"
         start_time = time.time()
         with model:
-            trace_M = pm.sample(step=[pm.Metropolis(vars_list)], tune=n_warmup, draws=n_samples, chains=n_chains,
+            trace_M = pm.sample(step=[pm.Metropolis()], tune=n_warmup, draws=n_samples, chains=n_chains,
                             initvals={var_name: tails_5th_percentile[var_name] for var_name in my_var_names}
                             )
         crudetime_M=time.time() - start_time
@@ -359,7 +371,7 @@ def main():
         sampler = "DE MetropolisZ"
         start_time = time.time()
         with model:
-            trace_DEMZ = pm.sample(step=[pm.DEMetropolisZ(vars_list)], tune=n_warmup, draws=n_samples, chains=n_chains,
+            trace_DEMZ = pm.sample(step=[pm.DEMetropolisZ()], tune=n_warmup, draws=n_samples, chains=n_chains,
                                     initvals={var_name: tails_5th_percentile[var_name] for var_name in my_var_names}
                                 ) 
         crudetime_DEMZ=time.time() - start_time
@@ -399,7 +411,8 @@ def main():
 
         def simulator_forward_model(rng,  G, size=None):
             theta = G 
-            mu = wrapper(G=G.item(), par=params, cut=cut, tr=tr, starts=starts, nn=nn).reshape(-1, 1)
+            #mu = wrapper(G=G.item(), par=params, cut=cut, tr=tr, starts=starts, nn=nn).reshape(-1, 1)
+            mu = wrapper(G=G.item(), weights=weights, t_end=t_end, cut=cut, tr=tr, starts=starts, nn=nn).reshape(-1, 1)
             return rng.normal(mu, obs_err)
         
         with pm.Model() as model:
@@ -448,11 +461,11 @@ def main():
 
     plot_trace(trace, my_var_names, theta_true, sampler, fname=fname_trace)
 
-    rmse_paramsmean, rmse_fitmean  = rmse_fit_mean(wrapper, trace, theta_true, my_var_names, params, cut, tr, starts, nn, FC_obs_flat)
+    rmse_paramsmean, rmse_fitmean  = rmse_fit_mean(wrapper, trace, theta_true, my_var_names, weights, t_end, cut, tr, starts, nn, FC_obs_flat)
     print ('RMSE to true parameters', rmse_paramsmean),
     print ('RMSE to true observation', rmse_fitmean)
 
-    rmse_paramsmap, rmse_fitmap  = rmse_fit_map(wrapper, trace, theta_true, my_var_names, params, cut, tr, starts, nn, FC_obs_flat)
+    rmse_paramsmap, rmse_fitmap  = rmse_fit_map(wrapper, trace, theta_true, my_var_names, weights, t_end, cut, tr, starts, nn, FC_obs_flat)
     print ('RMSE to true parameters', rmse_paramsmap),
     print ('RMSE to true observation', rmse_fitmap)
 

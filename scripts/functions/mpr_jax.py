@@ -300,7 +300,7 @@ class ParMPR:
     RECORD_RV: bool = True
     RECORD_BOLD: bool = True
     rv_decimate: int = 10
-    tr: float = 500.0
+    tr: float = 1.0#500.0
 
     @classmethod
     def create(cls, **kwargs):
