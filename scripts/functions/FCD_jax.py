@@ -122,7 +122,7 @@ def extract_FCD_jax_old(data, wwidth=30, olap=0.9, shift=None):
     return fcd_matrix
 
 
-#before calling the next functions, compute nnodes, T = data.shape
+# compute nnodes, T = data.shape before calling the next function
 
 def precompute_shift_and_starts(T, wwidth, olap):
     shift = (jnp.round(wwidth * (1 - olap)).astype(int)).astype(int)
@@ -151,3 +151,8 @@ def extract_FCD_jax(data, starts, nnodes, wwidth=30, olap=0.94):
     return fcd_matrix
 
 extract_FCD_jax_jitted = jax.jit(extract_FCD_jax, static_argnums=(2, 3))
+
+def fluidity(fcd, win_len=30, overlap=0.94):
+    k = int((float(win_len)/(float(win_len)-float(overlap)))+1)
+    triangle = jnp.triu(fcd, k)
+    return jnp.var(triangle)
