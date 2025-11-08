@@ -17,6 +17,7 @@ Mentors: Meysam Hashemi and Daniele Marinazzo
     - notebook/  # Example notebooks
       - mpr_jax.ipynb  # Jupyter notebook with JAX simulations
       - mpr_jax_inference.ipynb #notebook for optimization and Bayesian inference
+      - mpr_jax_inference_smallSC.ipynb #notebook for optimization with parameter sweeping for both small and whole network
     - functions/  # Core simulation and inference scripts
       - mpr.py  # Montbrió model implemented in Numba
       - mpr_jax.py  # Montbrió model implemented in Python/JAX
@@ -24,6 +25,10 @@ Mentors: Meysam Hashemi and Daniele Marinazzo
       - grid_search_fc.py  # Infer G by minimizing FC differences
       - grid_search_fcd.py  # Infer G by minimizing FCD differences
       - mpr_fc_fcd.py  # Run simulations for fixed G and t_end, store and plot results
+      - mpr_jax_numpyro.py # Broken attempt of gradient-based inference
+      - mpr_jax_pymc.py # Gradient-free inference
+      - utils.py # Utilities
   - README.md  # Project documentation
+  - GSoC_final_submission.md # Submission document
 
 

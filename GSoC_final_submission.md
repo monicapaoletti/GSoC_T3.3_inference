@@ -18,6 +18,10 @@
 
 **Project**: Transitioning from Simulation-Based Inference to Automatic MCMC for Virtual Brain Inference 
 
+
+
+**Repo**: [repo](https://github.com/monicapaoletti/GSoC_T3.3_inference/tree/main)
+
  
 
 **Project description** 
