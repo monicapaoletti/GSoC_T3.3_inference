@@ -577,7 +577,7 @@ class MPR_sde:
         key, new_key = jax.random.split(self.key)
         new_self = self.replace(P=P, key=new_key)
 
-        result = integrate_vbjax(
+        result = integrate(
                         nn,
                         new_self.P,
                         self.B,
