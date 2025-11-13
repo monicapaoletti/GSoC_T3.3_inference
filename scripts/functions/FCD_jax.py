@@ -10,6 +10,21 @@ def get_fc(bold):
     FC = FC - jnp.diag(jnp.diag(FC))
     return FC
 
+def stable_corrcoef(bold, eps=1e-6):
+    """
+    for model with gradients
+    """
+    # bold: shape (nodes, timepoints)
+    x = bold - jnp.mean(bold, axis=1, keepdims=True)
+    T = bold.shape[1]
+    cov = (x @ x.T) / (T - 1)
+    var = jnp.diag(cov)
+    denom = jnp.sqrt(jnp.outer(var, var) + eps)
+    corr = cov / denom
+    corr = corr * (corr > 0)
+    corr = corr - jnp.diag(jnp.diag(corr))
+    return corr
+
 def extract_FCD(data, wwidth=30, maxNwindows=200, olap=0.94, coldata=False, mode='corr'):
     """
     Extract Functional Connectivity Dynamics (FCD) from time series data.  

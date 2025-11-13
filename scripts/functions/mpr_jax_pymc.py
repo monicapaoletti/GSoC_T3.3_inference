@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Runnable inference script for your FC model using Numpyro + JAX.
-Now automatically appends parameter tags to all saved outputs.
+Runnable inference script for FC + FCD statistics using PyMC + JAX.
 """
 
 import sys
@@ -66,6 +65,10 @@ def parse_args():
     # Inference settings
     parser.add_argument("--obs_err", type=float, default=0.01)
     parser.add_argument("--n_prior", type=int, default=10000)
+    parser.add_argument("--mu_G", type=float, default=0.5)
+    parser.add_argument("--sigma_G", type=float, default=1.0)
+    parser.add_argument("--lower_G", type=float, default=0.0)
+
     parser.add_argument("--n_warmup", type=int, default=100)
     parser.add_argument("--n_samples", type=int, default=100)
     parser.add_argument("--n_chains", type=int, default=4)
@@ -73,7 +76,7 @@ def parse_args():
     parser.add_argument("--sampler", type=str, default="smcabc",
                     choices=["slice", "metropolis", "demetropolisz", "demetropolis", "smclik", "smcabc"], help="Choose inference method")
     parser.add_argument("--epsilon", type=float, default=10, help="epsilon parameter for smc abc algorithm")
-    parser.add_argument("--threshold", type=float, default=0.4, help="threshold parameter for smc algorithm")
+    parser.add_argument("--threshold", type=float, default=0.5, help="threshold parameter for smc algorithm")
     parser.add_argument("--correlation_threshold", type=float, default=0.05, help="correlation_threshold parameter for smc algorithm")
 
     # Misc
@@ -137,7 +140,7 @@ def wrapper_fcd(G, weights, t_end, cut, tr, starts, nn):
 @as_op(itypes=[pt.dvector, pt.dmatrix, pt.dscalar, pt.dscalar, pt.dscalar, pt.dvector, pt.dscalar], otypes=[pt.dvector])
 def pytensor_forward_model_matrix(G, weights, t_end, cut, tr, starts, nn):
     # inputs inside op are numpy arrays / scalars
-    G_val = float(np.atleast_1d(G))
+    G_val = float(np.atleast_1d(G).item())
     weights_np = np.asarray(weights, dtype=np.float64)
     t_end_val = int(float(t_end))
     cut_val = int(float(cut))
@@ -230,9 +233,12 @@ def main():
 
     # --- unpack args ---
     G, t_end, tr, cut = args.G, args.t_end, args.tr, args.cut
+
     wwidth, maxWindows, olap = args.wwidth, args.maxWindows, args.olap
-    obs_err, n_prior, n_warmup, n_samples, n_chains, epsilon, threshold, correlation_threshold = (
-        args.obs_err, args.n_prior, args.n_warmup, args.n_samples, args.n_chains, args.epsilon, args.threshold, args.correlation_threshold
+
+    obs_err, n_prior, mu_G, sigma_G, lower_G, n_warmup, n_samples, n_chains, epsilon, threshold, correlation_threshold = (
+        args.obs_err, args.n_prior, args.mu_G, args.sigma_G, args.lower_G, args.n_warmup, args.n_samples, args.n_chains, 
+        args.epsilon, args.threshold, args.correlation_threshold
     )
     seed = args.seed
     SC_type = args.SC_type.lower()
@@ -267,7 +273,7 @@ def main():
           f"n_samples = {n_samples}, n_chains = {n_chains}")
 
     # --- parameter tag for filenames ---  
-    tag = f"G{G}_cut{cut}_tr{tr}_seed{seed}_tend{t_end}_ns{n_samples}_nc{n_chains}_SC_{SC_size}_sampler_{sampler}_which_stat_{which_stat}"
+    tag = f"G{G}_cut{cut}_tr{tr}_seed{seed}_tend{t_end}_ns{n_samples}_nc{n_chains}_SC_{SC_size}_sampler_{sampler}_which_stat_{which_stat}_epsilon_{epsilon}"
     print(f"\nSaving all outputs with tag: {tag}\n")
 
     # --- file paths ---  
@@ -294,11 +300,11 @@ def main():
     FC_obs_flat = wrapper(G, weights, t_end, cut, tr, starts, nn)#(G=G, par=params, cut=cut, tr=tr, starts=starts, nn=nn)
     #print('FC_obs_flat_shape',np.shape(FC_obs_flat))
     data = {"FC_obs": FC_obs_flat, "params": params, "obs_err": obs_err, "cut": cut, "tr":tr, "starts":starts, "nn":nn}
-    prior_specs = {"mu_G" : 0.5, "sigma": 0.7, "lower": 0}
+    prior_specs = {"mu_G" : mu_G, "sigma_G": sigma_G, "lower_G": lower_G}
     my_var_names = ['G']
 
     with pm.Model() as prior_model:
-        G = pm.TruncatedNormal("G", mu=prior_specs["mu_G"], sigma=prior_specs["sigma"], lower=prior_specs["lower"])
+        G = pm.TruncatedNormal("G", mu=prior_specs["mu_G"], sigma=prior_specs["sigma_G"], lower=prior_specs["lower_G"])
 
     with prior_model:
         prior_predict= pm.sample_prior_predictive(n_prior)
@@ -315,7 +321,7 @@ def main():
 
     with pm.Model() as model:
         # Priors
-        G = pm.TruncatedNormal("G", mu=prior_specs["mu_G"], lower=prior_specs["lower"])
+        G = pm.TruncatedNormal("G", mu=prior_specs["mu_G"], sigma=prior_specs["sigma_G"], lower=prior_specs["lower_G"])
         
         params_samples = [G]
         
@@ -417,7 +423,7 @@ def main():
         
         with pm.Model() as model:
             # Priors
-            G = pm.TruncatedNormal("G", mu=prior_specs["mu_G"], lower=prior_specs["lower"])
+            G = pm.TruncatedNormal("G", mu=prior_specs["mu_G"], sigma=prior_specs["sigma_G"], lower=prior_specs["lower_G"])
             
             params_samples=[G]
             
@@ -428,7 +434,7 @@ def main():
                 epsilon=epsilon,
                 observed=FC_obs_flat,)
             
-        sampler = f"SMC_epsilon = {epsilon}"
+        sampler = f"SMC, $\epsilon$ = {epsilon}"
 
         start_time = time.time()
 
