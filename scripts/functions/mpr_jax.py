@@ -41,6 +41,29 @@ def f_mpr(x, t, P, nn): #, nn, method, output
     #dxdt = 50.0 * jnp.tanh(dxdt/50.0)
     return dxdt
 
+def heun_sde_with_noise(x, t, P, nn, dW_r, dW_v):
+    dt = P.dt
+    x0, x1 = x[:nn], x[nn:]
+    
+    dx = f_mpr(x, t, P, nn)
+    dx0, dx1 = dx[:nn], dx[nn:]
+    
+    # Heun predictor
+    r_pred = x0 + dt * dx0 + dW_r
+    v_pred = x1 + dt * dx1 + dW_v
+    
+    dx_pred = f_mpr(jnp.concatenate([r_pred, v_pred]), t + dt, P, nn)
+    dx0_pred, dx1_pred = dx_pred[:nn], dx_pred[nn:]
+    
+    # Heun corrector
+    r_new = x0 + 0.5 * dt * (dx0 + dx0_pred) + dW_r
+    v_new = x1 + 0.5 * dt * (dx1 + dx1_pred) + dW_v
+    
+    # Enforce r >= 0
+    r_new = jnp.maximum(r_new, 0.0)
+    
+    return jnp.concatenate([r_new, v_new])
+
 #@jax.jit
 def do_bold_step(r_in, s, f, ftilde, vtilde, qtilde, v, q, dtt, P):
     """balloon windkessel model
@@ -80,16 +103,14 @@ def do_bold_step(r_in, s, f, ftilde, vtilde, qtilde, v, q, dtt, P):
 
     return s1, f1, ftilde1, vtilde1, qtilde1, v1, q1
 
-def integrate_fast_noise(nn, P, B, key, record_rv, record_bold, nt, rv_decimate, bold_decimate):
+def integrate_fast_noise_remat(
+    nn, P, B, key, record_rv, record_bold, nt, rv_decimate, bold_decimate,
+    noise_r=None, noise_v=None, initial_bold_state=None
+):
     """
-    Optimized integration:
-    - Pre-generate all noise increments
-    - Single lax.scan over time steps
-    - Heun integration for neural state
-    - BOLD integration
-    - Downsampling of RV and BOLD
+    Same API as integrate_fast_noise but with remat checkpointing.
+    Supports carrying over BOLD state between blocks.
     """
-
     dt = P.dt
     r_period = dt * rv_decimate
     dtt = r_period / 1000.0  # BOLD substep in seconds
@@ -100,22 +121,26 @@ def integrate_fast_noise(nn, P, B, key, record_rv, record_bold, nt, rv_decimate,
     k2 = B.epsilon * B.r0 * B.Eo * B.TE
     k3 = 1 - B.epsilon
 
-    # Pre-generate all neural noise (nt x nn)
-    key_r, key_v = jax.random.split(key)
-    dW_r_all = P.sigma_r * jax.random.normal(key_r, shape=(nt, nn))
-    dW_v_all = P.sigma_v * jax.random.normal(key_v, shape=(nt, nn))
+    # Generate noise if not provided
+    if (noise_r is None) or (noise_v is None):
+        key_r, key_v = jax.random.split(key)
+        noise_r = P.sigma_r * jax.random.normal(key_r, shape=(nt, nn), dtype=jnp.float32)
+        noise_v = P.sigma_v * jax.random.normal(key_v, shape=(nt, nn), dtype=jnp.float32)
 
     # Initial neural state
     rv = P.initial_state
 
     # Initial BOLD state
-    s = jnp.ones(nn)
-    f = jnp.ones(nn)
-    ftilde = jnp.zeros(nn)
-    vtilde = jnp.zeros(nn)
-    qtilde = jnp.zeros(nn)
-    v = jnp.ones(nn)
-    q = jnp.ones(nn)
+    if initial_bold_state is not None:
+        s, f, ftilde, vtilde, qtilde, v, q = initial_bold_state
+    else:
+        s = jnp.ones(nn)
+        f = jnp.ones(nn)
+        ftilde = jnp.zeros(nn)
+        vtilde = jnp.zeros(nn)
+        qtilde = jnp.zeros(nn)
+        v = jnp.ones(nn)
+        q = jnp.ones(nn)
 
     # Preallocate downsampled arrays
     n_rv = nt // rv_decimate if record_rv else 1
@@ -125,17 +150,18 @@ def integrate_fast_noise(nn, P, B, key, record_rv, record_bold, nt, rv_decimate,
     vv_d = jnp.zeros((n_bold, nn), dtype=jnp.float32)
     qq_d = jnp.zeros((n_bold, nn), dtype=jnp.float32)
 
+    # --- define the per-step function ---
     def step(carry, i):
         rv, s, f, ftilde, vtilde, qtilde, v, q, rv_d, rv_t, vv_d, qq_d = carry
-        dWr = dW_r_all[i]
-        dWv = dW_v_all[i]
+        dWr = noise_r[i]
+        dWv = noise_v[i]
 
         # Advance neural state
         rv_next = heun_sde_with_noise(rv, 0.0, P, nn, dWr, dWv)
         r_in = rv_next[:nn]
 
         # Advance BOLD
-        s, f, ftilde, vtilde, qtilde, v, q = do_bold_step(r_in, s, f, ftilde, vtilde, qtilde, v, q, dtt, B)
+        s1, f1, ftilde1, vtilde1, qtilde1, v1, q1 = do_bold_step(r_in, s, f, ftilde, vtilde, qtilde, v, q, dtt, B)
 
         # Downsample RV
         rv_idx = i // rv_decimate
@@ -156,25 +182,26 @@ def integrate_fast_noise(nn, P, B, key, record_rv, record_bold, nt, rv_decimate,
         bold_idx = i // bold_decimate
         vv_d = jax.lax.cond(
             record_bold & (i % bold_decimate == 0),
-            lambda vv_: vv_.at[bold_idx].set(v),
+            lambda vv_: vv_.at[bold_idx].set(v1),
             lambda vv_: vv_,
             vv_d
         )
         qq_d = jax.lax.cond(
             record_bold & (i % bold_decimate == 0),
-            lambda qq_: qq_.at[bold_idx].set(q),
+            lambda qq_: qq_.at[bold_idx].set(q1),
             lambda qq_: qq_,
             qq_d
         )
 
-        return (rv_next, s, f, ftilde, vtilde, qtilde, v, q, rv_d, rv_t, vv_d, qq_d), None
+        return (rv_next, s1, f1, ftilde1, vtilde1, qtilde1, v1, q1, rv_d, rv_t, vv_d, qq_d), None
 
+    remat_step = jax.remat(step)
     init_carry = (rv, s, f, ftilde, vtilde, qtilde, v, q, rv_d, rv_t, vv_d, qq_d)
-    final_carry, _ = jax.lax.scan(step, init_carry, jnp.arange(nt))
+    final_carry, _ = jax.lax.scan(remat_step, init_carry, jnp.arange(nt))
 
     rv_d, rv_t, vv_d, qq_d = final_carry[8], final_carry[9], final_carry[10], final_carry[11]
 
-    # Compute final BOLD
+    # Compute final BOLD signal
     if record_bold:
         bold_d = vo * (k1 * (1 - qq_d) + k2 * (1 - qq_d / vv_d) + k3 * (1 - vv_d))
         bold_t = jnp.linspace(0, P.t_end - dt * bold_decimate, len(bold_d)) * 10.0
@@ -187,37 +214,14 @@ def integrate_fast_noise(nn, P, B, key, record_rv, record_bold, nt, rv_decimate,
         "rv_d": rv_d.astype(jnp.float32),
         "bold_t": bold_t.astype(jnp.float32),
         "bold_d": bold_d.astype(jnp.float32),
+        "final_state": final_carry[0],
+        "final_bold_state": final_carry[1:8],  # s, f, ftilde, vtilde, qtilde, v, q
     }
 
-
-# JIT the optimized integrator
 integrate_jitted_fast_noise = jax.jit(
-    integrate_fast_noise,
+    integrate_fast_noise_remat,
     static_argnames=["nn", "record_rv", "record_bold", "nt", "rv_decimate", "bold_decimate"]
 )
-
-def heun_sde_with_noise(x, t, P, nn, dW_r, dW_v):
-    dt = P.dt
-    x0, x1 = x[:nn], x[nn:]
-    
-    dx = f_mpr(x, t, P, nn)
-    dx0, dx1 = dx[:nn], dx[nn:]
-    
-    # Heun predictor
-    r_pred = x0 + dt * dx0 + dW_r
-    v_pred = x1 + dt * dx1 + dW_v
-    
-    dx_pred = f_mpr(jnp.concatenate([r_pred, v_pred]), t + dt, P, nn)
-    dx0_pred, dx1_pred = dx_pred[:nn], dx_pred[nn:]
-    
-    # Heun corrector
-    r_new = x0 + 0.5 * dt * (dx0 + dx0_pred) + dW_r
-    v_new = x1 + 0.5 * dt * (dx1 + dx1_pred) + dW_v
-    
-    # Enforce r >= 0
-    r_new = jnp.maximum(r_new, 0.0)
-    
-    return jnp.concatenate([r_new, v_new])
 
 @struct.dataclass
 class ParMPR:
@@ -243,7 +247,7 @@ class ParMPR:
     RECORD_RV: bool = True
     RECORD_BOLD: bool = True
     rv_decimate: int = 10
-    tr: float = 1.0#500.0
+    tr: float = 300.0#500.0
 
     @classmethod
     def create(cls, **kwargs):
@@ -325,63 +329,183 @@ class MPR_sde:
         assert self.P.weights.shape[0] == self.P.weights.shape[1]
         assert self.P.initial_state is not None
         assert len(self.P.initial_state) == 2 * self.P.weights.shape[0]
-
-    def run(self, par: dict = {}, x0: jnp.ndarray = None):
+    
+    def run(
+        self,
+        par: dict = {},
+        x0: jnp.ndarray = None,
+        block_size: int = 10_000,
+        record_rv: bool = True,
+        noise_blocks=None
+    ):
+        """
+        Chunked, memory-friendly run() for MPR+Balloon simulation.
+        Supports optional recording of RV to save memory.
+        Accepts dict parameter overrides like old API.
+        """
+        # ------------------ parameters ------------------
         P = self.P
+        for k, v in par.items():
+            if k not in ParMPR.__annotations__:
+                raise ValueError(f"Invalid parameter: {k}")
+            P = P.replace(**{k: v})
 
-        # If external x0 not provided, use internal initial state
-        if x0 is None:
-            sim = self.with_initial_state()
-            P = P.replace(initial_state=sim.initial_state)
-            key = sim.key
-        else:
-            P = P.replace(initial_state=x0)
-            P = P.replace(nn=(len(x0)//2))
-            key = self.key
-        # Override parameters
-        for key, val in par.items():
-            if key not in ParMPR.__annotations__:
-                raise ValueError(f"Invalid parameter: {key}")
-            P = P.replace(**{key: val})
-        # Sanity check
         P = P.replace(
             eta=check_vec_size(P.eta, P.nn),
             t_end=P.t_end / 10,
             t_cut=P.t_cut / 10
-        )        
+        )
 
-        assert P.weights.shape[0] == P.weights.shape[1]
-        assert P.initial_state is not None
-        assert len(P.initial_state) == 2 * P.nn
-
-        #key = jax.random.PRNGKey(P.seed)
-        new_self = self.replace(P=P)
-        new_self.check_input()
-        nn = int(new_self.P.nn)
-        nt = int(new_self.P.t_end / new_self.P.dt)
-
-        dt = float(new_self.P.dt)
-        tr = float(new_self.P.tr)
-        rv_decimate = int(new_self.P.rv_decimate)
+        nn = int(P.nn)
+        dt = float(P.dt)
+        tr = float(P.tr)
+        rv_decimate = int(P.rv_decimate)
         r_period = dt * rv_decimate
-        bold_decimate = int(np.round(tr / r_period))
-        key, new_key = jax.random.split(self.key)
-        new_self = self.replace(P=P, key=new_key)
+        bold_decimate = max(1, int(np.round(tr / r_period)))
+        nt_total = int(P.t_end / P.dt)
 
-        result = integrate_jitted_fast_noise(
+        # ------------------ initial state ------------------
+        if x0 is not None:
+            state = x0
+            key = self.key
+        elif P.initial_state.size == 2 * nn:
+            state = P.initial_state
+            key = self.key
+        else:
+            sim = self.with_initial_state()
+            P = P.replace(initial_state=sim.initial_state)
+            state = sim.initial_state
+            key = sim.key
+        assert state.size == 2 * nn
+
+        # ------------------ blocks decomposition ------------------
+        n_full = nt_total // block_size
+        remainder = nt_total - n_full * block_size
+        use_external_noise = noise_blocks is not None
+
+        if use_external_noise:
+            noise_r_seq, noise_v_seq = noise_blocks
+            assert len(noise_r_seq) == (n_full + (1 if remainder else 0))
+            assert len(noise_v_seq) == (n_full + (1 if remainder else 0))
+
+        # ------------------ initial bold state ------------------
+        bold_state = (
+            jnp.ones(nn), jnp.ones(nn), jnp.zeros(nn),
+            jnp.zeros(nn), jnp.zeros(nn), jnp.ones(nn), jnp.ones(nn)
+        )
+
+        # ------------------ storage ------------------
+        rv_blocks, bold_blocks = [], []
+
+        # ------------------ JITed scan for full blocks ------------------
+        if n_full > 0:
+            @jax.jit
+            def scan_full_blocks(state, bold_state, key):
+                def body(carry, block_idx):
+                    key, state, bold_state = carry
+                    key, subkey = jax.random.split(key)
+
+                    # noise
+                    if use_external_noise:
+                        noise_r = noise_r_seq[block_idx]
+                        noise_v = noise_v_seq[block_idx]
+                    else:
+                        k1, k2 = jax.random.split(subkey)
+                        noise_r = jax.random.normal(k1, (block_size, nn)) * P.sigma_r
+                        noise_v = jax.random.normal(k2, (block_size, nn)) * P.sigma_v
+
+                    # integrate
+                    out = integrate_jitted_fast_noise(
                         nn=nn,
-                        P=new_self.P,
+                        P=P.replace(initial_state=state),
                         B=self.B,
-                        key=new_self.key,
-                        record_rv=new_self.P.RECORD_RV,
-                        record_bold=new_self.P.RECORD_BOLD,
-                        nt=nt,#int(new_self.P.t_end / new_self.P.dt),
+                        key=subkey,
+                        record_rv=record_rv,
+                        record_bold=P.RECORD_BOLD,
+                        nt=block_size,
                         rv_decimate=rv_decimate,
-                        bold_decimate=bold_decimate)
+                        bold_decimate=bold_decimate,
+                        noise_r=noise_r,
+                        noise_v=noise_v,
+                        initial_bold_state=bold_state
+                    )
 
-        """It's paramount to call block_until_ready(), either here, or during pmap/vmap.
-        Otherwise it'd seem that the simulation has been completed, when it fact it hasn't!""" 
+                    new_state = out["final_state"]
+                    new_bold_state = out["final_bold_state"]
+
+                    # collect downsampled RV/BOLD
+                    rv_chunk = out["rv_d"] if record_rv else jnp.zeros((0, 2*nn))
+                    bold_chunk = out["bold_d"]
+
+                    return (key, new_state, new_bold_state), (rv_chunk, bold_chunk)
+
+                (key_out, state_out, bold_state_out), (rv_chunks, bold_chunks) = jax.lax.scan(
+                    body,
+                    (key, state, bold_state),
+                    jnp.arange(n_full)
+                )
+                return key_out, state_out, bold_state_out, rv_chunks, bold_chunks
+
+            key, state, bold_state, rv_chunks, bold_chunks = scan_full_blocks(state, bold_state, key)
+            rv_blocks.append(rv_chunks)
+            bold_blocks.append(bold_chunks)
+
+        # ------------------ remainder block ------------------
+        if remainder:
+            key, subkey = jax.random.split(key)
+            if use_external_noise:
+                noise_r_last = noise_r_seq[n_full]
+                noise_v_last = noise_v_seq[n_full]
+            else:
+                k1, k2 = jax.random.split(subkey)
+                noise_r_last = jax.random.normal(k1, (remainder, nn)) * P.sigma_r
+                noise_v_last = jax.random.normal(k2, (remainder, nn)) * P.sigma_v
+
+            out_last = integrate_jitted_fast_noise(
+                nn=nn,
+                P=P.replace(initial_state=state),
+                B=self.B,
+                key=subkey,
+                record_rv=record_rv,
+                record_bold=P.RECORD_BOLD,
+                nt=remainder,
+                rv_decimate=rv_decimate,
+                bold_decimate=bold_decimate,
+                noise_r=noise_r_last,
+                noise_v=noise_v_last,
+                initial_bold_state=bold_state
+            )
+
+            state = out_last["final_state"]
+            bold_state = out_last["final_bold_state"]
+
+            if record_rv:
+                rv_blocks.append(jnp.expand_dims(out_last["rv_d"], axis=0))
+            bold_blocks.append(jnp.expand_dims(out_last["bold_d"], axis=0))
+
+        # ------------------ stitch blocks ------------------
+        if record_rv:
+            rv = jnp.concatenate([jnp.concatenate(rb, axis=0) for rb in rv_blocks], axis=0)
+            rv_t = jnp.arange(rv.shape[0]) * (dt * rv_decimate) * 10.0
+        else:
+            rv = None
+            rv_t = None
+
+        bold = jnp.concatenate([jnp.concatenate(bb, axis=0) for bb in bold_blocks], axis=0)
+        bold_t = jnp.arange(bold.shape[0]) * (dt * rv_decimate * bold_decimate) * 10.0 if P.RECORD_BOLD else None
+
+        result = {
+            "rv_d": rv,
+            "bold_d": bold,
+            "final_state": state,
+            "final_bold_state": bold_state,
+            "rv_t": rv_t,
+            "bold_t": bold_t
+        }
+
         return jax.block_until_ready(result)
+
+
 
 
 #@jax.jit(static_argnames=["nn"])
