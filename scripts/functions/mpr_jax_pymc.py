@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Runnable inference script for FC + FCD statistics using PyMC + JAX.
+Inference script for FC + FCD statistics using PyMC + JAX.
 """
 
 import sys
@@ -31,17 +31,17 @@ import errno
 import pymc as pm
 import pytensor
 import pytensor.tensor as pt
+pytensor.config.floatX = "float32"
 
 from pytensor.compile.ops import as_op
 from scipy.optimize import least_squares
 
 # local modules
 import utils
-from FCD_jax import *    
+import FCD_jax  
 import mpr_jax
 mpr_jax = __import__("mpr_jax")
-#import config
-#from mpr_pytensor_model import pytensor_forward_model_matrix
+#import mpr_jax_old as mpr_jax
 
 # ------------------ Argument parser ------------------
 def parse_args():
@@ -55,22 +55,22 @@ def parse_args():
 
     # scale the next three parameters together 
     parser.add_argument("--t_end", type=int, default=30000) #300000
-    parser.add_argument("--tr", type=int, default=50) #500
-    parser.add_argument("--cut", type=int, default=1000) #10000
+    parser.add_argument("--tr", type=int, default=300) #500
+    parser.add_argument("--cut", type=int, default=30) #10000
 
     parser.add_argument("--wwidth", type=int, default=30)
     parser.add_argument("--maxWindows", type=int, default=200)
     parser.add_argument("--olap", type=float, default=0.94)
 
     # Inference settings
-    parser.add_argument("--obs_err", type=float, default=0.01)
+    parser.add_argument("--obs_err", type=float, default=0.1)
     parser.add_argument("--n_prior", type=int, default=10000)
-    parser.add_argument("--mu_G", type=float, default=0.5)
-    parser.add_argument("--sigma_G", type=float, default=1.0)
+    parser.add_argument("--mu_G", type=float, default=0.3)
+    parser.add_argument("--sigma_G", type=float, default=0.5)
     parser.add_argument("--lower_G", type=float, default=0.0)
 
-    parser.add_argument("--n_warmup", type=int, default=100)
-    parser.add_argument("--n_samples", type=int, default=100)
+    parser.add_argument("--n_warmup", type=int, default=10)
+    parser.add_argument("--n_samples", type=int, default=10)
     parser.add_argument("--n_chains", type=int, default=4)
 
     parser.add_argument("--sampler", type=str, default="smcabc",
@@ -85,8 +85,7 @@ def parse_args():
     parser.add_argument("--SC_type", type=str, default="data",
                     help="Type of structural connectivity: 'sim' for simulated, 'data' for real data")
     parser.add_argument("--SC_size", type=int, default=6,
-                        help="Number of nodes in SC") #change to 6 or 10 for small networks
-
+                        help="Number of nodes in SC") 
     return parser.parse_args()
 
 
@@ -102,21 +101,7 @@ def timer(func):
 
 # ------------------ Wrapper ------------------
 @timer
-def wrapper_fc(G, par, cut, tr, starts, nn):
-    par = deepcopy(par)
-    par["G"] = G
-    sde = mpr_jax.MPR_sde.create(par)
-    data = sde.run({})
-    bold_d = data["bold_d"]
-
-    FC_full = get_fc(bold_d[int(cut):].T)   # <<< ensure int(cut)
-    
-    tri_idx = jnp.triu_indices(FC_full.shape[0], k=1) 
-    return FC_full[tri_idx]
-
-#@timer
-def wrapper_fcd(G, weights, t_end, cut, tr, starts, nn):
-    #par = deepcopy(par)
+def wrapper_fc(G, weights, t_end, cut):
     par={}
     par["G"] = G
     par['weights'] = weights
@@ -125,33 +110,40 @@ def wrapper_fcd(G, weights, t_end, cut, tr, starts, nn):
     data = sde.run({})
     bold_d = data["bold_d"]
 
-    bold_d_sub = bold_d[cut::tr].T
-    #print(starts,nn)
-    FCD_full = extract_FCD_jax_jitted(bold_d_sub, starts, nn, wwidth=30, olap=0.94) 
+    FC_full = FCD_jax.get_fc(bold_d[cut:].T)   
+    
+    tri_idx = jnp.triu_indices(FC_full.shape[0], k=1) 
+    return FC_full[tri_idx]
+
+def wrapper_fcd(G, weights, t_end, cut):
+    par={}
+    par["G"] = G
+    par['weights'] = weights
+    par['t_end'] = t_end
+    sde = mpr_jax.MPR_sde.create(par)
+    data = sde.run({})
+    bold_d = data["bold_d"]
+
+    FCD_full, _, _ = FCD_jax.extract_FCD(bold_d.T) 
     
     tri_idx = jnp.triu_indices(FCD_full.shape[0], k=30) 
-    #print(len(bold_d),len(bold_d_sub.T),np.shape(FCD_full),len(FCD_full[tri_idx]))
+
     return FCD_full[tri_idx]
 
+@as_op(
+    itypes=[pt.fscalar, pt.fmatrix, pt.fscalar, pt.fscalar],   
+    otypes=[pt.fvector]
+)
+def pytensor_forward_model_matrix(G, weights, t_end, cut):
 
-# decorator with input and output types a Pytensor double float tensors
+    G_val = float(G)
+    weights_np = np.asarray(weights, dtype=np.float32)
+    t_end_val = int(t_end)
+    cut_val = int(cut)
 
-
-@as_op(itypes=[pt.dvector, pt.dmatrix, pt.dscalar, pt.dscalar, pt.dscalar, pt.dvector, pt.dscalar], otypes=[pt.dvector])
-def pytensor_forward_model_matrix(G, weights, t_end, cut, tr, starts, nn):
-    # inputs inside op are numpy arrays / scalars
-    G_val = float(np.atleast_1d(G).item())
-    weights_np = np.asarray(weights, dtype=np.float64)
-    t_end_val = int(float(t_end))
-    cut_val = int(float(cut))
-    tr_val = int(float(tr))
-    starts_np = np.asarray(starts, dtype=np.int64)   # if you need ints inside wrapper
-    nn_val = int(float(nn))
-
-    # call your wrapper which expects python/numpy/jax types:
     return np.asarray(
-        wrapper_fcd(G_val, weights_np, t_end_val, cut_val, tr_val, starts_np, nn_val),
-        dtype=np.float64
+        wrapper_fcd(G_val, weights_np, t_end_val, cut_val),
+        dtype=np.float32,
     ).flatten()
 
 # ------------------ Helpers ------------------
@@ -186,11 +178,11 @@ def plot_trace(trace, my_var_names, theta_true, sampler, fname=None):
 
     return axes   
 
-def rmse_fit_mean(wrapper, trace, theta_true, my_var_names, weights, t_end, cut, tr, starts, nn, FC_obs_flat):
+def rmse_fit_mean(wrapper, trace, theta_true, my_var_names, weights, t_end, cut, FC_obs_flat):
 
     theta_mean=np.mean(az.extract(trace).to_dataframe()[my_var_names], axis=0).to_numpy()
     theta_err=np.sqrt(np.mean(theta_mean-theta_true)**2)
-    xs_= wrapper(G=theta_mean, weights=weights, t_end=t_end, cut=cut, tr=tr, starts=starts, nn=nn)
+    xs_= wrapper(G=theta_mean, weights=weights, t_end=t_end, cut=cut)
     xs_err=np.sqrt(np.mean((xs_-FC_obs_flat)**2))
     
     return (theta_err), np.mean(xs_err)
@@ -205,13 +197,13 @@ def calcula_map(chains_):
         params_map.append(x_value_at_peak)
     return params_map
 
-def rmse_fit_map(wrapper, trace, theta_true, my_var_names, weights, t_end, cut, tr, starts, nn, FC_obs_flat):
+def rmse_fit_map(wrapper, trace, theta_true, weights, t_end, cut, FC_obs_flat):
 
     chains_pooled = trace.posterior["G"].values.reshape(1, -1)
     theta_map=calcula_map(chains_pooled)
     theta_map =jnp.array(theta_map)
     theta_err=np.sqrt(np.mean(theta_map-theta_true)**2)
-    xs_= wrapper(G=theta_map, weights=weights, t_end=t_end, cut=cut, tr=tr, starts=starts, nn=nn)
+    xs_= wrapper(G=theta_map, weights=weights, t_end=t_end, cut=cut)
     xs_err=np.sqrt(np.mean((xs_-FC_obs_flat)**2))
     
     return (theta_err), np.mean(xs_err)
@@ -249,21 +241,18 @@ def main():
 
     # --- setup params ---
     if SC_type == "sim":
-        SC = nx.to_numpy_array(nx.complete_graph(SC_size))
+        weights = nx.to_numpy_array(nx.complete_graph(SC_size))
     elif SC_type == "data":
         datapath = utils.DATA_ROOT
-        weights = np.loadtxt(os.path.join(datapath, "weights.txt"))
-        weights = weights[:SC_size,:SC_size]
-        nn = len(weights)
-        SC = jnp.array(weights) / jnp.max(weights)
+        SC = np.loadtxt(os.path.join(datapath, "weights.txt")).astype(np.float32)
+        SC = SC[:SC_size,:SC_size]
+        nn = len(SC)
+        weights = jnp.array(SC) / jnp.max(SC)
     else:
         raise ValueError(f"Invalid SC_type '{SC_type}'. Must be 'sim' or 'data'.")
     
-    T = (t_end-cut)//tr
-    shift, starts = precompute_shift_and_starts(T, wwidth=wwidth, olap=olap)
-
     params = {
-        "G": G, "weights": SC, "t_end": t_end, "tr": 1.0, "seed": seed
+        "G": G, "weights": weights, "t_end": t_end, "seed": seed
     }
 
     print("Running inference with parameters:")
@@ -296,10 +285,8 @@ def main():
 
     # --- Generate observed data ---
     print("Using wrapper:", wrapper.__name__)
-    #print(G,params,cut,tr,starts,nn)
-    FC_obs_flat = wrapper(G, weights, t_end, cut, tr, starts, nn)#(G=G, par=params, cut=cut, tr=tr, starts=starts, nn=nn)
-    #print('FC_obs_flat_shape',np.shape(FC_obs_flat))
-    data = {"FC_obs": FC_obs_flat, "params": params, "obs_err": obs_err, "cut": cut, "tr":tr, "starts":starts, "nn":nn}
+
+    FC_obs_flat = wrapper(G, weights, t_end, cut)
     prior_specs = {"mu_G" : mu_G, "sigma_G": sigma_G, "lower_G": lower_G}
     my_var_names = ['G']
 
@@ -320,26 +307,43 @@ def main():
     os.makedirs(resultspath, exist_ok=True)
 
     with pm.Model() as model:
-        # Priors
+
         G = pm.TruncatedNormal("G", mu=prior_specs["mu_G"], sigma=prior_specs["sigma_G"], lower=prior_specs["lower_G"])
         
-        params_samples = [G]
-        
-        # Ode solution function
-        #FC_hat_flat = pytensor_forward_model_matrix(pm.math.stack(params_samples))
-        FC_hat_flat = pytensor_forward_model_matrix(pm.math.stack(params_samples), 
-                                                    pt.as_tensor_variable(np.array(weights)),   
-                                                    pt.as_tensor_variable(np.array(float(t_end))),
-                                                    pt.as_tensor_variable(np.array(float(cut))),
-                                                    pt.as_tensor_variable(np.array(float(tr))),
-                                                    pt.as_tensor_variable(np.asarray(starts, dtype=np.float64)),    
-                                                    pt.as_tensor_variable(np.array(float(nn)))
+        FC_hat_flat = pytensor_forward_model_matrix(G, 
+                                                    pt.constant(np.array(SC, dtype=np.float32)),
+                                                    pt.constant(np.float32(t_end)),
+                                                    pt.constant(np.float32(cut)),
+                                                    #pt.as_tensor_variable(np.array(SC, dtype=np.float32)),
+                                                    #pt.as_tensor_variable(np.float32(t_end)),
+                                                    #pt.as_tensor_variable(np.float32(cut)),
                                                     )
+
+
+        # ✅ Convert everything ONCE to NumPy constants
+        #weights_np = np.asarray(SC, dtype=np.float32)
+        #t_end_np = np.float32(t_end)
+        #cut_np = np.float32(cut)
+
+        #FC_hat_flat = pytensor_forward_model_matrix(
+        #    G,
+        #    pt.constant(weights_np),   # ✅ CORRECT
+        #    pt.constant(t_end_np),     # ✅ CORRECT
+        #    pt.constant(cut_np),       # ✅ CORRECT
+        #)
                                                         
         # Likelihood
         pm.Normal("FC_obs", mu=FC_hat_flat, sigma=obs_err, observed=FC_obs_flat)
 
-    vars_list = list(model.values_to_rvs.keys())[:-1]
+    with model:
+        # Debug the model: check logp at initial point
+        print("Debugging model for NaNs or -inf in logp...")
+        model.debug()
+
+    
+
+    #vars_list = list(model.values_to_rvs.keys())[:-1]
+    vars_list = [model["G"]]
 
     # --- inference ---
     theta_true = np.array([params["G"]])
@@ -348,12 +352,27 @@ def main():
 
     rng_key, rng_key_run = jax.random.split(rng_key)
 
+    
+    # ---- SAFE forward-model test (NumPy only, correct evaluation) ----
+
+    #test_val = FC_hat_flat.eval({
+    #    G: np.float32(0.33),
+    #    # IMPORTANT: must match the symbolic tensor you used in the model:
+    #    pt.fmatrix(np.array(SC, dtype=np.float32)): np.array(SC, dtype=np.float32),
+    #    pt.fscalar(np.float32(t_end)): np.float32(t_end),
+    #    pt.fscalar(np.float32(cut)): np.float32(cut),
+    #})
+
+    #print("Test forward model shape:", test_val.shape)
+    #print("Any NaNs?", np.isnan(test_val).any())
+
+
     if sampler == "slice":
 
         sampler = "Slice Sampler"
         start_time = time.time()
         with model:
-            trace_slice = pm.sample(step=[pm.Slice(vars_list)], tune=n_warmup, draws=n_samples, chains=n_chains, 
+            trace_slice = pm.sample(step=[pm.Slice(vars_list)], tune=n_warmup, draws=n_samples, chains=n_chains, cores=n_chains, 
                                     initvals={var_name: tails_5th_percentile[var_name] for var_name in my_var_names}
                                 ) 
         crudetime_slice=time.time() - start_time
@@ -365,7 +384,7 @@ def main():
         sampler = "Metropolis"
         start_time = time.time()
         with model:
-            trace_M = pm.sample(step=[pm.Metropolis()], tune=n_warmup, draws=n_samples, chains=n_chains,
+            trace_M = pm.sample(step=[pm.Metropolis()], tune=n_warmup, draws=n_samples, chains=n_chains, cores=n_chains,
                             initvals={var_name: tails_5th_percentile[var_name] for var_name in my_var_names}
                             )
         crudetime_M=time.time() - start_time
@@ -377,7 +396,7 @@ def main():
         sampler = "DE MetropolisZ"
         start_time = time.time()
         with model:
-            trace_DEMZ = pm.sample(step=[pm.DEMetropolisZ()], tune=n_warmup, draws=n_samples, chains=n_chains,
+            trace_DEMZ = pm.sample(step=[pm.DEMetropolisZ()], tune=n_warmup, draws=n_samples, chains=n_chains, cores=n_chains,
                                     initvals={var_name: tails_5th_percentile[var_name] for var_name in my_var_names}
                                 ) 
         crudetime_DEMZ=time.time() - start_time
@@ -389,7 +408,7 @@ def main():
         sampler = "DEMetropolis"
         start_time = time.time()
         with model:
-            trace_DEM = pm.sample(step=[pm.DEMetropolis()],  draws=n_samples, chains=n_chains,
+            trace_DEM = pm.sample(step=[pm.DEMetropolis()],  draws=n_samples, chains=n_chains, cores=n_chains,
                                 initvals={var_name: tails_5th_percentile[var_name] for var_name in my_var_names}
                                 )
         crudetime_DEM=time.time() - start_time
@@ -417,8 +436,8 @@ def main():
 
         def simulator_forward_model(rng,  G, size=None):
             theta = G 
-            #mu = wrapper(G=G.item(), par=params, cut=cut, tr=tr, starts=starts, nn=nn).reshape(-1, 1)
-            mu = wrapper(G=G.item(), weights=weights, t_end=t_end, cut=cut, tr=tr, starts=starts, nn=nn).reshape(-1, 1)
+            #mu = wrapper(G=G.item(), par=params, cut=cut, starts=starts, nn=nn).reshape(-1, 1)
+            mu = wrapper(G=G.item(), weights=weights, t_end=t_end, cut=cut).reshape(-1, 1)
             return rng.normal(mu, obs_err)
         
         with pm.Model() as model:
@@ -467,11 +486,11 @@ def main():
 
     plot_trace(trace, my_var_names, theta_true, sampler, fname=fname_trace)
 
-    rmse_paramsmean, rmse_fitmean  = rmse_fit_mean(wrapper, trace, theta_true, my_var_names, weights, t_end, cut, tr, starts, nn, FC_obs_flat)
+    rmse_paramsmean, rmse_fitmean  = rmse_fit_mean(wrapper, trace, theta_true, my_var_names, weights, t_end, cut, FC_obs_flat)
     print ('RMSE to true parameters', rmse_paramsmean),
     print ('RMSE to true observation', rmse_fitmean)
 
-    rmse_paramsmap, rmse_fitmap  = rmse_fit_map(wrapper, trace, theta_true, my_var_names, weights, t_end, cut, tr, starts, nn, FC_obs_flat)
+    rmse_paramsmap, rmse_fitmap  = rmse_fit_map(wrapper, trace, theta_true, weights, t_end, cut, FC_obs_flat)
     print ('RMSE to true parameters', rmse_paramsmap),
     print ('RMSE to true observation', rmse_fitmap)
 

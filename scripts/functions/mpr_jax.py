@@ -30,6 +30,7 @@ def f_mpr(x, t, P, nn): #, nn, method, output
     rtau = 1.0 / P.tau
 
     coupling = jnp.dot(P.weights, x0)
+    coupling = jnp.clip(coupling, -5.0, 5.0)
 
     dx0 = rtau * (delta_over_tau_pi + 2.0 * x0 * x1)
     dx1 = rtau * (
@@ -96,6 +97,10 @@ def do_bold_step(r_in, s, f, ftilde, vtilde, qtilde, v, q, dtt, P):
     q_clipped = jnp.clip(q, 0.01, jnp.inf)
     ff = (1 - (1 - Eo) ** (1 / f_clipped)) / Eo
     qtilde1 = qtilde + dtt * ((f_clipped * ff - fv * q_clipped / v) / (tau * q_clipped))
+
+    #ftilde1 = jnp.clip(ftilde1, -10.0, 10.0)
+    #vtilde1 = jnp.clip(vtilde1, -10.0, 10.0)
+    #qtilde1 = jnp.clip(qtilde1, -10.0, 10.0)
 
     f1 = jnp.exp(ftilde1)
     v1 = jnp.exp(vtilde1)
@@ -399,7 +404,7 @@ class MPR_sde:
 
         # ------------------ JITed scan for full blocks ------------------
         if n_full > 0:
-            @jax.jit
+            #@jax.jit
             def scan_full_blocks(state, bold_state, key):
                 def body(carry, block_idx):
                     key, state, bold_state = carry
@@ -407,12 +412,15 @@ class MPR_sde:
 
                     # noise
                     if use_external_noise:
-                        noise_r = noise_r_seq[block_idx]
-                        noise_v = noise_v_seq[block_idx]
+                        noise_r = jax.lax.dynamic_index_in_dim(noise_r_seq, block_idx, False)
+                        noise_v = jax.lax.dynamic_index_in_dim(noise_v_seq, block_idx, False)
                     else:
                         k1, k2 = jax.random.split(subkey)
                         noise_r = jax.random.normal(k1, (block_size, nn)) * P.sigma_r
                         noise_v = jax.random.normal(k2, (block_size, nn)) * P.sigma_v
+                    #jax.debug.print("noise_r.shape = {}", noise_r.shape)
+                    #jax.debug.print("noise_v.shape = {}", noise_v.shape)
+                    #jax.debug.print("P.initial_state.shape = {}", P.initial_state.shape)
 
                     # integrate
                     out = integrate_jitted_fast_noise(
