@@ -34,9 +34,11 @@ from numpyro.infer.util import initialize_model
 
 # local modules
 import utils
-from FCD_jax import *    
+from FCD_jax import *
 import mpr_jax
 mpr_jax = __import__("mpr_jax")
+import json
+from benchmark_utils import benchmark_metrics
 
 # ------------------ Argument parser ------------------
 def parse_args():
@@ -65,7 +67,8 @@ def parse_args():
     parser.add_argument("--n_chains", type=int, default=1)
     parser.add_argument("--scale", type=int, default=1, help="prior scale")
     parser.add_argument("--sampler", type=str, default="pathfinder",
-                    choices=["nuts", "pathfinder"], help="Choose inference method")
+                    choices=["nuts", "pathfinder", "blackjax"],
+                    help="nuts=NumPyro NUTS, blackjax=BlackJAX NUTS, pathfinder=BlackJAX Pathfinder VI")
 
     # Misc
     parser.add_argument("--save_dir", type=str, default=None)
@@ -75,6 +78,20 @@ def parse_args():
                     help="Type of structural connectivity: 'sim' for simulated, 'data' for real data")
     parser.add_argument("--SC_size", type=int, default=88,
                         help="Number of nodes if using simulated SC") #change to 6 or 10 for small networks
+
+    # --- gradient-based knobs (see mpr_jax.py) ---
+    parser.add_argument("--grad_horizon", type=int, default=0,
+                        help="Truncated-BPTT horizon in neural steps (0=full BPTT). ~200 tames chaotic gradient explosion.")
+    parser.add_argument("--clip_mode", type=str, default="hard", choices=["hard", "soft", "none"],
+                        help="Derivative bounding in f_mpr: hard=jnp.clip, soft=tanh (smooth, gradient-friendly), none=unbounded.")
+    parser.add_argument("--fast_bold", action="store_true",
+                        help="Integrate BOLD once per rv_decimate block (approx, ~1.4x faster).")
+    parser.add_argument("--fc_eps", type=float, default=0.0,
+                        help="Stabilise FC/FCD correlation denominator (e.g. 1e-6) to keep gradients finite.")
+    parser.add_argument("--grad_method", type=str, default="fd", choices=["fd", "autodiff"],
+                        help="Gradient for NUTS/BlackJAX: fd=central finite differences via custom_vjp "
+                             "(correct across the bifurcation), autodiff (exact but unreliable in chaos).")
+    parser.add_argument("--fd_h", type=float, default=1e-2, help="Finite-difference step for grad_method=fd.")
 
     return parser.parse_args()
 
@@ -91,32 +108,79 @@ def timer(func):
 
 # ------------------ Wrapper ------------------
 @timer
-def wrapper_fc(G, par, cut, tr, starts, nn):
+def wrapper_fc(G, par, cut, tr, starts, nn, grad_horizon=0, fast_bold=False, eps=0.0):
     par = deepcopy(par)
     par["G"] = G
     sde = mpr_jax.MPR_sde.create(par)
-    data = sde.run({})
+    data = sde.run({}, record_rv=False, fast_bold=fast_bold, grad_horizon=grad_horizon)
     bold_d = data["bold_d"]
 
-    FC_full = get_fc(bold_d[int(cut):].T)   # <<< ensure int(cut)
+    FC_full = get_fc(bold_d[int(cut):].T, eps=eps)   # <<< ensure int(cut)
     #print(FC_full)
-    tri_idx = jnp.triu_indices(FC_full.shape[0], k=1) 
+    tri_idx = jnp.triu_indices(FC_full.shape[0], k=1)
     return FC_full[tri_idx]
 
 @timer
-def wrapper_fcd(G, par, cut, tr, starts, nn):
+def wrapper_fcd(G, par, cut, tr, starts, nn, grad_horizon=0, fast_bold=False, eps=0.0):
     par = deepcopy(par)
     par["G"] = G
     sde = mpr_jax.MPR_sde.create(par)
-    data = sde.run({})
+    data = sde.run({}, record_rv=False, fast_bold=fast_bold, grad_horizon=grad_horizon)
     bold_d = data["bold_d"]
 
     bold_d_sub = bold_d[cut::tr].T
 
-    FCD_full = extract_FCD_jax_jitted(bold_d_sub, starts, nn, wwidth=30, olap=0.94) #FC_full = get_fc(bold_d[int(cut):].T)   # <<< ensure int(cut)
+    # non-jitted extract (we're already inside numpyro's traced/jitted model, and
+    # this lets eps be a concrete float for the stabilised correlation)
+    FCD_full = extract_FCD_jax(bold_d_sub, starts, nn, wwidth=30, olap=0.94, eps=eps)
     #print(FCD_full)
     tri_idx = jnp.triu_indices(FCD_full.shape[0], k=30)
     return FCD_full[tri_idx]
+
+
+# ------------------ Forward model (shared by NumPyro NUTS + BlackJAX) ------------------
+def make_forward_fn(par, which_stat, cut, tr, starts, nn, grad_horizon=0,
+                    fast_bold=False, eps=0.0, grad_method="fd", fd_h=1e-2):
+    """Return forward_fn(G) -> flat FC/FCD statistic, matching wrapper_fc/fcd.
+
+    grad_method="autodiff": plain JAX forward (autodiff gradient — unreliable in
+    the chaotic regime). grad_method="fd": wraps the forward in jax.custom_vjp so
+    that jax.grad returns the CENTRAL FINITE-DIFFERENCE gradient (valid because the
+    noise is frozen). This lets NumPyro/BlackJAX NUTS run on-device with the
+    reliable FD gradient instead of the exploding autodiff one."""
+    base = dict(par)
+
+    def raw(G):
+        p = dict(base); p["G"] = G
+        sde = mpr_jax.MPR_sde.create(p)
+        bold = sde.run({}, record_rv=False, fast_bold=fast_bold, grad_horizon=grad_horizon)["bold_d"]
+        if which_stat == "FC":
+            F = get_fc(bold[int(cut):].T, eps=eps)
+            return F[jnp.triu_indices(F.shape[0], k=1)]
+        sub = bold[cut::tr].T
+        F = extract_FCD_jax(sub, starts, nn, wwidth=30, olap=0.94, eps=eps)
+        return F[jnp.triu_indices(F.shape[0], k=30)]
+
+    if grad_method == "autodiff":
+        return raw
+
+    @jax.custom_vjp
+    def fwd(G):
+        return raw(G)
+
+    def fwd_fwd(G):
+        return raw(G), G                       # save G for the backward pass
+
+    def fwd_bwd(G, ct):
+        # Central FD (frozen noise -> valid). The two +/-h simulations are run in
+        # ONE vmapped call, so on GPU they execute in parallel (and XLA fuses them
+        # on CPU) instead of two sequential sims per leapfrog step.
+        both = jax.vmap(raw)(jnp.stack([G + fd_h, G - fd_h]))  # (2, m)
+        jacv = (both[0] - both[1]) / (2.0 * fd_h)              # d(stat)/dG, (m,)
+        return (jnp.vdot(ct, jacv),)                           # scalar cotangent wrt G
+
+    fwd.defvjp(fwd_fwd, fwd_bwd)
+    return fwd
 
 
 # ------------------ Helpers ------------------
@@ -190,9 +254,7 @@ def model_fc(data, prior_specs):
     FC_obs = data["FC_obs"]
     n_obs = FC_obs.shape[0]
     G = npr.sample("G", dist.HalfNormal(scale=prior_specs['scale_G']))#dist.Beta(2.0, 3.0)
-    params_sim = dict(data["params"])
-    params_sim["G"] = G
-    FC_hat_flat = wrapper_fc(G, params_sim, cut=data["cut"], tr=data["tr"], starts=data["starts"], nn=data["nn"])
+    FC_hat_flat = data["forward_fn"](G)   # config-baked forward (custom_vjp FD or autodiff)
     obs_err = data["obs_err"]
     with plate("fc_elements", n_obs):
         npr.sample("FC_obs", dist.Normal(FC_hat_flat, obs_err), obs=FC_obs)
@@ -203,9 +265,7 @@ def model_fcd(data, prior_specs):
     FC_obs = data["FC_obs"]
     n_obs = FC_obs.shape[0]
     G = npr.sample("G", dist.HalfNormal(scale=prior_specs['scale_G']))#dist.Beta(2.0, 3.0)
-    params_sim = dict(data["params"])
-    params_sim["G"] = G
-    FC_hat_flat = wrapper_fcd(G, params_sim, cut=data["cut"], tr=data["tr"], starts=data["starts"], nn=data["nn"])
+    FC_hat_flat = data["forward_fn"](G)   # config-baked forward (custom_vjp FD or autodiff)
     obs_err = data["obs_err"]
     with plate("fc_elements", n_obs):
         npr.sample("FC_obs", dist.Normal(FC_hat_flat, obs_err), obs=FC_obs)
@@ -248,6 +308,9 @@ def main():
     fname_postpred_summary = os.path.join(resultspath, f"posterior_predictive_summary_{tag}.png")
     fname_summary_csv = os.path.join(resultspath, f"summary_{tag}.csv")
     fname_netcdf = os.path.join(resultspath, f"inference_results_{tag}.nc")
+    fname_benchmark_csv = os.path.join(resultspath, f"benchmark_{tag}.csv")
+    fname_benchmark_params_csv = os.path.join(resultspath, f"benchmark_params_{tag}.csv")
+    fname_benchmark_json = os.path.join(resultspath, f"benchmark_{tag}.json")
 
     # --- setup params ---
     if SC_type == "sim":
@@ -263,7 +326,8 @@ def main():
     params = {
         "G": G, "weights": SC, "t_end": t_end,
         "dt": 0.01, "eta": jnp.array([-4.6]), "rv_decimate": 10,
-        "noise_amp": 0.037, "tr": 1.0, "seed": seed
+        "noise_amp": 0.037, "tr": 1.0, "seed": seed,
+        "clip_mode": args.clip_mode,
     }
 
     # --- setup model features  and data --
@@ -279,9 +343,19 @@ def main():
     T = (t_end-cut)//tr
     shift, starts = precompute_shift_and_starts(T, wwidth=30, olap=0.94)
 
-    FC_obs_flat = wrapper(G=G, par=params, cut=cut, tr=tr, starts=starts, nn=nn)
+    # observed data uses fast_bold/eps for consistency with the model; grad_horizon is
+    # irrelevant here (no gradient) so we leave it at 0.
+    FC_obs_flat = wrapper(G=G, par=params, cut=cut, tr=tr, starts=starts, nn=nn,
+                          grad_horizon=0, fast_bold=args.fast_bold, eps=args.fc_eps)
     print(FC_obs_flat)
-    data = {"FC_obs": FC_obs_flat, "params": params, "obs_err": obs_err, "cut": cut, "tr":tr, "starts":starts, "nn":nn}
+    # Single config-baked forward used by the model (custom_vjp FD gradient by
+    # default so NUTS/BlackJAX get the reliable finite-difference gradient).
+    forward_fn = make_forward_fn(params, which_stat, cut, tr, starts, nn,
+                                 grad_horizon=args.grad_horizon, fast_bold=args.fast_bold,
+                                 eps=args.fc_eps, grad_method=args.grad_method, fd_h=args.fd_h)
+    data = {"FC_obs": FC_obs_flat, "params": params, "obs_err": obs_err, "cut": cut, "tr":tr, "starts":starts, "nn":nn,
+            "grad_horizon": args.grad_horizon, "fast_bold": args.fast_bold, "eps": args.fc_eps,
+            "forward_fn": forward_fn}
     prior_specs = {"scale_G": scale}
 
     os.makedirs(resultspath, exist_ok=True)
@@ -300,6 +374,7 @@ def main():
 
     # --- inference ---
     theta_true = np.array([params["G"]])
+    runtime = float("nan")
 
     rng_key, rng_key_run = jax.random.split(rng_key)
 
@@ -332,7 +407,58 @@ def main():
         az_summary.to_csv(fname_summary_csv, index=False)
         print(f"Summary saved to {fname_summary_csv}")
 
-        
+
+    elif sampler == "blackjax":
+        print("Running NUTS inference via BlackJAX...")
+        # Unconstrained potential from the NumPyro model (handles the prior
+        # transform); its gradient uses the model's forward_fn -> custom_vjp FD.
+        rng_key, rng_key_init = jax.random.split(rng_key_run)
+        param_info, potential_fn, postprocess_fn, *_ = initialize_model(
+            rng_key_init, model, model_args=(data, prior_specs), dynamic_args=True)
+        logdensity_fn = lambda z: -potential_fn(data, prior_specs)(z)
+        initial_position = param_info.z
+
+        # Window adaptation (step size + mass matrix) on one chain.
+        rng_key, rng_key_warmup = jax.random.split(rng_key)
+        warmup = blackjax.window_adaptation(blackjax.nuts, logdensity_fn)
+        (warm_state, parameters), _ = warmup.run(rng_key_warmup, initial_position, num_steps=n_warmup)
+        kernel = blackjax.nuts(logdensity_fn, **parameters)
+
+        def inference_loop(rng_key, init_state, n):
+            def one(state, key):
+                state, info = kernel.step(key, state)
+                return state, (state.position, info)
+            keys = jax.random.split(rng_key, n)
+            _, (positions, infos) = jax.lax.scan(one, init_state, keys)
+            return positions, infos
+
+        # n_chains vectorized on-device (vmap), all from the adapted state, distinct RNG.
+        rng_key, rng_key_chains = jax.random.split(rng_key)
+        chain_keys = jax.random.split(rng_key_chains, n_chains)
+        init_state = kernel.init(initial_position)
+        start_time = time.time()
+        positions, infos = jax.vmap(lambda k: inference_loop(k, init_state, n_samples))(chain_keys)
+        jax.block_until_ready(positions)
+        runtime = time.time() - start_time
+
+        # Unconstrained z -> constrained params, per (chain, draw); keep just "G".
+        samples = jax.vmap(jax.vmap(lambda z: postprocess_fn(data, prior_specs)(z)))(positions)
+        posterior = {"G": np.asarray(samples["G"])}   # (chain, draw)
+        sample_stats = {
+            "diverging": np.asarray(infos.is_divergent),
+            "acceptance_rate": np.asarray(infos.acceptance_rate),
+            "num_steps": np.asarray(infos.num_integration_steps),
+            "lp": -np.asarray(infos.energy),
+        }
+        posterior_samples = az.from_dict(posterior=posterior, sample_stats=sample_stats)
+        mcmc = posterior_samples
+
+        az_summary = az.summary(posterior_samples, var_names=["G"]).reset_index().rename(columns={"index": "parameter"})
+        az_summary["runtime_sec"] = runtime
+        az_summary.to_csv(fname_summary_csv, index=False)
+        print(f"Summary saved to {fname_summary_csv}")
+
+
     elif sampler == "pathfinder":
         print("Running Pathfinder inference via BlackJAX...")
 
@@ -399,6 +525,41 @@ def main():
     chains_pooled = posterior_samples.posterior["G"].values.reshape(1, -1)
     plot_posterior_pooled(["G"], theta_true, prior_predictions, chains_pooled, "Pooled Posteriors", savepath=fname_posteriors)
 
+    # --- comprehensive benchmark metrics (same schema/file as mpr_jax_pymc.py) ---
+    try:
+        fwd_eval = make_forward_fn(params, which_stat, cut, tr, starts, nn,
+                                   grad_horizon=0, fast_bold=args.fast_bold,
+                                   eps=args.fc_eps, grad_method="autodiff")
+        obs_np = np.asarray(FC_obs_flat)
+        Gmean = float(np.mean(posterior_samples.posterior["G"].values))
+        Gmap = float(calcula_map(chains_pooled)[0])
+        xs_mean = np.asarray(fwd_eval(jnp.float32(Gmean)))
+        xs_map = np.asarray(fwd_eval(jnp.float32(Gmap)))
+        rmse = {
+            "param_mean": abs(Gmean - float(theta_true[0])),
+            "param_map": abs(Gmap - float(theta_true[0])),
+            "fit_mean": float(np.sqrt(np.mean((xs_mean - obs_np) ** 2))),
+            "fit_map": float(np.sqrt(np.mean((xs_map - obs_np) ** 2))),
+        }
+        prior_sd = {"G": float(np.std(np.asarray(prior_predictions["G"]).ravel(), ddof=1))}
+        meta = {
+            "sampler": sampler, "framework": "numpyro/blackjax", "which_stat": which_stat,
+            "SC_type": SC_type, "SC_size": SC_size, "G_true": float(params["G"]),
+            "t_end": t_end, "cut": cut, "obs_err": obs_err, "seed": seed,
+            "n_warmup": n_warmup, "grad_method": args.grad_method, "clip_mode": args.clip_mode,
+        }
+        run_row, param_rows = benchmark_metrics(posterior_samples, theta_true, ["G"],
+                                                prior_sd, runtime, rmse, meta)
+        pd.DataFrame([run_row]).to_csv(fname_benchmark_csv, index=False)
+        pd.DataFrame(param_rows).to_csv(fname_benchmark_params_csv, index=False)
+        with open(fname_benchmark_json, "w") as fh:
+            json.dump({"run": run_row, "params": param_rows}, fh, indent=2)
+        print(f"Benchmark metrics saved to: {fname_benchmark_csv}")
+        print(f"  runtime={runtime:.1f}s  max_r_hat={run_row['max_r_hat']:.3f}  "
+              f"min_ess_bulk={run_row['min_ess_bulk']:.1f}  "
+              f"rmse_param_mean={run_row['rmse_param_mean']:.4f}")
+    except Exception as e:
+        print(f"WARNING: benchmark_metrics failed: {e}")
 
     print(f"\nAll results and plots saved in:\n{resultspath}\n")
 

@@ -8,62 +8,60 @@ import time
 
 import numpy as np
 
+_PI2 = float(np.pi ** 2)
 
 # is P is a static argument, use @partial(jit, static_argnames=["P"])
 #@partial(jax.jit, static_argnames=["nn"])
 #@jax.jit
-def f_mpr(x, t, P, nn): #, nn, method, output
+def f_mpr(r, v, P):
     """
-    MPR model
-    x: state vector at time t split into x0 and x1 (r and v), t time variable (time step at which r and v are calculated), P parameter object strucure
-    
+    MPR model right-hand side, operating on the firing rate `r` and membrane
+    potential `v` as separate arrays (avoids the slice/concat churn of a stacked
+    state). Returns the derivatives (dr, dv) as separate arrays.
     """
+    cm = P.clip_mode
+    coupling = jnp.dot(P.weights, r)
+    if cm == "hard":
+        coupling = jnp.clip(coupling, -5.0, 5.0)
+    elif cm == "soft":
+        coupling = 5.0 * jnp.tanh(coupling / 5.0)
 
-    #nn = P.nn #cancel if partially jitted
-    x0 = jax.lax.dynamic_slice(x, (0,), (nn,))
-    x1 = jax.lax.dynamic_slice(x, (nn,), (nn,))
-
-    delta_over_tau_pi = P.delta / (P.tau * jnp.pi)
-    J_tau = P.J * P.tau
-    pi2 = jnp.pi ** 2
-    tau2 = P.tau ** 2
-    rtau = 1.0 / P.tau
-
-    coupling = jnp.dot(P.weights, x0)
-    coupling = jnp.clip(coupling, -5.0, 5.0)
-
-    dx0 = rtau * (delta_over_tau_pi + 2.0 * x0 * x1)
-    dx1 = rtau * (
-        x1 ** 2 + P.eta + P.iapp + J_tau * x0 - (pi2 * tau2 * x0 ** 2) + P.G * coupling
+    dr = P.rtau * (P.delta_over_tau_pi + 2.0 * r * v)
+    dv = P.rtau * (
+        v ** 2 + P.eta + P.iapp + P.J_tau * r - P.pi_tau_sq * r ** 2 + P.G * coupling
     )
 
-    dxdt = jnp.concatenate([dx0, dx1])
-    dxdt = jnp.clip(dxdt, -10.0, 10.0)
-    #dxdt = 50.0 * jnp.tanh(dxdt/50.0)
-    return dxdt
+    # Bound the derivatives to avoid chaotic blow-up. "hard" = jnp.clip (current
+    # default, bit-exact, but zero gradient outside the bounds). "soft" = tanh
+    # saturation: same bound, smooth, gradient 1-tanh^2 in (0,1] everywhere ->
+    # no dead-zones, finite forward. "none" = unbounded (NaNs at high G).
+    if cm == "hard":
+        dr = jnp.clip(dr, -10.0, 10.0)
+        dv = jnp.clip(dv, -10.0, 10.0)
+    elif cm == "soft":
+        dr = 10.0 * jnp.tanh(dr / 10.0)
+        dv = 10.0 * jnp.tanh(dv / 10.0)
+    return dr, dv
 
-def heun_sde_with_noise(x, t, P, nn, dW_r, dW_v):
+def heun_sde_with_noise(r, v, P, dW_r, dW_v):
     dt = P.dt
-    x0, x1 = x[:nn], x[nn:]
-    
-    dx = f_mpr(x, t, P, nn)
-    dx0, dx1 = dx[:nn], dx[nn:]
-    
+
+    dr, dv = f_mpr(r, v, P)
+
     # Heun predictor
-    r_pred = x0 + dt * dx0 + dW_r
-    v_pred = x1 + dt * dx1 + dW_v
-    
-    dx_pred = f_mpr(jnp.concatenate([r_pred, v_pred]), t + dt, P, nn)
-    dx0_pred, dx1_pred = dx_pred[:nn], dx_pred[nn:]
-    
+    r_pred = r + dt * dr + dW_r
+    v_pred = v + dt * dv + dW_v
+
+    dr_pred, dv_pred = f_mpr(r_pred, v_pred, P)
+
     # Heun corrector
-    r_new = x0 + 0.5 * dt * (dx0 + dx0_pred) + dW_r
-    v_new = x1 + 0.5 * dt * (dx1 + dx1_pred) + dW_v
-    
+    r_new = r + 0.5 * dt * (dr + dr_pred) + dW_r
+    v_new = v + 0.5 * dt * (dv + dv_pred) + dW_v
+
     # Enforce r >= 0
     r_new = jnp.maximum(r_new, 0.0)
-    
-    return jnp.concatenate([r_new, v_new])
+
+    return r_new, v_new
 
 #@jax.jit
 def do_bold_step(r_in, s, f, ftilde, vtilde, qtilde, v, q, dtt, P):
@@ -110,15 +108,22 @@ def do_bold_step(r_in, s, f, ftilde, vtilde, qtilde, v, q, dtt, P):
 
 def integrate_fast_noise_remat(
     nn, P, B, key, record_rv, record_bold, nt, rv_decimate, bold_decimate,
-    noise_r=None, noise_v=None, initial_bold_state=None
+    noise_r=None, noise_v=None, initial_bold_state=None, use_remat=False,
+    fast_bold=False, grad_horizon=0
 ):
     """
-    Same API as integrate_fast_noise but with remat checkpointing.
+    Integrates the MPR SDE + Balloon-Windkessel BOLD via jax.lax.scan.
     Supports carrying over BOLD state between blocks.
+    use_remat: enable gradient checkpointing (only needed when computing gradients).
+    fast_bold: integrate BOLD once per rv_decimate-step block driven by the
+        block-mean firing rate, instead of every neural step. ~rv_decimate x
+        fewer (expensive) hemodynamic updates. Approximate: not bit-identical to
+        fast_bold=False; validate summary features (FC/FCD/fluidity) before use.
     """
     dt = P.dt
     r_period = dt * rv_decimate
     dtt = r_period / 1000.0  # BOLD substep in seconds
+    dtt_block = dtt * rv_decimate  # one BOLD Euler step spanning a full block
     vo = B.vo
 
     # Precompute BOLD constants
@@ -132,8 +137,9 @@ def integrate_fast_noise_remat(
         noise_r = P.sigma_r * jax.random.normal(key_r, shape=(nt, nn), dtype=jnp.float32)
         noise_v = P.sigma_v * jax.random.normal(key_v, shape=(nt, nn), dtype=jnp.float32)
 
-    # Initial neural state
-    rv = P.initial_state
+    # Initial neural state (kept as separate r / v arrays in the carry)
+    r0 = P.initial_state[:nn]
+    v0 = P.initial_state[nn:]
 
     # Initial BOLD state
     if initial_bold_state is not None:
@@ -147,67 +153,150 @@ def integrate_fast_noise_remat(
         v = jnp.ones(nn)
         q = jnp.ones(nn)
 
-    # Preallocate downsampled arrays
+    # Number of downsampled samples
     n_rv = nt // rv_decimate if record_rv else 1
     n_bold = nt // bold_decimate if record_bold else 1
-    rv_d = jnp.zeros((n_rv, 2 * nn), dtype=jnp.float32)
-    rv_t = jnp.zeros((n_rv,), dtype=jnp.float32)
-    vv_d = jnp.zeros((n_bold, nn), dtype=jnp.float32)
-    qq_d = jnp.zeros((n_bold, nn), dtype=jnp.float32)
 
-    # --- define the per-step function ---
-    def step(carry, i):
-        rv, s, f, ftilde, vtilde, qtilde, v, q, rv_d, rv_t, vv_d, qq_d = carry
-        dWr = noise_r[i]
-        dWv = noise_v[i]
+    # Nested-scan geometry: the outer scan walks over blocks of `rv_decimate`
+    # neural steps, the inner scan advances the sub-steps within a block. The
+    # first sub-step of block k is flat step k*rv_decimate, whose post-step
+    # value is exactly what the old "record when i % rv_decimate == 0" logic
+    # kept -> bit-for-bit identical recording, with no lax.cond and no
+    # full-resolution buffer.
+    n_blocks = nt // rv_decimate            # outer iterations (loop geometry)
+    trailing = nt - n_blocks * rv_decimate  # steps after the last full block
 
-        # Advance neural state
-        rv_next = heun_sde_with_noise(rv, 0.0, P, nn, dWr, dWv)
-        r_in = rv_next[:nn]
-
-        # Advance BOLD
-        s1, f1, ftilde1, vtilde1, qtilde1, v1, q1 = do_bold_step(r_in, s, f, ftilde, vtilde, qtilde, v, q, dtt, B)
-
-        # Downsample RV
-        rv_idx = i // rv_decimate
-        rv_d = jax.lax.cond(
-            record_rv & (i % rv_decimate == 0),
-            lambda rd: rd.at[rv_idx].set(rv_next),
-            lambda rd: rd,
-            rv_d
+    # BOLD is recorded every `bold_decimate` neural steps; those indices must
+    # land on block boundaries so we can pick them out by striding the per-block
+    # BOLD samples.
+    if record_bold and n_blocks > 0:
+        assert bold_decimate % rv_decimate == 0, (
+            "nested-scan recording requires bold_decimate to be a multiple of "
+            f"rv_decimate (got {bold_decimate} and {rv_decimate})"
         )
-        rv_t = jax.lax.cond(
-            record_rv & (i % rv_decimate == 0),
-            lambda rt: rt.at[rv_idx].set(i * dt * 10.0),
-            lambda rt: rt,
-            rv_t
+        bold_stride = bold_decimate // rv_decimate
+    else:
+        bold_stride = 1
+
+    def neural_bold_step(carry, i):
+        """(exact path) Advance neural + BOLD one step using noise at flat i.
+
+        `r`, `v` are the neural firing rate / membrane potential; `vb`, `q` are
+        the BOLD blood volume / deoxyhemoglobin. No output is emitted per step;
+        recorded samples are read straight from the carry in `outer_block`, so
+        the stacked (r, v) concatenation happens once per recorded sample, not
+        every step.
+        """
+        r, v, s, f, ftilde, vtilde, qtilde, vb, q = carry
+        r_new, v_new = heun_sde_with_noise(r, v, P, noise_r[i], noise_v[i])
+        s1, f1, ftilde1, vtilde1, qtilde1, vb1, q1 = do_bold_step(
+            r_new, s, f, ftilde, vtilde, qtilde, vb, q, dtt, B
+        )
+        return (r_new, v_new, s1, f1, ftilde1, vtilde1, qtilde1, vb1, q1), None
+
+    def neural_step(carry, i):
+        """(fast path) Advance neural state only, accumulating the firing rate."""
+        r, v, r_sum = carry
+        r_new, v_new = heun_sde_with_noise(r, v, P, noise_r[i], noise_v[i])
+        return (r_new, v_new, r_sum + r_new), None
+
+    # --- truncated backprop-through-time (bounds gradient explosion in the
+    # chaotic regime). We segment the trajectory and stop_gradient the carry at
+    # segment starts, so gradients flow back at most `grad_horizon` neural steps.
+    # stop_gradient is the identity in the forward pass -> forward is bit-exact;
+    # only the backward pass changes. grad_horizon == 0 disables it entirely.
+    seg_blocks = max(1, int(round(grad_horizon / rv_decimate))) if grad_horizon else 0
+
+    def maybe_truncate(carry, k):
+        if not grad_horizon:
+            return carry
+        return jax.lax.cond(
+            k % seg_blocks == 0,
+            lambda c: jax.tree_util.tree_map(jax.lax.stop_gradient, c),
+            lambda c: c,
+            carry,
         )
 
-        # Downsample BOLD
-        bold_idx = i // bold_decimate
-        vv_d = jax.lax.cond(
-            record_bold & (i % bold_decimate == 0),
-            lambda vv_: vv_.at[bold_idx].set(v1),
-            lambda vv_: vv_,
-            vv_d
+    def outer_block_exact(carry, k):
+        carry = maybe_truncate(carry, k)
+        base = k * rv_decimate
+        # First sub-step of the block -> this is the recorded sample.
+        carry, _ = neural_bold_step(carry, base)
+        r_rec, v_rec_n = carry[0], carry[1]
+        vb_rec, q_rec = carry[7], carry[8]
+        out_rv = jnp.concatenate([r_rec, v_rec_n]) if record_rv else None
+        out_v = vb_rec if record_bold else None
+        out_q = q_rec if record_bold else None
+        # Remaining rv_decimate-1 sub-steps advance the state without recording.
+        if rv_decimate > 1:
+            carry, _ = jax.lax.scan(
+                neural_bold_step, carry, base + 1 + jnp.arange(rv_decimate - 1)
+            )
+        return carry, (out_rv, out_v, out_q)
+
+    def outer_block_fast(carry, k):
+        # Neural state advances every step; BOLD is integrated ONCE per block,
+        # driven by the block-mean firing rate, with a single Euler step
+        # spanning the whole block (dtt_block == rv_decimate * dtt).
+        carry = maybe_truncate(carry, k)
+        r, v, s, f, ftilde, vtilde, qtilde, vb, q = carry
+        base = k * rv_decimate
+        # First neural sub-step -> the recorded RV sample.
+        r, v = heun_sde_with_noise(r, v, P, noise_r[base], noise_v[base])
+        out_rv = jnp.concatenate([r, v]) if record_rv else None
+        r_sum = r
+        # Remaining neural sub-steps, accumulating the firing rate.
+        if rv_decimate > 1:
+            (r, v, r_sum), _ = jax.lax.scan(
+                neural_step, (r, v, r_sum), base + 1 + jnp.arange(rv_decimate - 1)
+            )
+        r_mean = r_sum / rv_decimate
+        s, f, ftilde, vtilde, qtilde, vb, q = do_bold_step(
+            r_mean, s, f, ftilde, vtilde, qtilde, vb, q, dtt_block, B
         )
-        qq_d = jax.lax.cond(
-            record_bold & (i % bold_decimate == 0),
-            lambda qq_: qq_.at[bold_idx].set(q1),
-            lambda qq_: qq_,
-            qq_d
+        out_v = vb if record_bold else None
+        out_q = q if record_bold else None
+        return (r, v, s, f, ftilde, vtilde, qtilde, vb, q), (out_rv, out_v, out_q)
+
+    outer_block = outer_block_fast if fast_bold else outer_block_exact
+    init_carry = (r0, v0, s, f, ftilde, vtilde, qtilde, v, q)
+    outer_fn = jax.remat(outer_block) if use_remat else outer_block
+
+    if n_blocks > 0:
+        final_carry, (rv_stack, vv_stack, qq_stack) = jax.lax.scan(
+            outer_fn, init_carry, jnp.arange(n_blocks)
         )
+    else:
+        final_carry = init_carry
+        rv_stack = vv_stack = qq_stack = None
 
-        return (rv_next, s1, f1, ftilde1, vtilde1, qtilde1, v1, q1, rv_d, rv_t, vv_d, qq_d), None
+    # Trailing steps (nt not a multiple of rv_decimate): integrate, no recording.
+    if trailing > 0:
+        trail_idx = n_blocks * rv_decimate + jnp.arange(trailing)
+        if fast_bold:
+            r, v = final_carry[0], final_carry[1]
+            bold_state = final_carry[2:9]
+            (r, v, r_sum), _ = jax.lax.scan(
+                neural_step, (r, v, jnp.zeros(nn)), trail_idx
+            )
+            s, f, ftilde, vtilde, qtilde, vb, q = do_bold_step(
+                r_sum / trailing, *bold_state, dtt * trailing, B
+            )
+            final_carry = (r, v, s, f, ftilde, vtilde, qtilde, vb, q)
+        else:
+            final_carry, _ = jax.lax.scan(neural_bold_step, final_carry, trail_idx)
 
-    remat_step = jax.remat(step)
-    init_carry = (rv, s, f, ftilde, vtilde, qtilde, v, q, rv_d, rv_t, vv_d, qq_d)
-    final_carry, _ = jax.lax.scan(remat_step, init_carry, jnp.arange(nt))
+    # --- assemble recorded outputs ---
+    if record_rv and rv_stack is not None:
+        rv_d = rv_stack[:n_rv]
+        rv_t = jnp.arange(n_rv, dtype=jnp.float32) * (rv_decimate * dt * 10.0)
+    else:
+        rv_d = jnp.zeros((1, 2 * nn), dtype=jnp.float32)
+        rv_t = jnp.zeros((1,), dtype=jnp.float32)
 
-    rv_d, rv_t, vv_d, qq_d = final_carry[8], final_carry[9], final_carry[10], final_carry[11]
-
-    # Compute final BOLD signal
-    if record_bold:
+    if record_bold and vv_stack is not None:
+        vv_d = vv_stack[::bold_stride][:n_bold]
+        qq_d = qq_stack[::bold_stride][:n_bold]
         bold_d = vo * (k1 * (1 - qq_d) + k2 * (1 - qq_d / vv_d) + k3 * (1 - vv_d))
         bold_t = jnp.linspace(0, P.t_end - dt * bold_decimate, len(bold_d)) * 10.0
     else:
@@ -219,13 +308,13 @@ def integrate_fast_noise_remat(
         "rv_d": rv_d.astype(jnp.float32),
         "bold_t": bold_t.astype(jnp.float32),
         "bold_d": bold_d.astype(jnp.float32),
-        "final_state": final_carry[0],
-        "final_bold_state": final_carry[1:8],  # s, f, ftilde, vtilde, qtilde, v, q
+        "final_state": jnp.concatenate([final_carry[0], final_carry[1]]),
+        "final_bold_state": final_carry[2:9],  # s, f, ftilde, vtilde, qtilde, v, q
     }
 
 integrate_jitted_fast_noise = jax.jit(
     integrate_fast_noise_remat,
-    static_argnames=["nn", "record_rv", "record_bold", "nt", "rv_decimate", "bold_decimate"]
+    static_argnames=["nn", "record_rv", "record_bold", "nt", "rv_decimate", "bold_decimate", "use_remat", "fast_bold", "grad_horizon"]
 )
 
 @struct.dataclass
@@ -245,14 +334,23 @@ class ParMPR:
     seed: int = 42
     initial_state: jnp.ndarray = struct.field(default_factory=lambda: jnp.array([]))
     noise_amp: float = 0.037
-    sigma_r: float = 0.0  
-    sigma_v: float = 0.0  
+    sigma_r: float = 0.0
+    sigma_v: float = 0.0
     iapp: float = 0.0
     output: str = struct.field(default="output", pytree_node=False)
     RECORD_RV: bool = True
     RECORD_BOLD: bool = True
     rv_decimate: int = 10
     tr: float = 300.0#500.0
+    # Derivative/coupling bounding in f_mpr: "hard" = jnp.clip (default, bit-exact),
+    # "soft" = tanh saturation (smooth, gradient-friendly), "none" = unbounded.
+    # Static (non-pytree) so f_mpr can branch on it at trace time.
+    clip_mode: str = struct.field(default="hard", pytree_node=False)
+    # Derived constants — precomputed once in create(), read every f_mpr call
+    delta_over_tau_pi: float = 0.0
+    J_tau: float = 0.0
+    rtau: float = 1.0
+    pi_tau_sq: float = _PI2
 
     @classmethod
     def create(cls, **kwargs):
@@ -260,6 +358,9 @@ class ParMPR:
         weights = kwargs.get("weights", jnp.zeros((0, 0)))
         dt = kwargs.get("dt", 0.01)
         noise_amp = kwargs.get("noise_amp", 0.037)
+        tau = kwargs.get("tau", 1.0)
+        J = kwargs.get("J", 14.5)
+        delta = kwargs.get("delta", 0.7)
         sigma_r = jnp.sqrt(dt) * jnp.sqrt(2 * noise_amp)
         sigma_v = jnp.sqrt(dt) * jnp.sqrt(4 * noise_amp)
         nn = int(weights.shape[0])
@@ -268,6 +369,10 @@ class ParMPR:
             sigma_r=sigma_r,
             sigma_v=sigma_v,
             nn=nn,
+            delta_over_tau_pi=float(delta / (tau * np.pi)),
+            J_tau=float(J * tau),
+            rtau=float(1.0 / tau),
+            pi_tau_sq=float((np.pi * tau) ** 2),
             **kwargs
         )
 
@@ -341,7 +446,10 @@ class MPR_sde:
         x0: jnp.ndarray = None,
         block_size: int = 10_000,
         record_rv: bool = True,
-        noise_blocks=None
+        noise_blocks=None,
+        use_remat: bool = False,
+        fast_bold: bool = False,
+        grad_horizon: int = 0
     ):
         """
         Chunked, memory-friendly run() for MPR+Balloon simulation.
@@ -404,7 +512,6 @@ class MPR_sde:
 
         # ------------------ JITed scan for full blocks ------------------
         if n_full > 0:
-            #@jax.jit
             def scan_full_blocks(state, bold_state, key):
                 def body(carry, block_idx):
                     key, state, bold_state = carry
@@ -418,9 +525,6 @@ class MPR_sde:
                         k1, k2 = jax.random.split(subkey)
                         noise_r = jax.random.normal(k1, (block_size, nn)) * P.sigma_r
                         noise_v = jax.random.normal(k2, (block_size, nn)) * P.sigma_v
-                    #jax.debug.print("noise_r.shape = {}", noise_r.shape)
-                    #jax.debug.print("noise_v.shape = {}", noise_v.shape)
-                    #jax.debug.print("P.initial_state.shape = {}", P.initial_state.shape)
 
                     # integrate
                     out = integrate_jitted_fast_noise(
@@ -435,13 +539,15 @@ class MPR_sde:
                         bold_decimate=bold_decimate,
                         noise_r=noise_r,
                         noise_v=noise_v,
-                        initial_bold_state=bold_state
+                        initial_bold_state=bold_state,
+                        use_remat=use_remat,
+                        fast_bold=fast_bold,
+                        grad_horizon=grad_horizon
                     )
 
                     new_state = out["final_state"]
                     new_bold_state = out["final_bold_state"]
 
-                    # collect downsampled RV/BOLD
                     rv_chunk = out["rv_d"] if record_rv else jnp.zeros((0, 2*nn))
                     bold_chunk = out["bold_d"]
 
@@ -481,7 +587,10 @@ class MPR_sde:
                 bold_decimate=bold_decimate,
                 noise_r=noise_r_last,
                 noise_v=noise_v_last,
-                initial_bold_state=bold_state
+                initial_bold_state=bold_state,
+                use_remat=use_remat,
+                fast_bold=fast_bold,
+                grad_horizon=grad_horizon
             )
 
             state = out_last["final_state"]

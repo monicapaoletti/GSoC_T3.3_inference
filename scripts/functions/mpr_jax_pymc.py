@@ -7,11 +7,16 @@ Inference script for FC + FCD statistics using PyMC + JAX.
 import sys
 import os
 import time
+import json
 import warnings
 from copy import deepcopy
 import argparse
 
 import numpy as np
+# GPU memory: disable XLA's default ~75% preallocation so repeated JAX calls (and
+# any multi-process use) don't grab the whole device. No-op on CPU. Must be set
+# before importing jax; override by exporting XLA_PYTHON_CLIENT_PREALLOCATE yourself.
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
@@ -34,6 +39,9 @@ import pytensor.tensor as pt
 pytensor.config.floatX = "float32"
 
 from pytensor.compile.ops import as_op
+from pytensor.graph.op import Op
+from pytensor.graph.basic import Apply
+from pytensor.link.jax.dispatch import jax_funcify   # for nuts_sampler="blackjax"
 from scipy.optimize import least_squares
 
 # local modules
@@ -74,7 +82,7 @@ def parse_args():
     parser.add_argument("--n_chains", type=int, default=4)
 
     parser.add_argument("--sampler", type=str, default="smcabc",
-                    choices=["slice", "metropolis", "demetropolisz", "demetropolis", "smclik", "smcabc"], help="Choose inference method")
+                    choices=["slice", "metropolis", "demetropolisz", "demetropolis", "smclik", "smcabc", "nuts", "blackjax", "numpyro"], help="Choose inference method")
     parser.add_argument("--epsilon", type=float, default=10, help="epsilon parameter for smc abc algorithm")
     parser.add_argument("--threshold", type=float, default=0.5, help="threshold parameter for smc algorithm")
     parser.add_argument("--correlation_threshold", type=float, default=0.05, help="correlation_threshold parameter for smc algorithm")
@@ -85,7 +93,22 @@ def parse_args():
     parser.add_argument("--SC_type", type=str, default="data",
                     help="Type of structural connectivity: 'sim' for simulated, 'data' for real data")
     parser.add_argument("--SC_size", type=int, default=6,
-                        help="Number of nodes in SC") 
+                        help="Number of nodes in SC")
+
+    # --- forward-model speed/stability knobs (mpr_jax) ---
+    parser.add_argument("--clip_mode", type=str, default="hard", choices=["hard", "soft", "none"],
+                        help="Derivative bounding: hard=jnp.clip, soft=tanh (stable across the transition), none=unbounded.")
+    parser.add_argument("--fast_bold", action="store_true",
+                        help="Integrate BOLD once per rv_decimate block (approx, ~1.4x faster).")
+    parser.add_argument("--fc_eps", type=float, default=0.0,
+                        help="Stabilise FC/FCD correlation denominator (e.g. 1e-6) for NaN-safety.")
+    # --- gradient-based NUTS options (only used when --sampler nuts) ---
+    parser.add_argument("--grad_method", type=str, default="fd", choices=["fd", "autodiff"],
+                        help="Gradient for NUTS: fd=finite differences (correct in chaos), autodiff (unreliable past bifurcation).")
+    parser.add_argument("--fd_h", type=float, default=1e-2, help="Finite-difference step for grad_method=fd.")
+    parser.add_argument("--grad_horizon", type=int, default=0,
+                        help="Truncated-BPTT horizon (only affects grad_method=autodiff).")
+
     return parser.parse_args()
 
 
@@ -99,52 +122,148 @@ def timer(func):
     return wrapper_timer
 
 
-# ------------------ Wrapper ------------------
-@timer
-def wrapper_fc(G, weights, t_end, cut):
-    par={}
-    par["G"] = G
-    par['weights'] = weights
-    par['t_end'] = t_end
+# ------------------ Forward model ------------------
+# There is a SINGLE forward model for every sampler, built in main() as a set of
+# config-explicit closures (see make_forward_fns) wrapped in ForwardGradOp. The
+# statistic (FC/FCD) and the mpr_jax knobs (clip_mode/fast_bold/eps/grad_horizon)
+# are captured by value, so (a) the whole script is congruent with --which_stat
+# and (b) the config survives cloudpickle to spawned multiprocessing workers.
+# ForwardGradOp exposes a gradient wrt the scalar G, computed either by FINITE
+# DIFFERENCES (grad_method="fd", correct for the chaotic regime) or by AUTODIFF
+# (grad_method="autodiff", exact but unreliable past the bifurcation); gradient-
+# free samplers simply never call it.
+
+def _forward_stat_jax(G, weights, t_end, cut, which_stat, starts, nn,
+                      clip_mode="hard", fast_bold=False, eps=0.0, grad_horizon=0):
+    """JAX forward: simulate at coupling G and return the flat FC/FCD statistic.
+
+    Config (clip_mode/fast_bold/eps/grad_horizon) is passed EXPLICITLY rather
+    than read from a module global, so the closures that capture it (built in
+    main) are serialized by value to spawned multiprocessing workers.
+    """
+    par = {"G": G, "weights": weights, "t_end": t_end, "clip_mode": clip_mode}
     sde = mpr_jax.MPR_sde.create(par)
-    data = sde.run({})
-    bold_d = data["bold_d"]
+    bold = sde.run({}, record_rv=False, fast_bold=fast_bold,
+                   grad_horizon=grad_horizon)["bold_d"]
+    if which_stat == "FC":
+        F = FCD_jax.get_fc(bold[int(cut):].T, eps=eps)
+        return F[jnp.triu_indices(F.shape[0], k=1)]
+    else:
+        F = FCD_jax.extract_FCD_jax(bold[int(cut):].T, starts, nn, 30, 0.94, eps=eps)
+        return F[jnp.triu_indices(F.shape[0], k=30)]
 
-    FC_full = FCD_jax.get_fc(bold_d[cut:].T)   
-    
-    tri_idx = jnp.triu_indices(FC_full.shape[0], k=1) 
-    return FC_full[tri_idx]
 
-def wrapper_fcd(G, weights, t_end, cut):
-    par={}
-    par["G"] = G
-    par['weights'] = weights
-    par['t_end'] = t_end
-    sde = mpr_jax.MPR_sde.create(par)
-    data = sde.run({})
-    bold_d = data["bold_d"]
+class _JacOp(Op):
+    """Returns d(stat)/dG as a vector (used inside ForwardGradOp.grad)."""
+    def __init__(self, jac_fn):
+        self.jac_fn = jac_fn
+    def make_node(self, G):
+        G = pt.as_tensor_variable(G)
+        return Apply(self, [G], [pt.fvector()])
+    def perform(self, node, inputs, outputs):
+        outputs[0][0] = np.asarray(self.jac_fn(float(inputs[0])), dtype=np.float32).ravel()
 
-    FCD_full, _, _ = FCD_jax.extract_FCD(bold_d.T) 
-    
-    tri_idx = jnp.triu_indices(FCD_full.shape[0], k=30) 
 
-    return FCD_full[tri_idx]
+class ForwardGradOp(Op):
+    """Differentiable pytensor Op wrapping the JAX forward model (scalar G -> stat
+    vector). Two gradient paths, both FD: native PyMC samplers use .grad (numpy FD
+    via _JacOp); the JAX backend (nuts_sampler="blackjax"/"numpyro") uses jax_fn,
+    a jax.custom_vjp forward whose backward is the same FD gradient (see jax_funcify
+    registration below). The .grad here also satisfies PyMC's NUTS-eligibility check."""
+    def __init__(self, forward_fn, jac_fn, jax_fn=None):
+        self.forward_fn = forward_fn
+        self._jacop = _JacOp(jac_fn)
+        self.jax_fn = jax_fn              # JAX custom_vjp forward for the JAX backend
+    def make_node(self, G):
+        G = pt.as_tensor_variable(G)
+        return Apply(self, [G], [pt.fvector()])
+    def perform(self, node, inputs, outputs):
+        outputs[0][0] = np.asarray(self.forward_fn(float(inputs[0])), dtype=np.float32).ravel()
+    def grad(self, inputs, output_grads):
+        G = inputs[0]
+        gvec = output_grads[0]
+        jac = self._jacop(G)              # d(stat)/dG, shape (m,)
+        return [pt.dot(gvec, jac)]         # scalar gradient wrt G
 
-@as_op(
-    itypes=[pt.fscalar, pt.fmatrix, pt.fscalar, pt.fscalar],   
-    otypes=[pt.fvector]
-)
-def pytensor_forward_model_matrix(G, weights, t_end, cut):
 
-    G_val = float(G)
-    weights_np = np.asarray(weights, dtype=np.float32)
-    t_end_val = int(t_end)
-    cut_val = int(cut)
+@jax_funcify.register(ForwardGradOp)
+def _forwardgradop_jax_funcify(op, **kwargs):
+    """Convert ForwardGradOp to its JAX forward for pm.sample(nuts_sampler=...).
+    Returns the custom_vjp forward, so jax.grad (used by BlackJAX/NumPyro NUTS)
+    sees the finite-difference gradient."""
+    fn = op.jax_fn
+    if fn is None:
+        raise NotImplementedError("ForwardGradOp has no jax_fn; build it via make_forward_fns.")
+    def forward(G):
+        return fn(G)
+    return forward
 
-    return np.asarray(
-        wrapper_fcd(G_val, weights_np, t_end_val, cut_val),
-        dtype=np.float32,
-    ).flatten()
+
+def make_forward_fns(weights, t_end, cut, which_stat, starts, nn,
+                     clip_mode="hard", fast_bold=False, eps=0.0, grad_horizon=0,
+                     grad_method="fd", fd_h=1e-2):
+    """Build (forward, jac) closures for the JAX forward model with ALL config
+    captured BY VALUE. Because they close over plain values (not module globals),
+    cloudpickle serializes them correctly to spawned multiprocessing workers, so
+    every chain computes the same statistic with the same knobs. grad_method in
+    {"fd","autodiff"}; forward(g) and jac(g) both take a scalar float G."""
+    w = np.asarray(weights, dtype=np.float32)
+    s = None if starts is None else np.asarray(starts)
+
+    def forward(g):
+        return np.asarray(
+            _forward_stat_jax(jnp.float32(g), w, t_end, cut, which_stat, s, nn,
+                              clip_mode, fast_bold, eps, grad_horizon),
+            dtype=np.float32,
+        ).ravel()
+
+    if grad_method == "fd":
+        def jac(g):
+            fp = _forward_stat_jax(jnp.float32(g + fd_h), w, t_end, cut, which_stat, s, nn,
+                                   clip_mode, fast_bold, eps, grad_horizon)
+            fm = _forward_stat_jax(jnp.float32(g - fd_h), w, t_end, cut, which_stat, s, nn,
+                                   clip_mode, fast_bold, eps, grad_horizon)
+            return np.asarray((fp - fm) / (2.0 * fd_h), dtype=np.float32).ravel()
+    elif grad_method == "autodiff":
+        _jfn = jax.jacobian(lambda g: _forward_stat_jax(
+            g, w, t_end, cut, which_stat, s, nn, clip_mode, fast_bold, eps, grad_horizon))
+        def jac(g):
+            return np.asarray(_jfn(jnp.float32(g)), dtype=np.float32).ravel()
+    else:
+        raise ValueError(f"grad_method must be 'fd' or 'autodiff', got {grad_method}")
+
+    # JAX forward for the pytensor JAX backend (nuts_sampler="blackjax"/"numpyro").
+    # custom_vjp injects the SAME central-FD gradient (the two +/-h sims run in one
+    # vmapped call) so on-device NUTS uses the reliable FD gradient too.
+    def _raw_jax(G):
+        return _forward_stat_jax(G, w, t_end, cut, which_stat, s, nn,
+                                 clip_mode, fast_bold, eps, grad_horizon)
+    if grad_method == "autodiff":
+        jax_forward = _raw_jax
+    else:
+        @jax.custom_vjp
+        def jax_forward(G):
+            return _raw_jax(G)
+        def _jf_fwd(G):
+            return _raw_jax(G), G
+        def _jf_bwd(G, ct):
+            both = jax.vmap(_raw_jax)(jnp.stack([G + fd_h, G - fd_h]))
+            jacv = (both[0] - both[1]) / (2.0 * fd_h)
+            return (jnp.vdot(ct, jacv),)
+        jax_forward.defvjp(_jf_fwd, _jf_bwd)
+
+    return forward, jac, jax_forward
+
+
+def make_forward_grad_op(weights, t_end, cut, which_stat, starts, nn,
+                         clip_mode="hard", fast_bold=False, eps=0.0, grad_horizon=0,
+                         grad_method="fd", fd_h=1e-2):
+    """Build a differentiable ForwardGradOp with config baked into its closures."""
+    forward, jac, jax_forward = make_forward_fns(weights, t_end, cut, which_stat, starts, nn,
+                                                 clip_mode, fast_bold, eps, grad_horizon,
+                                                 grad_method, fd_h)
+    return ForwardGradOp(forward, jac, jax_forward)
+
 
 # ------------------ Helpers ------------------
 def tails_percentile(my_var_names, prior_predictions, thr):
@@ -178,13 +297,13 @@ def plot_trace(trace, my_var_names, theta_true, sampler, fname=None):
 
     return axes   
 
-def rmse_fit_mean(wrapper, trace, theta_true, my_var_names, weights, t_end, cut, FC_obs_flat):
+def rmse_fit_mean(forward_fn, trace, theta_true, my_var_names, FC_obs_flat):
 
     theta_mean=np.mean(az.extract(trace).to_dataframe()[my_var_names], axis=0).to_numpy()
     theta_err=np.sqrt(np.mean(theta_mean-theta_true)**2)
-    xs_= wrapper(G=theta_mean, weights=weights, t_end=t_end, cut=cut)
+    xs_= forward_fn(float(np.asarray(theta_mean).ravel()[0]))
     xs_err=np.sqrt(np.mean((xs_-FC_obs_flat)**2))
-    
+
     return (theta_err), np.mean(xs_err)
 
 def calcula_map(chains_):
@@ -197,15 +316,15 @@ def calcula_map(chains_):
         params_map.append(x_value_at_peak)
     return params_map
 
-def rmse_fit_map(wrapper, trace, theta_true, weights, t_end, cut, FC_obs_flat):
+def rmse_fit_map(forward_fn, trace, theta_true, FC_obs_flat):
 
     chains_pooled = trace.posterior["G"].values.reshape(1, -1)
     theta_map=calcula_map(chains_pooled)
-    theta_map =jnp.array(theta_map)
+    theta_map =np.asarray(theta_map)
     theta_err=np.sqrt(np.mean(theta_map-theta_true)**2)
-    xs_= wrapper(G=theta_map, weights=weights, t_end=t_end, cut=cut)
+    xs_= forward_fn(float(theta_map.ravel()[0]))
     xs_err=np.sqrt(np.mean((xs_-FC_obs_flat)**2))
-    
+
     return (theta_err), np.mean(xs_err)
 
 def tails_percentile(my_var_names, prior_predictions, thr):
@@ -219,9 +338,17 @@ def tails_percentile(my_var_names, prior_predictions, thr):
     return tails_xth_percentile
 
 
+# ------------------ Benchmark metrics ------------------
+# Shared with mpr_jax_numpyro.py so every sampler is scored identically.
+from benchmark_utils import benchmark_metrics
+
+
 # ------------------ Main ------------------
 def main():
     args = parse_args()
+    # NB: 'spawn' is set at import time (top of module) so each chain worker is a
+    # fresh process — on CPU this avoids fork+JAX segfaults and lets cloudpickle
+    # ship the forward closures (with baked-in config) to workers by value.
 
     # --- unpack args ---
     G, t_end, tr, cut = args.G, args.t_end, args.tr, args.cut
@@ -239,17 +366,29 @@ def main():
     which_stat = args.which_stat.upper()
     resultspath = utils.results_folder()
 
+    # --- device-aware parallelism ---
+    # On CPU: one chain per core via spawned processes (fast, isolated JAX each).
+    # On GPU: a single process — N workers would each grab a CUDA context / device
+    # memory and contend or OOM. So force cores=1 and rely on in-process sampling;
+    # true GPU speedup would come from on-device batching (vmap), not processes.
+    backend = jax.default_backend()  # "cpu" or "gpu"
+    sample_cores = 1 if backend == "gpu" else n_chains
+    print(f"JAX backend: {backend} | chains={n_chains}, sampling cores={sample_cores}")
+
     # --- setup params ---
     if SC_type == "sim":
-        weights = nx.to_numpy_array(nx.complete_graph(SC_size))
+        SC = nx.to_numpy_array(nx.complete_graph(SC_size)).astype(np.float32)
     elif SC_type == "data":
         datapath = utils.DATA_ROOT
         SC = np.loadtxt(os.path.join(datapath, "weights.txt")).astype(np.float32)
-        SC = SC[:SC_size,:SC_size]
-        nn = len(SC)
-        weights = jnp.array(SC) / jnp.max(SC)
+        SC = SC[:SC_size, :SC_size]
     else:
         raise ValueError(f"Invalid SC_type '{SC_type}'. Must be 'sim' or 'data'.")
+
+    # Defined the same way for both SC types so every code path (observed data,
+    # gradient-free op, smcabc, nuts) uses the same normalized coupling matrix.
+    nn = len(SC)
+    weights = jnp.array(SC) / jnp.max(SC)
     
     params = {
         "G": G, "weights": weights, "t_end": t_end, "seed": seed
@@ -271,22 +410,40 @@ def main():
     fname_summary_csv = os.path.join(resultspath, f"summary_{tag}.csv")
     fname_summary_RMSE_csv = os.path.join(resultspath, f"summary_RMSE_{tag}.csv")
     fname_netcdf = os.path.join(resultspath, f"inference_results_{tag}.nc")
+    fname_benchmark_csv = os.path.join(resultspath, f"benchmark_{tag}.csv")
+    fname_benchmark_params_csv = os.path.join(resultspath, f"benchmark_params_{tag}.csv")
+    fname_benchmark_json = os.path.join(resultspath, f"benchmark_{tag}.json")
 
-    # --- setup model features  and data --
-    if which_stat == "FC":
-        wrapper = wrapper_fc
-        #model = model_fc
-    elif which_stat == "FCD":
-        wrapper = wrapper_fcd
-        #model = model_fcd
+    # --- build the single config-explicit forward model (used by EVERY path) ---
+    if which_stat not in ("FC", "FCD"):
+        raise ValueError(f"Invalid statistic '{which_stat}'. Must be 'FC' or 'FCD'.")
+
+    nnodes = int(np.asarray(weights).shape[0])
+    # Precompute FCD sliding-window starts once, from a reference-simulation BOLD
+    # length (after cut), so observed data and every sampler use identical windows.
+    if which_stat == "FCD":
+        ref_bold = mpr_jax.MPR_sde.create(
+            {"G": float(params["G"]), "weights": weights, "t_end": t_end,
+             "clip_mode": args.clip_mode}
+        ).run({}, record_rv=False, fast_bold=args.fast_bold,
+              grad_horizon=args.grad_horizon)["bold_d"]
+        T = int(ref_bold[int(cut):].shape[0])
+        _, starts = FCD_jax.precompute_shift_and_starts(T, 30, 0.94)
+        starts = np.asarray(starts)
     else:
-        raise ValueError(f"Invalid Functional Connectivity type '{which_stat}'. Must be 'FC' or 'FCD'.")
+        starts = None
 
+    # forward_np(G)->flat statistic and jac_np(G)->d(stat)/dG. Config is captured
+    # by value inside these closures, so a single fwd_op works for gradient-free
+    # samplers, smcabc and nuts, and survives cloudpickle to spawned workers.
+    forward_np, jac_np, jax_fwd = make_forward_fns(
+        weights, t_end, cut, which_stat, starts, nnodes,
+        clip_mode=args.clip_mode, fast_bold=args.fast_bold, eps=args.fc_eps,
+        grad_horizon=args.grad_horizon, grad_method=args.grad_method, fd_h=args.fd_h)
+    fwd_op = ForwardGradOp(forward_np, jac_np, jax_fwd)
 
-    # --- Generate observed data ---
-    print("Using wrapper:", wrapper.__name__)
-
-    FC_obs_flat = wrapper(G, weights, t_end, cut)
+    # --- Generate observed data (same forward as the model -> shapes/semantics match) ---
+    FC_obs_flat = np.asarray(forward_np(float(params["G"])), dtype=np.float32)
     prior_specs = {"mu_G" : mu_G, "sigma_G": sigma_G, "lower_G": lower_G}
     my_var_names = ['G']
 
@@ -302,36 +459,22 @@ def main():
     plt.close()
     print(f"Prior predictive plot saved to: {fname_prior_pred}")
 
-    tails_5th_percentile=tails_percentile(my_var_names, prior_predict.prior, 0.05) 
+    tails_5th_percentile=tails_percentile(my_var_names, prior_predict.prior, 0.05)
+
+    # prior SD per parameter (for the shrinkage metric = 1 - post_var/prior_var)
+    prior_sd = {v: float(np.std(np.asarray(prior_predict.prior[v]).ravel(), ddof=1))
+                for v in my_var_names}
 
     os.makedirs(resultspath, exist_ok=True)
 
     with pm.Model() as model:
 
         G = pm.TruncatedNormal("G", mu=prior_specs["mu_G"], sigma=prior_specs["sigma_G"], lower=prior_specs["lower_G"])
-        
-        FC_hat_flat = pytensor_forward_model_matrix(G, 
-                                                    pt.constant(np.array(SC, dtype=np.float32)),
-                                                    pt.constant(np.float32(t_end)),
-                                                    pt.constant(np.float32(cut)),
-                                                    #pt.as_tensor_variable(np.array(SC, dtype=np.float32)),
-                                                    #pt.as_tensor_variable(np.float32(t_end)),
-                                                    #pt.as_tensor_variable(np.float32(cut)),
-                                                    )
 
+        # Single shared forward Op (config baked in). Gradient-free samplers just
+        # never call its .grad; nuts uses the same op below.
+        FC_hat_flat = fwd_op(G)
 
-        # ✅ Convert everything ONCE to NumPy constants
-        #weights_np = np.asarray(SC, dtype=np.float32)
-        #t_end_np = np.float32(t_end)
-        #cut_np = np.float32(cut)
-
-        #FC_hat_flat = pytensor_forward_model_matrix(
-        #    G,
-        #    pt.constant(weights_np),   # ✅ CORRECT
-        #    pt.constant(t_end_np),     # ✅ CORRECT
-        #    pt.constant(cut_np),       # ✅ CORRECT
-        #)
-                                                        
         # Likelihood
         pm.Normal("FC_obs", mu=FC_hat_flat, sigma=obs_err, observed=FC_obs_flat)
 
@@ -372,7 +515,7 @@ def main():
         sampler = "Slice Sampler"
         start_time = time.time()
         with model:
-            trace_slice = pm.sample(step=[pm.Slice(vars_list)], tune=n_warmup, draws=n_samples, chains=n_chains, cores=n_chains, 
+            trace_slice = pm.sample(step=[pm.Slice(vars_list)], tune=n_warmup, draws=n_samples, chains=n_chains, cores=sample_cores, 
                                     initvals={var_name: tails_5th_percentile[var_name] for var_name in my_var_names}
                                 ) 
         crudetime_slice=time.time() - start_time
@@ -384,7 +527,7 @@ def main():
         sampler = "Metropolis"
         start_time = time.time()
         with model:
-            trace_M = pm.sample(step=[pm.Metropolis()], tune=n_warmup, draws=n_samples, chains=n_chains, cores=n_chains,
+            trace_M = pm.sample(step=[pm.Metropolis()], tune=n_warmup, draws=n_samples, chains=n_chains, cores=sample_cores,
                             initvals={var_name: tails_5th_percentile[var_name] for var_name in my_var_names}
                             )
         crudetime_M=time.time() - start_time
@@ -396,7 +539,7 @@ def main():
         sampler = "DE MetropolisZ"
         start_time = time.time()
         with model:
-            trace_DEMZ = pm.sample(step=[pm.DEMetropolisZ()], tune=n_warmup, draws=n_samples, chains=n_chains, cores=n_chains,
+            trace_DEMZ = pm.sample(step=[pm.DEMetropolisZ()], tune=n_warmup, draws=n_samples, chains=n_chains, cores=sample_cores,
                                     initvals={var_name: tails_5th_percentile[var_name] for var_name in my_var_names}
                                 ) 
         crudetime_DEMZ=time.time() - start_time
@@ -407,8 +550,16 @@ def main():
 
         sampler = "DEMetropolis"
         start_time = time.time()
+        # WARNING: DEMetropolis is unreliable with this JAX/XLA forward model.
+        # It is a POPULATION sampler (coupled chains): with cores>1 PyMC's own
+        # PopulationStepper spawns subprocesses that crash on the JAX op, and even
+        # with cores=1 (set below to avoid that path) the full pipeline hits an
+        # XLA LLVM "Cannot allocate memory" during compilation and segfaults
+        # (reproducible; works only in a minimal script). Prefer DEMetropolisZ for
+        # differential-evolution sampling: its chains are independent and DO run
+        # one-per-core under spawn. cores=1 is kept as the least-broken option.
         with model:
-            trace_DEM = pm.sample(step=[pm.DEMetropolis()],  draws=n_samples, chains=n_chains, cores=n_chains,
+            trace_DEM = pm.sample(step=[pm.DEMetropolis()],  draws=n_samples, chains=n_chains, cores=1,
                                 initvals={var_name: tails_5th_percentile[var_name] for var_name in my_var_names}
                                 )
         crudetime_DEM=time.time() - start_time
@@ -426,7 +577,7 @@ def main():
                                         correlation_threshold=correlation_threshold,  
                                         progressbar=False, 
                                         chains=n_chains,
-                                        cores=n_chains
+                                        cores=sample_cores
                                         )
         crudetime_SMC_like=time.time() - start_time
         print("---running took: %s seconds ---" % crudetime_SMC_like)
@@ -435,9 +586,7 @@ def main():
     elif sampler == "smcabc":
 
         def simulator_forward_model(rng,  G, size=None):
-            theta = G 
-            #mu = wrapper(G=G.item(), par=params, cut=cut, starts=starts, nn=nn).reshape(-1, 1)
-            mu = wrapper(G=G.item(), weights=weights, t_end=t_end, cut=cut).reshape(-1, 1)
+            mu = forward_np(float(np.asarray(G).ravel()[0])).reshape(-1, 1)
             return rng.normal(mu, obs_err)
         
         with pm.Model() as model:
@@ -465,18 +614,71 @@ def main():
                                         correlation_threshold=correlation_threshold,  #defaul 0.01
                                         progressbar=False, 
                                         chains=n_chains,
-                                        cores=n_chains)
+                                        cores=sample_cores)
         crudetime_SMC_e1=time.time() - start_time
 
         print("---running took: %s seconds ---" % crudetime_SMC_e1)
         trace = trace_SMC_e
 
-    else: 
-        ValueError(f"Invalid sampler: {sampler}")
+    elif sampler == "nuts":
+
+        # Gradient-based NUTS using the same shared differentiable fwd_op built
+        # above. grad_method="fd" (default) uses central finite differences
+        # (correct across the bifurcation); "autodiff" uses jax.jacobian (exact
+        # but unreliable past the transition). The observed FC_obs_flat came from
+        # the same forward_np, so shapes/semantics already match.
+        with pm.Model() as model_nuts:
+            G = pm.TruncatedNormal("G", mu=prior_specs["mu_G"],
+                                   sigma=prior_specs["sigma_G"],
+                                   lower=prior_specs["lower_G"])
+            mu = fwd_op(G)
+            pm.Normal("FC_obs", mu=mu, sigma=obs_err, observed=FC_obs_flat)
+
+        sampler = f"NUTS ({args.grad_method})"
+        start_time = time.time()
+        with model_nuts:
+            trace_nuts = pm.sample(
+                step=[pm.NUTS([model_nuts["G"]])],
+                tune=n_warmup, draws=n_samples, chains=n_chains, cores=sample_cores,
+                initvals={var_name: tails_5th_percentile[var_name] for var_name in my_var_names},
+            )
+        crudetime_nuts = time.time() - start_time
+        print("---running took: %s seconds ---" % crudetime_nuts)
+        trace = trace_nuts
+
+    elif sampler in ("numpyro", "blackjax"):
+
+        # On-device NUTS via PyMC's JAX backend (nuts_sampler = "numpyro" or
+        # "blackjax"). The default `model` (with fwd_op) compiles to JAX through
+        # the registered jax_funcify, and the custom_vjp gives NUTS the FD
+        # gradient. Chains are vmapped on-device ("vectorized"), so this is the
+        # GPU-ready path within the PyMC benchmark. NumPyro is the more mature/
+        # convenient backend, so it is the recommended default of the two.
+        nuts_sampler = sampler
+        sampler = f"{'NumPyro' if nuts_sampler == 'numpyro' else 'BlackJAX'} NUTS ({args.grad_method})"
+        start_time = time.time()
+        with model:
+            trace_bj = pm.sample(
+                nuts_sampler=nuts_sampler,
+                tune=n_warmup, draws=n_samples, chains=n_chains,
+                nuts_sampler_kwargs={"chain_method": "vectorized"},
+                progressbar=False, random_seed=seed,
+            )
+        print("---running took: %s seconds ---" % (time.time() - start_time))
+        trace = trace_bj
+
+    else:
+        raise ValueError(f"Invalid sampler: {sampler}")
+
+    # Wall-clock sampling time of whichever branch ran: each branch sets
+    # start_time right before its pm.sample/pm.sample_smc call, so this measures
+    # the sampling itself (excluding model build) consistently across samplers.
+    runtime = time.time() - start_time
 
     #print(trace.sample_stats.beta)
 
-    az.to_netcdf(trace.posterior, fname_netcdf)
+    # Save the FULL InferenceData (posterior + sample_stats etc.) for benchmarking.
+    az.to_netcdf(trace, fname_netcdf)
     print(f"Trace saved to: {fname_netcdf}")
 
     summary_df = az.summary(trace)
@@ -486,11 +688,11 @@ def main():
 
     plot_trace(trace, my_var_names, theta_true, sampler, fname=fname_trace)
 
-    rmse_paramsmean, rmse_fitmean  = rmse_fit_mean(wrapper, trace, theta_true, my_var_names, weights, t_end, cut, FC_obs_flat)
+    rmse_paramsmean, rmse_fitmean  = rmse_fit_mean(forward_np, trace, theta_true, my_var_names, FC_obs_flat)
     print ('RMSE to true parameters', rmse_paramsmean),
     print ('RMSE to true observation', rmse_fitmean)
 
-    rmse_paramsmap, rmse_fitmap  = rmse_fit_map(wrapper, trace, theta_true, weights, t_end, cut, FC_obs_flat)
+    rmse_paramsmap, rmse_fitmap  = rmse_fit_map(forward_np, trace, theta_true, FC_obs_flat)
     print ('RMSE to true parameters', rmse_paramsmap),
     print ('RMSE to true observation', rmse_fitmap)
 
@@ -504,6 +706,32 @@ def main():
     summary_df_RMSE = pd.DataFrame(summary_data)
     summary_df_RMSE.to_csv(fname_summary_RMSE_csv, index=False)
     print(f"RMSE summary saved to: {fname_summary_RMSE_csv}")
+
+    # --- comprehensive benchmark metrics (one row per run; concat across runs
+    #     to compare samplers × statistic on convergence/efficiency/accuracy) ---
+    meta = {
+        "sampler": sampler, "which_stat": which_stat, "SC_type": SC_type,
+        "SC_size": SC_size, "G_true": float(params["G"]), "t_end": t_end,
+        "cut": cut, "obs_err": obs_err, "seed": seed,
+        "n_warmup": n_warmup, "grad_method": args.grad_method,
+        "clip_mode": args.clip_mode, "epsilon": epsilon,
+    }
+    rmse = {"param_mean": float(rmse_paramsmean), "param_map": float(rmse_paramsmap),
+            "fit_mean": float(rmse_fitmean), "fit_map": float(rmse_fitmap)}
+    try:
+        run_row, param_rows = benchmark_metrics(
+            trace, theta_true, my_var_names, prior_sd, runtime, rmse, meta)
+        pd.DataFrame([run_row]).to_csv(fname_benchmark_csv, index=False)
+        pd.DataFrame(param_rows).to_csv(fname_benchmark_params_csv, index=False)
+        with open(fname_benchmark_json, "w") as fh:
+            json.dump({"run": run_row, "params": param_rows}, fh, indent=2)
+        print(f"Benchmark metrics saved to: {fname_benchmark_csv}")
+        print(f"  runtime={runtime:.1f}s  max_r_hat={run_row['max_r_hat']:.3f}  "
+              f"min_ess_bulk={run_row['min_ess_bulk']:.1f}  "
+              f"ess/sec={run_row['min_ess_bulk_per_sec']:.2f}  "
+              f"rmse_param_mean={run_row['rmse_param_mean']:.4f}")
+    except Exception as e:
+        print(f"WARNING: benchmark_metrics failed: {e}")
 
 if __name__ == "__main__":
 

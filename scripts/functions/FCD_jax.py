@@ -1,11 +1,24 @@
 import jax
 import jax.numpy as jnp
 
-def get_fc(bold):
+def _corrcoef(x, eps=0.0):
+    """Pearson correlation of rows of `x`. eps<=0 -> jnp.corrcoef (bit-exact).
+    eps>0 -> stabilised denominator sqrt(var_i*var_j + eps) so zero-variance
+    rows give 0 instead of NaN (keeps gradients finite)."""
+    if eps <= 0:
+        return jnp.corrcoef(x)
+    xc = x - jnp.mean(x, axis=1, keepdims=True)
+    T = x.shape[1]
+    cov = (xc @ xc.T) / (T - 1)
+    var = jnp.diag(cov)
+    return cov / jnp.sqrt(jnp.outer(var, var) + eps)
+
+def get_fc(bold, eps=0.0):
     """
-    Extract the functional correlation (pearson correlation) of the input (bold_d.T from running the mpr model)
+    Extract the functional correlation (pearson correlation) of the input (bold_d.T from running the mpr model).
+    eps>0 uses a stabilised correlation (safe for gradients); eps=0 is the original jnp.corrcoef.
     """
-    FC = jnp.corrcoef(bold)
+    FC = _corrcoef(bold, eps)
     FC = FC * (FC > 0)
     FC = FC - jnp.diag(jnp.diag(FC))
     return FC
@@ -145,11 +158,11 @@ def precompute_shift_and_starts(T, wwidth, olap):
     return shift, starts
 
 #@jax.jit(static_argnums=(2, 3))
-def extract_FCD_jax(data, starts, nnodes, wwidth=30, olap=0.94):
+def extract_FCD_jax(data, starts, nnodes, wwidth=30, olap=0.94, eps=0.0):
     def compute_fc(start):
         window = jax.lax.dynamic_slice(data, (0, start), (nnodes, wwidth))
         #print("Window shape:", window.shape)
-        fc = jnp.corrcoef(window)
+        fc = _corrcoef(window, eps)
         fc = fc * (fc > 0)
         tril_idx = jnp.tril_indices(nnodes, -1)
         return fc[tril_idx]
@@ -161,13 +174,14 @@ def extract_FCD_jax(data, starts, nnodes, wwidth=30, olap=0.94):
     CV_centered = corr_vectors - jnp.mean(corr_vectors, axis=1, keepdims=True)
 
     # Compute FCD matrix as the correlation of the centered vectors
-    fcd_matrix = jnp.corrcoef(CV_centered)
+    fcd_matrix = _corrcoef(CV_centered, eps)
 
     return fcd_matrix
 
 extract_FCD_jax_jitted = jax.jit(extract_FCD_jax, static_argnums=(2, 3))
 
 def fluidity(fcd, win_len=30, overlap=0.94):
-    k = int((float(win_len)/(float(win_len)-float(overlap)))+1)
-    triangle = jnp.triu(fcd, k)
-    return jnp.var(triangle)
+    k = int((float(win_len) / (float(win_len) - float(overlap))) + 1)
+    n = fcd.shape[0]
+    idx = jnp.triu_indices(n, k)
+    return jnp.var(fcd[idx])

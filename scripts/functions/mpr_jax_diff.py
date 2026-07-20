@@ -97,8 +97,7 @@ def heun_sde_precomputed_noise(x, t, P, dW_r, dW_v, nn):
     x_new = x + 0.5 * dt * (k1 + k2)
     x_new = x_new.at[:nn].add(dW_r)
     x_new = x_new.at[nn:].add(dW_v)
-
-    #x_new = x_new.at[:nn].set(jax.nn.softplus(x_new[:nn]))
+    x_new = x_new.at[:nn].set(jnp.maximum(x_new[:nn], 0.0))
 
     return x_new
 
@@ -614,7 +613,6 @@ def check_vec_size(x, nn):
     """
     x = jnp.asarray(x)
     return jnp.ones(nn) * x if x.ndim == 0 or x.size != nn else x
-
 
 
 
