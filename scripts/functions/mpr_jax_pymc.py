@@ -71,7 +71,26 @@ def parse_args():
     parser.add_argument("--olap", type=float, default=0.94)
 
     # Inference settings
-    parser.add_argument("--obs_err", type=float, default=0.1)
+    parser.add_argument("--obs_err", type=float, default=1.0,
+                        help="Gaussian likelihood sigma on the (FC/FCD) features. Default 1.0 "
+                             "matches vbjax's dist.Normal(mu, 1); kept identical across scripts.")
+    parser.add_argument("--standardize_features", action=argparse.BooleanOptionalAction, default=True,
+                        help="Z-score each FC/FCD feature by its scatter across noise seeds so a "
+                             "unit obs_err is meaningful and FC vs FCD sit on the same scale "
+                             "(applied congruently to observed, likelihood, FD-grad and SMC).")
+    parser.add_argument("--n_ref_seeds", type=int, default=8,
+                        help="Number of noise seeds used to estimate per-feature scatter for "
+                             "--standardize_features (extra full sims run once at setup).")
+    parser.add_argument("--noisy_obs", action=argparse.BooleanOptionalAction, default=True,
+                        help="Add N(0, obs_err) observation noise to the synthetic observed data so "
+                             "it is a genuine draw from the model (needed for honest calibration).")
+    parser.add_argument("--fisher_z", action=argparse.BooleanOptionalAction, default=True,
+                        help="Apply arctanh (Fisher z) to correlation features before the Gaussian "
+                             "likelihood: variance-stabilizes and unbounds them so fixed-sigma is "
+                             "well-specified (no extra sims needed). Applied inside the forward.")
+    parser.add_argument("--keep_negative_fc", action=argparse.BooleanOptionalAction, default=True,
+                        help="Keep negative (anti-)correlations instead of the default ReLU that "
+                             "zeroes them: more information, no zero-variance-feature spike, smoother.")
     parser.add_argument("--n_prior", type=int, default=10000)
     parser.add_argument("--mu_G", type=float, default=0.3)
     parser.add_argument("--sigma_G", type=float, default=0.5)
@@ -80,6 +99,10 @@ def parse_args():
     parser.add_argument("--n_warmup", type=int, default=10)
     parser.add_argument("--n_samples", type=int, default=10)
     parser.add_argument("--n_chains", type=int, default=4)
+    parser.add_argument("--sample_cores", type=int, default=0,
+                        help="Parallel sampling processes. 0=auto (=n_chains on CPU, 1 on GPU). "
+                             "Set 1 to run chains sequentially in-process (much lower peak RAM; "
+                             "avoids XLA 'Cannot allocate memory' with a big t_end).")
 
     parser.add_argument("--sampler", type=str, default="smcabc",
                     choices=["slice", "metropolis", "demetropolisz", "demetropolis", "smclik", "smcabc", "nuts", "blackjax", "numpyro"], help="Choose inference method")
@@ -102,6 +125,10 @@ def parse_args():
                         help="Integrate BOLD once per rv_decimate block (approx, ~1.4x faster).")
     parser.add_argument("--fc_eps", type=float, default=0.0,
                         help="Stabilise FC/FCD correlation denominator (e.g. 1e-6) for NaN-safety.")
+    parser.add_argument("--fcd_stride1", action=argparse.BooleanOptionalAction, default=True,
+                        help="Use vbi-style FCD windowing (shift=1 sample) instead of the "
+                             "overlap-fraction shift; pairs with the hardcoded triu offset k=30. "
+                             "Pass --no-fcd_stride1 to revert to the prior overlap windowing.")
     # --- gradient-based NUTS options (only used when --sampler nuts) ---
     parser.add_argument("--grad_method", type=str, default="fd", choices=["fd", "autodiff"],
                         help="Gradient for NUTS: fd=finite differences (correct in chaos), autodiff (unreliable past bifurcation).")
@@ -133,24 +160,36 @@ def timer(func):
 # (grad_method="autodiff", exact but unreliable past the bifurcation); gradient-
 # free samplers simply never call it.
 
+def _fisher_z(v, eps=1e-4):
+    """Fisher z-transform arctanh(r) for correlation features. Variance-stabilizes
+    (a correlation's own variance depends on its value; arctanh makes it ~constant)
+    and maps [-1,1] -> R so a fixed-sigma Gaussian likelihood is well-specified.
+    Clip keeps arctanh(+/-1) finite. Applied INSIDE the forward so the FD gradient
+    and SMC paths all see the transformed feature."""
+    return jnp.arctanh(jnp.clip(v, -1.0 + eps, 1.0 - eps))
+
+
 def _forward_stat_jax(G, weights, t_end, cut, which_stat, starts, nn,
-                      clip_mode="hard", fast_bold=False, eps=0.0, grad_horizon=0):
+                      clip_mode="hard", fast_bold=False, eps=0.0, grad_horizon=0,
+                      fisher_z=False, keep_negative=False):
     """JAX forward: simulate at coupling G and return the flat FC/FCD statistic.
 
-    Config (clip_mode/fast_bold/eps/grad_horizon) is passed EXPLICITLY rather
-    than read from a module global, so the closures that capture it (built in
-    main) are serialized by value to spawned multiprocessing workers.
+    Config (clip_mode/fast_bold/eps/grad_horizon/fisher_z/keep_negative) is passed
+    EXPLICITLY rather than read from a module global, so the closures that capture it
+    (built in main) are serialized by value to spawned multiprocessing workers.
     """
     par = {"G": G, "weights": weights, "t_end": t_end, "clip_mode": clip_mode}
     sde = mpr_jax.MPR_sde.create(par)
     bold = sde.run({}, record_rv=False, fast_bold=fast_bold,
                    grad_horizon=grad_horizon)["bold_d"]
     if which_stat == "FC":
-        F = FCD_jax.get_fc(bold[int(cut):].T, eps=eps)
-        return F[jnp.triu_indices(F.shape[0], k=1)]
+        F = FCD_jax.get_fc(bold[int(cut):].T, eps=eps, keep_negative=keep_negative)
+        v = F[jnp.triu_indices(F.shape[0], k=1)]
     else:
-        F = FCD_jax.extract_FCD_jax(bold[int(cut):].T, starts, nn, 30, 0.94, eps=eps)
-        return F[jnp.triu_indices(F.shape[0], k=30)]
+        F = FCD_jax.extract_FCD_jax(bold[int(cut):].T, starts, nn, 30, 0.94, eps=eps,
+                                    keep_negative=keep_negative)
+        v = F[jnp.triu_indices(F.shape[0], k=30)]
+    return _fisher_z(v) if fisher_z else v
 
 
 class _JacOp(Op):
@@ -162,6 +201,24 @@ class _JacOp(Op):
         return Apply(self, [G], [pt.fvector()])
     def perform(self, node, inputs, outputs):
         outputs[0][0] = np.asarray(self.jac_fn(float(inputs[0])), dtype=np.float32).ravel()
+        _maybe_clear_jax_cache()
+
+
+# The JAX forward accumulates ~20-35 MB of cache per call (measured: jax.clear_caches()
+# fully reclaims it, gc.collect() only partly, so it is a JAX cache leak not Python).
+# Unchecked it OOMs long chains (~150 draws/chain at t_end=40000). Clearing every call
+# would force a recompile each time; instead clear PERIODICALLY -> peak bounded to
+# ~N*per-call, amortized recompile cost negligible on a long run. FORWARD_CLEAR_EVERY=0
+# disables. Counter is process-local (spawned chain workers each get their own).
+_FWD_CLEAR_EVERY = int(os.environ.get("FORWARD_CLEAR_EVERY", "40"))
+_fwd_call_count = [0]
+
+def _maybe_clear_jax_cache():
+    if _FWD_CLEAR_EVERY <= 0:
+        return
+    _fwd_call_count[0] += 1
+    if _fwd_call_count[0] % _FWD_CLEAR_EVERY == 0:
+        jax.clear_caches()
 
 
 class ForwardGradOp(Op):
@@ -178,6 +235,8 @@ class ForwardGradOp(Op):
         G = pt.as_tensor_variable(G)
         return Apply(self, [G], [pt.fvector()])
     def perform(self, node, inputs, outputs):
+        # forward_fn is the make_forward_fns closure (or its standardize wrapper),
+        # which already calls _maybe_clear_jax_cache -> no extra clear needed here.
         outputs[0][0] = np.asarray(self.forward_fn(float(inputs[0])), dtype=np.float32).ravel()
     def grad(self, inputs, output_grads):
         G = inputs[0]
@@ -201,7 +260,7 @@ def _forwardgradop_jax_funcify(op, **kwargs):
 
 def make_forward_fns(weights, t_end, cut, which_stat, starts, nn,
                      clip_mode="hard", fast_bold=False, eps=0.0, grad_horizon=0,
-                     grad_method="fd", fd_h=1e-2):
+                     grad_method="fd", fd_h=1e-2, fisher_z=False, keep_negative=False):
     """Build (forward, jac) closures for the JAX forward model with ALL config
     captured BY VALUE. Because they close over plain values (not module globals),
     cloudpickle serializes them correctly to spawned multiprocessing workers, so
@@ -211,22 +270,27 @@ def make_forward_fns(weights, t_end, cut, which_stat, starts, nn,
     s = None if starts is None else np.asarray(starts)
 
     def forward(g):
-        return np.asarray(
+        out = np.asarray(
             _forward_stat_jax(jnp.float32(g), w, t_end, cut, which_stat, s, nn,
-                              clip_mode, fast_bold, eps, grad_horizon),
+                              clip_mode, fast_bold, eps, grad_horizon, fisher_z, keep_negative),
             dtype=np.float32,
         ).ravel()
+        # Bound the ~20-50MB/call JAX-cache leak on EVERY forward path (the Op, but
+        # also pm.Simulator/smcabc, smclik and rmse call this closure directly and
+        # would otherwise bypass the clear -> OOM). See _maybe_clear_jax_cache.
+        _maybe_clear_jax_cache()
+        return out
 
     if grad_method == "fd":
         def jac(g):
             fp = _forward_stat_jax(jnp.float32(g + fd_h), w, t_end, cut, which_stat, s, nn,
-                                   clip_mode, fast_bold, eps, grad_horizon)
+                                   clip_mode, fast_bold, eps, grad_horizon, fisher_z, keep_negative)
             fm = _forward_stat_jax(jnp.float32(g - fd_h), w, t_end, cut, which_stat, s, nn,
-                                   clip_mode, fast_bold, eps, grad_horizon)
+                                   clip_mode, fast_bold, eps, grad_horizon, fisher_z, keep_negative)
             return np.asarray((fp - fm) / (2.0 * fd_h), dtype=np.float32).ravel()
     elif grad_method == "autodiff":
         _jfn = jax.jacobian(lambda g: _forward_stat_jax(
-            g, w, t_end, cut, which_stat, s, nn, clip_mode, fast_bold, eps, grad_horizon))
+            g, w, t_end, cut, which_stat, s, nn, clip_mode, fast_bold, eps, grad_horizon, fisher_z, keep_negative))
         def jac(g):
             return np.asarray(_jfn(jnp.float32(g)), dtype=np.float32).ravel()
     else:
@@ -237,7 +301,7 @@ def make_forward_fns(weights, t_end, cut, which_stat, starts, nn,
     # vmapped call) so on-device NUTS uses the reliable FD gradient too.
     def _raw_jax(G):
         return _forward_stat_jax(G, w, t_end, cut, which_stat, s, nn,
-                                 clip_mode, fast_bold, eps, grad_horizon)
+                                 clip_mode, fast_bold, eps, grad_horizon, fisher_z, keep_negative)
     if grad_method == "autodiff":
         jax_forward = _raw_jax
     else:
@@ -253,6 +317,39 @@ def make_forward_fns(weights, t_end, cut, which_stat, starts, nn,
         jax_forward.defvjp(_jf_fwd, _jf_bwd)
 
     return forward, jac, jax_forward
+
+
+def feature_reference_scatter(G, weights, t_end, cut, which_stat, starts, nn,
+                              clip_mode="hard", fast_bold=False, eps=0.0,
+                              n_ref=8, base_seed=10_000, fisher_z=False,
+                              keep_negative=False):
+    """Per-feature mean/std of the FC/FCD statistic across `n_ref` noise seeds.
+
+    Used by --standardize_features: dividing each feature by its noise-scatter puts
+    all features on unit scale (so obs_err=1 is meaningful) and places FC and FCD on
+    the same scale. Runs n_ref extra full sims once at setup. Extraction mirrors
+    _forward_stat_jax exactly so standardized features stay congruent with the model."""
+    reps = []
+    for i in range(n_ref):
+        par = {"G": G, "weights": weights, "t_end": t_end,
+               "clip_mode": clip_mode, "seed": base_seed + i}
+        bold = mpr_jax.MPR_sde.create(par).run(
+            {}, record_rv=False, fast_bold=fast_bold, grad_horizon=0)["bold_d"]
+        b = bold[int(cut):].T
+        if which_stat == "FC":
+            F = FCD_jax.get_fc(b, eps=eps, keep_negative=keep_negative)
+            v = F[jnp.triu_indices(F.shape[0], k=1)]
+        else:
+            F = FCD_jax.extract_FCD_jax(b, starts, nn, 30, 0.94, eps=eps,
+                                        keep_negative=keep_negative)
+            v = F[jnp.triu_indices(F.shape[0], k=30)]
+        if fisher_z:
+            v = _fisher_z(v)          # scatter estimated on the transformed feature
+        reps.append(np.asarray(v, dtype=np.float32))
+    reps = np.stack(reps, 0)
+    mu = reps.mean(0).astype(np.float32)
+    sd = np.maximum(reps.std(0, ddof=1), 1e-6).astype(np.float32)  # floor: never /~0
+    return mu, sd
 
 
 def make_forward_grad_op(weights, t_end, cut, which_stat, starts, nn,
@@ -372,7 +469,10 @@ def main():
     # memory and contend or OOM. So force cores=1 and rely on in-process sampling;
     # true GPU speedup would come from on-device batching (vmap), not processes.
     backend = jax.default_backend()  # "cpu" or "gpu"
-    sample_cores = 1 if backend == "gpu" else n_chains
+    if args.sample_cores and args.sample_cores > 0:
+        sample_cores = args.sample_cores   # explicit override (e.g. 1 to cap peak RAM)
+    else:
+        sample_cores = 1 if backend == "gpu" else n_chains
     print(f"JAX backend: {backend} | chains={n_chains}, sampling cores={sample_cores}")
 
     # --- setup params ---
@@ -428,7 +528,7 @@ def main():
         ).run({}, record_rv=False, fast_bold=args.fast_bold,
               grad_horizon=args.grad_horizon)["bold_d"]
         T = int(ref_bold[int(cut):].shape[0])
-        _, starts = FCD_jax.precompute_shift_and_starts(T, 30, 0.94)
+        _, starts = FCD_jax.precompute_shift_and_starts(T, 30, 0.94, stride1=args.fcd_stride1)
         starts = np.asarray(starts)
     else:
         starts = None
@@ -439,11 +539,42 @@ def main():
     forward_np, jac_np, jax_fwd = make_forward_fns(
         weights, t_end, cut, which_stat, starts, nnodes,
         clip_mode=args.clip_mode, fast_bold=args.fast_bold, eps=args.fc_eps,
-        grad_horizon=args.grad_horizon, grad_method=args.grad_method, fd_h=args.fd_h)
+        grad_horizon=args.grad_horizon, grad_method=args.grad_method, fd_h=args.fd_h,
+        fisher_z=args.fisher_z, keep_negative=args.keep_negative_fc)
+
+    # --- optional per-feature standardization -----------------------------------
+    # Wrap the forward as an AFFINE transform  x -> (x - mu)/sd  applied to EVERY
+    # consumer of the statistic (observed, likelihood, FD-grad, SMC), so a single
+    # scalar obs_err is a unit-scale sigma and FC/FCD are comparable. Identity
+    # (mu=0, sd=1) when --standardize_features is off -> bit-exact prior behaviour.
+    feat_mu = np.float32(0.0)
+    feat_sd = np.float32(1.0)
+    if args.standardize_features:
+        feat_mu, feat_sd = feature_reference_scatter(
+            float(params["G"]), weights, t_end, cut, which_stat, starts, nnodes,
+            clip_mode=args.clip_mode, fast_bold=args.fast_bold, eps=args.fc_eps,
+            n_ref=args.n_ref_seeds, fisher_z=args.fisher_z,
+            keep_negative=args.keep_negative_fc)
+        print(f"Standardizing {which_stat} features over {args.n_ref_seeds} noise "
+              f"seeds: dim={feat_sd.shape[0]}, median feature sd={np.median(feat_sd):.4g}")
+        _mu_j, _sd_j = jnp.asarray(feat_mu), jnp.asarray(feat_sd)
+        _f0, _j0, _x0 = forward_np, jac_np, jax_fwd
+        forward_np = lambda g, _f=_f0: ((np.asarray(_f(g)) - feat_mu) / feat_sd).astype(np.float32)
+        jac_np     = lambda g, _j=_j0: (np.asarray(_j(g)) / feat_sd).astype(np.float32)
+        jax_fwd    = lambda G, _x=_x0: (_x(G) - _mu_j) / _sd_j   # affine ∘ custom_vjp: FD grad /sd
+
     fwd_op = ForwardGradOp(forward_np, jac_np, jax_fwd)
 
     # --- Generate observed data (same forward as the model -> shapes/semantics match) ---
     FC_obs_flat = np.asarray(forward_np(float(params["G"])), dtype=np.float32)
+    if args.noisy_obs:
+        # Make the synthetic observation a genuine draw from the likelihood: add
+        # N(0, obs_err) (in standardized space obs_err=1 == unit per-feature noise).
+        _rng_obs = np.random.default_rng(seed)
+        FC_obs_flat = (FC_obs_flat
+                       + _rng_obs.normal(0.0, obs_err, size=FC_obs_flat.shape)).astype(np.float32)
+        print(f"Added observation noise N(0, {obs_err}) to observed "
+              f"({FC_obs_flat.shape[0]} features).")
     prior_specs = {"mu_G" : mu_G, "sigma_G": sigma_G, "lower_G": lower_G}
     my_var_names = ['G']
 
@@ -678,8 +809,27 @@ def main():
     #print(trace.sample_stats.beta)
 
     # Save the FULL InferenceData (posterior + sample_stats etc.) for benchmarking.
-    az.to_netcdf(trace, fname_netcdf)
-    print(f"Trace saved to: {fname_netcdf}")
+    # SMC samplers (smclik/smcabc) store a 'beta' tempering schedule in sample_stats
+    # as an object array with mixed int/float, which az.to_netcdf cannot serialize.
+    # Coerce any object-dtype sample_stats var to float, and make the save non-fatal
+    # so a serialization hiccup never discards a completed (expensive) run.
+    if hasattr(trace, "sample_stats"):
+        for _v in list(trace.sample_stats.data_vars):
+            if trace.sample_stats[_v].dtype == object:
+                try:
+                    trace.sample_stats[_v] = trace.sample_stats[_v].astype("float64")
+                except (ValueError, TypeError):
+                    # Ragged/nested object stat (e.g. SMC 'beta' tempering schedule
+                    # stored as an array of lists) is not netCDF-serializable and
+                    # can't be coerced element-wise. Drop it so the rest still saves.
+                    trace.sample_stats = trace.sample_stats.drop_vars(_v)
+    try:
+        az.to_netcdf(trace, fname_netcdf)
+        print(f"Trace saved to: {fname_netcdf}")
+    except Exception as _e:
+        print(f"WARNING: full az.to_netcdf failed ({type(_e).__name__}: {_e}); "
+              f"saving posterior group only.")
+        az.to_netcdf(trace.posterior, fname_netcdf)
 
     summary_df = az.summary(trace)
     summary_df.to_csv(fname_summary_csv)
@@ -715,6 +865,11 @@ def main():
         "cut": cut, "obs_err": obs_err, "seed": seed,
         "n_warmup": n_warmup, "grad_method": args.grad_method,
         "clip_mode": args.clip_mode, "epsilon": epsilon,
+        "fcd_stride1": bool(args.fcd_stride1),
+        "standardize_features": bool(args.standardize_features),
+        "noisy_obs": bool(args.noisy_obs),
+        "fisher_z": bool(args.fisher_z),
+        "keep_negative_fc": bool(args.keep_negative_fc),
     }
     rmse = {"param_mean": float(rmse_paramsmean), "param_map": float(rmse_paramsmap),
             "fit_mean": float(rmse_fitmean), "fit_map": float(rmse_fitmap)}

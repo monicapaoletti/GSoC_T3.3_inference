@@ -19,3 +19,6 @@ scripts/notebooks/tutorial*
 scripts/noteboooks/test.nc
 scripts/smallSC_inferG*
 de_model
+
+# Overleaf paper (separate git remote, cloned locally)
+paper/

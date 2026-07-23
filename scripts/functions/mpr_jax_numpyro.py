@@ -60,7 +60,9 @@ def parse_args():
     parser.add_argument("--olap", type=float, default=0.5)
 
     # Inference settings
-    parser.add_argument("--obs_err", type=float, default=0.01)
+    parser.add_argument("--obs_err", type=float, default=1.0,
+                        help="Gaussian likelihood sigma on the (FC/FCD) features. Default 1.0 "
+                             "matches vbjax's dist.Normal(mu, 1); kept identical across scripts.")
     parser.add_argument("--n_prior", type=int, default=100)
     parser.add_argument("--n_warmup", type=int, default=20)
     parser.add_argument("--n_samples", type=int, default=20)
@@ -86,8 +88,26 @@ def parse_args():
                         help="Derivative bounding in f_mpr: hard=jnp.clip, soft=tanh (smooth, gradient-friendly), none=unbounded.")
     parser.add_argument("--fast_bold", action="store_true",
                         help="Integrate BOLD once per rv_decimate block (approx, ~1.4x faster).")
+    parser.add_argument("--fcd_stride1", action=argparse.BooleanOptionalAction, default=True,
+                        help="Use vbi-style FCD windowing (shift=1 sample) instead of the "
+                             "overlap-fraction shift; pairs with the hardcoded triu offset k=30. "
+                             "Pass --no-fcd_stride1 to revert to the prior overlap windowing.")
     parser.add_argument("--fc_eps", type=float, default=0.0,
                         help="Stabilise FC/FCD correlation denominator (e.g. 1e-6) to keep gradients finite.")
+    # --- likelihood feature scaling (mirror of mpr_jax_pymc.py) ---
+    parser.add_argument("--fisher_z", action=argparse.BooleanOptionalAction, default=True,
+                        help="arctanh (Fisher z) on correlation features: variance-stabilizes and "
+                             "unbounds them so a fixed-sigma Gaussian is well-specified (no extra sims).")
+    parser.add_argument("--standardize_features", action=argparse.BooleanOptionalAction, default=True,
+                        help="Z-score each feature by its scatter across noise seeds so obs_err is a "
+                             "unit-scale sigma and FC/FCD are comparable (applied to model + observed).")
+    parser.add_argument("--n_ref_seeds", type=int, default=8,
+                        help="Noise seeds for the per-feature scatter estimate (--standardize_features).")
+    parser.add_argument("--noisy_obs", action=argparse.BooleanOptionalAction, default=True,
+                        help="Add N(0, obs_err) to the synthetic observed data so it is a genuine "
+                             "draw from the model (needed for honest calibration).")
+    parser.add_argument("--keep_negative_fc", action=argparse.BooleanOptionalAction, default=True,
+                        help="Keep negative (anti-)correlations instead of the default ReLU.")
     parser.add_argument("--grad_method", type=str, default="fd", choices=["fd", "autodiff"],
                         help="Gradient for NUTS/BlackJAX: fd=central finite differences via custom_vjp "
                              "(correct across the bifurcation), autodiff (exact but unreliable in chaos).")
@@ -107,21 +127,30 @@ def timer(func):
 
 
 # ------------------ Wrapper ------------------
+def _fisher_z(v, eps=1e-4):
+    """Fisher z-transform arctanh(r): variance-stabilizes correlation features and
+    maps [-1,1]->R so a fixed-sigma Gaussian likelihood is well-specified. Mirrors
+    mpr_jax_pymc._fisher_z. Applied inside the forward so the FD gradient sees it."""
+    return jnp.arctanh(jnp.clip(v, -1.0 + eps, 1.0 - eps))
+
 @timer
-def wrapper_fc(G, par, cut, tr, starts, nn, grad_horizon=0, fast_bold=False, eps=0.0):
+def wrapper_fc(G, par, cut, tr, starts, nn, grad_horizon=0, fast_bold=False, eps=0.0,
+               fisher_z=False, keep_negative=False):
     par = deepcopy(par)
     par["G"] = G
     sde = mpr_jax.MPR_sde.create(par)
     data = sde.run({}, record_rv=False, fast_bold=fast_bold, grad_horizon=grad_horizon)
     bold_d = data["bold_d"]
 
-    FC_full = get_fc(bold_d[int(cut):].T, eps=eps)   # <<< ensure int(cut)
+    FC_full = get_fc(bold_d[int(cut):].T, eps=eps, keep_negative=keep_negative)   # <<< ensure int(cut)
     #print(FC_full)
     tri_idx = jnp.triu_indices(FC_full.shape[0], k=1)
-    return FC_full[tri_idx]
+    v = FC_full[tri_idx]
+    return _fisher_z(v) if fisher_z else v
 
 @timer
-def wrapper_fcd(G, par, cut, tr, starts, nn, grad_horizon=0, fast_bold=False, eps=0.0):
+def wrapper_fcd(G, par, cut, tr, starts, nn, grad_horizon=0, fast_bold=False, eps=0.0,
+                fisher_z=False, keep_negative=False):
     par = deepcopy(par)
     par["G"] = G
     sde = mpr_jax.MPR_sde.create(par)
@@ -132,15 +161,38 @@ def wrapper_fcd(G, par, cut, tr, starts, nn, grad_horizon=0, fast_bold=False, ep
 
     # non-jitted extract (we're already inside numpyro's traced/jitted model, and
     # this lets eps be a concrete float for the stabilised correlation)
-    FCD_full = extract_FCD_jax(bold_d_sub, starts, nn, wwidth=30, olap=0.94, eps=eps)
+    FCD_full = extract_FCD_jax(bold_d_sub, starts, nn, wwidth=30, olap=0.94, eps=eps, keep_negative=keep_negative)
     #print(FCD_full)
     tri_idx = jnp.triu_indices(FCD_full.shape[0], k=30)
-    return FCD_full[tri_idx]
+    v = FCD_full[tri_idx]
+    return _fisher_z(v) if fisher_z else v
+
+
+# ------------------ per-feature scatter (for --standardize_features) ------------------
+def feature_reference_scatter(par, which_stat, cut, tr, starts, nn,
+                              fast_bold=False, eps=0.0, n_ref=8, base_seed=10_000,
+                              fisher_z=False, keep_negative=False):
+    """Per-feature mean/std of the FC/FCD statistic over n_ref noise seeds. Mirrors
+    mpr_jax_pymc.feature_reference_scatter; extraction matches wrapper_fc/fcd so the
+    standardized features stay congruent with model + observed."""
+    wrap = wrapper_fc if which_stat == "FC" else wrapper_fcd
+    reps = []
+    for i in range(n_ref):
+        p = dict(par); p["seed"] = base_seed + i
+        v = wrap(G=p["G"], par=p, cut=cut, tr=tr, starts=starts, nn=nn,
+                 grad_horizon=0, fast_bold=fast_bold, eps=eps, fisher_z=fisher_z,
+                 keep_negative=keep_negative)
+        reps.append(np.asarray(v, dtype=np.float32))
+    reps = np.stack(reps, 0)
+    mu = reps.mean(0).astype(np.float32)
+    sd = np.maximum(reps.std(0, ddof=1), 1e-6).astype(np.float32)
+    return mu, sd
 
 
 # ------------------ Forward model (shared by NumPyro NUTS + BlackJAX) ------------------
 def make_forward_fn(par, which_stat, cut, tr, starts, nn, grad_horizon=0,
-                    fast_bold=False, eps=0.0, grad_method="fd", fd_h=1e-2):
+                    fast_bold=False, eps=0.0, grad_method="fd", fd_h=1e-2,
+                    fisher_z=False):
     """Return forward_fn(G) -> flat FC/FCD statistic, matching wrapper_fc/fcd.
 
     grad_method="autodiff": plain JAX forward (autodiff gradient — unreliable in
@@ -155,11 +207,13 @@ def make_forward_fn(par, which_stat, cut, tr, starts, nn, grad_horizon=0,
         sde = mpr_jax.MPR_sde.create(p)
         bold = sde.run({}, record_rv=False, fast_bold=fast_bold, grad_horizon=grad_horizon)["bold_d"]
         if which_stat == "FC":
-            F = get_fc(bold[int(cut):].T, eps=eps)
-            return F[jnp.triu_indices(F.shape[0], k=1)]
-        sub = bold[cut::tr].T
-        F = extract_FCD_jax(sub, starts, nn, wwidth=30, olap=0.94, eps=eps)
-        return F[jnp.triu_indices(F.shape[0], k=30)]
+            F = get_fc(bold[int(cut):].T, eps=eps, keep_negative=keep_negative)
+            v = F[jnp.triu_indices(F.shape[0], k=1)]
+        else:
+            sub = bold[cut::tr].T
+            F = extract_FCD_jax(sub, starts, nn, wwidth=30, olap=0.94, eps=eps, keep_negative=keep_negative)
+            v = F[jnp.triu_indices(F.shape[0], k=30)]
+        return _fisher_z(v) if fisher_z else v
 
     if grad_method == "autodiff":
         return raw
@@ -341,18 +395,44 @@ def main():
         raise ValueError(f"Invalid Functional Connectivity type '{which_stat}'. Must be 'FC' or 'FCD'.")
 
     T = (t_end-cut)//tr
-    shift, starts = precompute_shift_and_starts(T, wwidth=30, olap=0.94)
+    shift, starts = precompute_shift_and_starts(T, wwidth=30, olap=0.94, stride1=args.fcd_stride1)
 
-    # observed data uses fast_bold/eps for consistency with the model; grad_horizon is
-    # irrelevant here (no gradient) so we leave it at 0.
+    # observed data uses fast_bold/eps/fisher_z for consistency with the model;
+    # grad_horizon is irrelevant here (no gradient) so we leave it at 0.
     FC_obs_flat = wrapper(G=G, par=params, cut=cut, tr=tr, starts=starts, nn=nn,
-                          grad_horizon=0, fast_bold=args.fast_bold, eps=args.fc_eps)
-    print(FC_obs_flat)
+                          grad_horizon=0, fast_bold=args.fast_bold, eps=args.fc_eps,
+                          fisher_z=args.fisher_z, keep_negative=args.keep_negative_fc)
     # Single config-baked forward used by the model (custom_vjp FD gradient by
     # default so NUTS/BlackJAX get the reliable finite-difference gradient).
     forward_fn = make_forward_fn(params, which_stat, cut, tr, starts, nn,
                                  grad_horizon=args.grad_horizon, fast_bold=args.fast_bold,
-                                 eps=args.fc_eps, grad_method=args.grad_method, fd_h=args.fd_h)
+                                 eps=args.fc_eps, grad_method=args.grad_method, fd_h=args.fd_h,
+                                 fisher_z=args.fisher_z, keep_negative=args.keep_negative_fc)
+
+    # --- optional per-feature standardization (mirror of pymc): affine (x-mu)/sd on
+    # both the model forward and the observed, so a scalar obs_err is a unit-scale
+    # sigma. Identity when off -> unchanged behaviour. ---
+    if args.standardize_features:
+        feat_mu, feat_sd = feature_reference_scatter(
+            params, which_stat, cut, tr, starts, nn, fast_bold=args.fast_bold,
+            eps=args.fc_eps, n_ref=args.n_ref_seeds, fisher_z=args.fisher_z,
+            keep_negative=args.keep_negative_fc)
+        print(f"Standardizing {which_stat} features over {args.n_ref_seeds} noise seeds: "
+              f"dim={feat_sd.shape[0]}, median feature sd={np.median(feat_sd):.4g}")
+        _mu_j, _sd_j = jnp.asarray(feat_mu), jnp.asarray(feat_sd)
+        _fwd0 = forward_fn
+        forward_fn = lambda G, _f=_fwd0: (_f(G) - _mu_j) / _sd_j
+        FC_obs_flat = (jnp.asarray(FC_obs_flat) - _mu_j) / _sd_j
+
+    # --- optional observation noise: make the synthetic observed a real draw from
+    # the model (N(0, obs_err)); needed for honest calibration. ---
+    if args.noisy_obs:
+        _rng_obs = np.random.default_rng(seed)
+        FC_obs_flat = jnp.asarray(FC_obs_flat) + jnp.asarray(
+            _rng_obs.normal(0.0, obs_err, size=np.asarray(FC_obs_flat).shape), dtype=jnp.float32)
+        print(f"Added observation noise N(0, {obs_err}) to observed "
+              f"({np.asarray(FC_obs_flat).shape[0]} features).")
+    print(FC_obs_flat)
     data = {"FC_obs": FC_obs_flat, "params": params, "obs_err": obs_err, "cut": cut, "tr":tr, "starts":starts, "nn":nn,
             "grad_horizon": args.grad_horizon, "fast_bold": args.fast_bold, "eps": args.fc_eps,
             "forward_fn": forward_fn}
@@ -547,6 +627,9 @@ def main():
             "SC_type": SC_type, "SC_size": SC_size, "G_true": float(params["G"]),
             "t_end": t_end, "cut": cut, "obs_err": obs_err, "seed": seed,
             "n_warmup": n_warmup, "grad_method": args.grad_method, "clip_mode": args.clip_mode,
+            "fcd_stride1": bool(args.fcd_stride1), "fisher_z": bool(args.fisher_z),
+            "standardize_features": bool(args.standardize_features), "noisy_obs": bool(args.noisy_obs),
+            "keep_negative_fc": bool(args.keep_negative_fc),
         }
         run_row, param_rows = benchmark_metrics(posterior_samples, theta_true, ["G"],
                                                 prior_sd, runtime, rmse, meta)

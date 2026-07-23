@@ -13,13 +13,16 @@ def _corrcoef(x, eps=0.0):
     var = jnp.diag(cov)
     return cov / jnp.sqrt(jnp.outer(var, var) + eps)
 
-def get_fc(bold, eps=0.0):
+def get_fc(bold, eps=0.0, keep_negative=False):
     """
     Extract the functional correlation (pearson correlation) of the input (bold_d.T from running the mpr model).
     eps>0 uses a stabilised correlation (safe for gradients); eps=0 is the original jnp.corrcoef.
+    keep_negative=False (default) zeroes negative correlations (the original ReLU);
+    True keeps anti-correlations (more info, no zero-variance-feature spike, smoother).
     """
     FC = _corrcoef(bold, eps)
-    FC = FC * (FC > 0)
+    if not keep_negative:
+        FC = FC * (FC > 0)
     FC = FC - jnp.diag(jnp.diag(FC))
     return FC
 
@@ -152,18 +155,23 @@ def extract_FCD_jax_old(data, wwidth=30, olap=0.9, shift=None):
 
 # compute nnodes, T = data.shape before calling the next function
 
-def precompute_shift_and_starts(T, wwidth, olap):
-    shift = (jnp.round(wwidth * (1 - olap)).astype(int)).astype(int)
+def precompute_shift_and_starts(T, wwidth, olap, stride1=False):
+    # stride1=True reproduces vbi's get_fcd windowing (one window per sample,
+    # shift=1) for which the hardcoded FCD triu offset k=30 was designed. Default
+    # (stride1=False) keeps the overlap-fraction shift = round(wwidth*(1-olap)),
+    # i.e. the prior behaviour -> pass stride1 to switch, omit it to revert.
+    shift = 1 if stride1 else int((jnp.round(wwidth * (1 - olap)).astype(int)))
     starts = jnp.arange(0, T - wwidth + 1, shift, dtype=int)
     return shift, starts
 
 #@jax.jit(static_argnums=(2, 3))
-def extract_FCD_jax(data, starts, nnodes, wwidth=30, olap=0.94, eps=0.0):
+def extract_FCD_jax(data, starts, nnodes, wwidth=30, olap=0.94, eps=0.0, keep_negative=False):
     def compute_fc(start):
         window = jax.lax.dynamic_slice(data, (0, start), (nnodes, wwidth))
         #print("Window shape:", window.shape)
         fc = _corrcoef(window, eps)
-        fc = fc * (fc > 0)
+        if not keep_negative:
+            fc = fc * (fc > 0)
         tril_idx = jnp.tril_indices(nnodes, -1)
         return fc[tril_idx]
 
