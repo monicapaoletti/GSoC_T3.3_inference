@@ -192,7 +192,7 @@ def feature_reference_scatter(par, which_stat, cut, tr, starts, nn,
 # ------------------ Forward model (shared by NumPyro NUTS + BlackJAX) ------------------
 def make_forward_fn(par, which_stat, cut, tr, starts, nn, grad_horizon=0,
                     fast_bold=False, eps=0.0, grad_method="fd", fd_h=1e-2,
-                    fisher_z=False):
+                    fisher_z=False, keep_negative=False):
     """Return forward_fn(G) -> flat FC/FCD statistic, matching wrapper_fc/fcd.
 
     grad_method="autodiff": plain JAX forward (autodiff gradient — unreliable in
@@ -380,7 +380,8 @@ def main():
     params = {
         "G": G, "weights": SC, "t_end": t_end,
         "dt": 0.01, "eta": jnp.array([-4.6]), "rv_decimate": 10,
-        "noise_amp": 0.037, "tr": 1.0, "seed": seed,
+        "noise_amp": 0.037, "tr": 300.0, "seed": seed,  # model BOLD TR; 300 (=ParMPR default,
+        # matches pymc) -> ~90 BOLD frames. tr=1.0 gave 30000 frames -> FCD OOM & incomparable.
         "clip_mode": args.clip_mode,
     }
 
@@ -394,7 +395,16 @@ def main():
     else:
         raise ValueError(f"Invalid Functional Connectivity type '{which_stat}'. Must be 'FC' or 'FCD'.")
 
-    T = (t_end-cut)//tr
+    # FCD window starts must be computed from the ACTUAL reference-BOLD length after
+    # cut+tr subsampling. The model decimates BOLD internally (t_end=30000 -> 90 frames),
+    # so (t_end-cut)//tr massively overcounts windows -> a ~30000x30000 FCD matrix -> OOM.
+    # Mirror mpr_jax_pymc, which measures the real BOLD length.
+    if which_stat == "FCD":
+        _ref_bold = mpr_jax.MPR_sde.create(params).run(
+            {}, record_rv=False, fast_bold=args.fast_bold)["bold_d"]
+        T = int(_ref_bold[cut::tr].shape[0])
+    else:
+        T = (t_end - cut) // tr
     shift, starts = precompute_shift_and_starts(T, wwidth=30, olap=0.94, stride1=args.fcd_stride1)
 
     # observed data uses fast_bold/eps/fisher_z for consistency with the model;
