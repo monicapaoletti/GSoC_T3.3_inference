@@ -241,7 +241,11 @@ def make_forward_fn(par, which_stat, cut, tr, starts, nn, grad_horizon=0,
 def calcula_map(chains_):
     params_map = []
     for i in range(int(chains_.shape[0])):
-        y = chains_[i]
+        y = np.asarray(chains_[i])
+        y = y[np.isfinite(y)]                       # a diverged sampler (e.g. pathfinder)
+        if y.size == 0:                             # can produce all-NaN chains; record
+            params_map.append(float("nan"))         # NaN instead of crashing np.histogram
+            continue
         hist, bin_edges = np.histogram(y, bins=50)
         x_value_at_peak = (bin_edges[np.argmax(hist)] + bin_edges[np.argmax(hist) + 1]) / 2
         params_map.append(x_value_at_peak)
@@ -613,7 +617,10 @@ def main():
     #az.to_netcdf(posterior_samples, fname_netcdf)
 
     chains_pooled = posterior_samples.posterior["G"].values.reshape(1, -1)
-    plot_posterior_pooled(["G"], theta_true, prior_predictions, chains_pooled, "Pooled Posteriors", savepath=fname_posteriors)
+    try:  # plotting is non-essential; never let it crash the run before benchmarks save
+        plot_posterior_pooled(["G"], theta_true, prior_predictions, chains_pooled, "Pooled Posteriors", savepath=fname_posteriors)
+    except Exception as _e:
+        print(f"WARNING: plot_posterior_pooled failed ({type(_e).__name__}: {_e}); continuing to benchmark save.")
 
     # --- comprehensive benchmark metrics (same schema/file as mpr_jax_pymc.py) ---
     try:
