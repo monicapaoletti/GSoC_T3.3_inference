@@ -654,14 +654,18 @@ def main():
         else:  # smc_abc  (likelihood-free)
             distance_fn = lambda G: jnp.sqrt(jnp.sum((fwd(G) - obs) ** 2))
             n_feat = int(obs.shape[0])
-            eps_target = args.abc_eps_target if args.abc_eps_target is not None \
-                else float(obs_err * np.sqrt(n_feat))                    # noise floor
+            # target epsilon = the irreducible noise floor: at the true G the
+            # simulated features still differ from the observed by ~obs_err per
+            # feature, i.e. distance ~ obs_err*sqrt(n_feat). Annealing BELOW this
+            # over-tightens and biases G (particles overfit the noise).
+            noise_floor = float(obs_err * np.sqrt(n_feat))
+            eps_target = args.abc_eps_target if args.abc_eps_target is not None else noise_floor
             if args.abc_eps0 is not None:
                 eps0 = args.abc_eps0
             else:
                 d0 = np.asarray(jax.vmap(distance_fn)(init_particles))
-                eps0 = float(np.median(d0))
-            eps_target = min(eps_target, eps0 * 0.5)                     # ensure decreasing
+                eps0 = float(np.percentile(d0, 90))          # start loose
+            eps0 = max(eps0, eps_target * 3.0)               # guarantee a real decreasing schedule
             eps_schedule = jnp.geomspace(eps0, eps_target, args.n_stages + 1)
             print(f"  ABC epsilon schedule: {eps0:.3g} -> {eps_target:.3g}")
             start_time = time.time()
