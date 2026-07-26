@@ -40,7 +40,7 @@ def forward_jobs(save):
     ]
 
 
-def smc_jobs(save, n_stages, n_mcmc, g):
+def smc_jobs(save, n_stages, n_mcmc, g, gpu_only=False):
     jobs = []
     G = ["--G", str(g)]
     for flavor in ["smc_lik", "smc_abc"]:
@@ -50,16 +50,19 @@ def smc_jobs(save, n_stages, n_mcmc, g):
                          ["mpr_jax_numpyro.py", "--sampler", flavor,
                           "--n_particles", str(npart), "--n_stages", str(n_stages),
                           "--n_mcmc", str(n_mcmc), "--save_dir", save] + G + COMMON))
-        # CPU: only the smaller particle counts (large batch collapses on CPU)
-        for npart in [64, 256]:
-            jobs.append((f"{flavor}_cpu_np{npart}_G{g}", "cpu",
-                         ["mpr_jax_numpyro.py", "--sampler", flavor,
-                          "--n_particles", str(npart), "--n_stages", str(n_stages),
-                          "--n_mcmc", str(n_mcmc), "--save_dir", save] + G + COMMON))
+        # CPU: only the smaller particle counts (large batch collapses on CPU).
+        # Skipped for the multi-G campaign (--gpu_only): CPU np256 ~5.6h would
+        # bottleneck every G; the CPU baseline is already established at G=0.2.
+        if not gpu_only:
+            for npart in [64, 256]:
+                jobs.append((f"{flavor}_cpu_np{npart}_G{g}", "cpu",
+                             ["mpr_jax_numpyro.py", "--sampler", flavor,
+                              "--n_particles", str(npart), "--n_stages", str(n_stages),
+                              "--n_mcmc", str(n_mcmc), "--save_dir", save] + G + COMMON))
     return jobs
 
 
-def nuts_jobs(save, n_warmup, n_samples, g):
+def nuts_jobs(save, n_warmup, n_samples, g, gpu_only=False):
     jobs = []
     G = ["--G", str(g)]
     # GPU: vectorized chains sweep (n_chains is the batched axis)
@@ -70,12 +73,13 @@ def nuts_jobs(save, n_warmup, n_samples, g):
                       "--n_warmup", str(n_warmup), "--n_samples", str(n_samples),
                       "--save_dir", save] + G + COMMON))
     # CPU baseline: only low chain counts (multi-chain CPU NUTS is impractical)
-    for nc in [1, 8]:
-        jobs.append((f"nuts_cpu_nc{nc}_G{g}", "cpu",
-                     ["mpr_jax_numpyro.py", "--sampler", "nuts",
-                      "--chain_method", "parallel", "--n_chains", str(nc),
-                      "--n_warmup", str(n_warmup), "--n_samples", str(n_samples),
-                      "--save_dir", save] + G + COMMON))
+    if not gpu_only:
+        for nc in [1, 8]:
+            jobs.append((f"nuts_cpu_nc{nc}_G{g}", "cpu",
+                         ["mpr_jax_numpyro.py", "--sampler", "nuts",
+                          "--chain_method", "parallel", "--n_chains", str(nc),
+                          "--n_warmup", str(n_warmup), "--n_samples", str(n_samples),
+                          "--save_dir", save] + G + COMMON))
     return jobs
 
 
@@ -140,6 +144,9 @@ def main():
     ap.add_argument("--cpu_cap", type=int, default=1)
     ap.add_argument("--G", type=float, default=0.2,
                     help="true G for this run (multi-G campaign loops the runner over G).")
+    ap.add_argument("--gpu_only", action="store_true",
+                    help="skip CPU baseline cells (multi-G campaign: GPU-only to avoid the "
+                         "slow CPU np256 bottleneck; CPU baseline already done at G=0.2).")
     args = ap.parse_args()
 
     save = results_dir()
@@ -147,9 +154,9 @@ def main():
     if "forward" in args.suite:      # forward throughput is G-independent -> run once
         jobs += forward_jobs(save)
     if "smc" in args.suite:
-        jobs += smc_jobs(save, args.n_stages, args.n_mcmc, args.G)
+        jobs += smc_jobs(save, args.n_stages, args.n_mcmc, args.G, args.gpu_only)
     if "nuts" in args.suite:
-        jobs += nuts_jobs(save, args.n_warmup, args.n_samples, args.G)
+        jobs += nuts_jobs(save, args.n_warmup, args.n_samples, args.G, args.gpu_only)
 
     print(f"scheduling {len(jobs)} jobs -> {save}/out/  (GPUs={len(range(2))}, cpu_cap={args.cpu_cap})", flush=True)
     run(jobs, save, cpu_cap=args.cpu_cap)
