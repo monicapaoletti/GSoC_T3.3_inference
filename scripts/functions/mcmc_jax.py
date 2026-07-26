@@ -93,7 +93,7 @@ def run_demc(key, init_G, logprior_G, loglik_G, n_tune, n_draws,
 
 # -------------------------------------------------------------------- Slice
 def run_slice(key, init_G, logprior_G, loglik_G, n_tune, n_draws,
-              w=1.0, max_expand=25, max_shrink=50):
+              w=1.0, max_expand=10, max_shrink=20):
     """N parallel univariate slice-sampling chains on z=log G (Neal 2003:
     stepping-out + shrinkage). Uses fixed-iteration fori_loops with masking instead
     of while_loops so it is efficient and safe under vmap. Returns (G_draws, info)."""

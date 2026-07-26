@@ -63,13 +63,13 @@ def smc_jobs(save, n_stages, n_mcmc, g, stat, gpu_only=False):
     return jobs
 
 
-def mcmc_jobs(save, n_tune, n_draws, g, stat, gpu_only=False):
+def mcmc_jobs(save, n_tune, n_draws, g, stat, gpu_only=False, samplers=None):
     """GPU chain-vmapped gradient-free samplers (rwmh/demc/slice): n_chains is the
     batched axis, swept like SMC's n_particles. slice is eval-heavy per step, so
-    keep n_tune/n_draws modest."""
+    keep n_tune/n_draws modest (and typically run it only at one G)."""
     jobs = []
     GS = ["--G", str(g), "--which_stat", stat]
-    for sampler in ["rwmh", "demc", "slice"]:
+    for sampler in (samplers or ["rwmh", "demc", "slice"]):
         for nc in [64, 256, 1024, 4096]:
             jobs.append((f"{sampler}_gpu_nc{nc}_G{g}_{stat}", "gpu",
                          ["mpr_jax_numpyro.py", "--sampler", sampler, "--n_chains", str(nc),
@@ -170,6 +170,10 @@ def main():
                          "slow CPU np256 bottleneck; CPU baseline already done at G=0.2 FC).")
     ap.add_argument("--which_stat", type=str, default="FC", choices=["FC", "FCD"],
                     help="summary statistic for the SMC/NUTS jobs (FC or FCD).")
+    ap.add_argument("--mcmc_samplers", nargs="+", default=None,
+                    choices=["rwmh", "demc", "slice"],
+                    help="subset of chain-vmapped samplers for the mcmc suite "
+                         "(default all three; e.g. run slice only at one G).")
     args = ap.parse_args()
 
     save = results_dir()
@@ -179,7 +183,8 @@ def main():
     if "smc" in args.suite:
         jobs += smc_jobs(save, args.n_stages, args.n_mcmc, args.G, args.which_stat, args.gpu_only)
     if "mcmc" in args.suite:
-        jobs += mcmc_jobs(save, args.n_warmup, args.n_samples, args.G, args.which_stat, args.gpu_only)
+        jobs += mcmc_jobs(save, args.n_warmup, args.n_samples, args.G, args.which_stat,
+                          args.gpu_only, args.mcmc_samplers)
     if "nuts" in args.suite:
         jobs += nuts_jobs(save, args.n_warmup, args.n_samples, args.G, args.which_stat, args.gpu_only)
 
