@@ -40,6 +40,7 @@ mpr_jax = __import__("mpr_jax")
 import json
 from benchmark_utils import benchmark_metrics
 from smc_jax import run_tempered_smc, run_abc_smc
+from mcmc_jax import run_parallel_rwmh, run_demc, run_slice
 
 # ------------------ Argument parser ------------------
 def parse_args():
@@ -75,10 +76,12 @@ def parse_args():
                          "processes (CPU-style); 'sequential' one after another.")
     parser.add_argument("--scale", type=int, default=1, help="prior scale")
     parser.add_argument("--sampler", type=str, default="pathfinder",
-                    choices=["nuts", "pathfinder", "blackjax", "smc_lik", "smc_abc"],
+                    choices=["nuts", "pathfinder", "blackjax", "smc_lik", "smc_abc",
+                             "rwmh", "demc", "slice"],
                     help="nuts=NumPyro NUTS, blackjax=BlackJAX NUTS, pathfinder=BlackJAX "
-                         "Pathfinder VI, smc_lik=JAX likelihood-tempered SMC (particles "
-                         "vmapped on-device), smc_abc=JAX ABC epsilon-tempered SMC.")
+                         "Pathfinder VI, smc_lik=JAX likelihood-tempered SMC, smc_abc=JAX "
+                         "ABC SMC, rwmh=JAX parallel-chain RW-Metropolis, demc=JAX "
+                         "DE-Metropolis, slice=JAX slice sampling (all GPU chain-vmapped).")
     # --- batched-SMC controls (smc_lik / smc_abc); n_particles is the batched axis ---
     parser.add_argument("--n_particles", type=int, default=1000,
                     help="SMC particle-cloud size (the on-device vmap batch).")
@@ -684,6 +687,40 @@ def main():
         az_summary = az.summary(posterior_samples, var_names=["G"]).reset_index().rename(columns={"index": "parameter"})
         az_summary["runtime_sec"] = runtime
         az_summary["n_particles"] = args.n_particles
+        az_summary.to_csv(fname_summary_csv, index=False)
+        print(f"Summary saved to {fname_summary_csv}")
+
+
+    elif sampler in ("rwmh", "demc", "slice"):
+        # GPU chain-vmapped gradient-free samplers (mcmc_jax). The batched axis is
+        # n_chains: N independent chains run at once, so every forward eval is a vmap
+        # over chains -> the GPU-batching win, with no gradient (no NUTS pathology).
+        names = {"rwmh": "parallel RW-Metropolis", "demc": "DE-Metropolis", "slice": "slice"}
+        print(f"Running {names[sampler]} ({n_chains} chains vmapped on-device, "
+              f"{n_warmup} tune + {n_samples} draws)...")
+        fwd = data["forward_fn"]
+        obs = jnp.asarray(FC_obs_flat)
+        scale_G = prior_specs["scale_G"]
+        logprior_G = lambda G: dist.HalfNormal(scale_G).log_prob(G)
+        loglik_G = lambda G: jnp.sum(dist.Normal(fwd(G), obs_err).log_prob(obs))
+
+        rng_key, k_init, k_run = jax.random.split(rng_key_run, 3)
+        init_G = dist.HalfNormal(scale_G).sample(k_init, (n_chains,))
+        sampler_fn = {"rwmh": run_parallel_rwmh, "demc": run_demc, "slice": run_slice}[sampler]
+
+        start_time = time.time()
+        G_draws, info = sampler_fn(k_run, init_G, logprior_G, loglik_G, n_warmup, n_samples)
+        jax.block_until_ready(G_draws)
+        runtime = time.time() - start_time
+
+        posterior = {"G": np.asarray(G_draws)}          # (chain=n_chains, draw=n_samples)
+        posterior_samples = az.from_dict(posterior=posterior)
+        mcmc = posterior_samples
+        print(f"{sampler} done in {runtime:.1f}s | posterior G mean={float(np.mean(G_draws)):.4f} "
+              f"sd={float(np.std(G_draws)):.4f} | accept={float(np.asarray(info['accept'])):.2f}")
+
+        az_summary = az.summary(posterior_samples, var_names=["G"]).reset_index().rename(columns={"index": "parameter"})
+        az_summary["runtime_sec"] = runtime
         az_summary.to_csv(fname_summary_csv, index=False)
         print(f"Summary saved to {fname_summary_csv}")
 

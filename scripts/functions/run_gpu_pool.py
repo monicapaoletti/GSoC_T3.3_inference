@@ -63,6 +63,26 @@ def smc_jobs(save, n_stages, n_mcmc, g, stat, gpu_only=False):
     return jobs
 
 
+def mcmc_jobs(save, n_tune, n_draws, g, stat, gpu_only=False):
+    """GPU chain-vmapped gradient-free samplers (rwmh/demc/slice): n_chains is the
+    batched axis, swept like SMC's n_particles. slice is eval-heavy per step, so
+    keep n_tune/n_draws modest."""
+    jobs = []
+    GS = ["--G", str(g), "--which_stat", stat]
+    for sampler in ["rwmh", "demc", "slice"]:
+        for nc in [64, 256, 1024, 4096]:
+            jobs.append((f"{sampler}_gpu_nc{nc}_G{g}_{stat}", "gpu",
+                         ["mpr_jax_numpyro.py", "--sampler", sampler, "--n_chains", str(nc),
+                          "--n_warmup", str(n_tune), "--n_samples", str(n_draws),
+                          "--save_dir", save] + GS + COMMON))
+        if not gpu_only:                    # one small-nc CPU baseline per sampler
+            jobs.append((f"{sampler}_cpu_nc64_G{g}_{stat}", "cpu",
+                         ["mpr_jax_numpyro.py", "--sampler", sampler, "--n_chains", "64",
+                          "--n_warmup", str(n_tune), "--n_samples", str(n_draws),
+                          "--save_dir", save] + GS + COMMON))
+    return jobs
+
+
 def nuts_jobs(save, n_warmup, n_samples, g, stat, gpu_only=False):
     jobs = []
     GS = ["--G", str(g), "--which_stat", stat]
@@ -137,7 +157,7 @@ def run(jobs, save, gpu_slots=(0, 1), cpu_cap=1, poll=3.0):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--suite", nargs="+", required=True,
-                    choices=["forward", "smc", "nuts"])
+                    choices=["forward", "smc", "mcmc", "nuts"])
     ap.add_argument("--n_warmup", type=int, default=1000)
     ap.add_argument("--n_samples", type=int, default=1000)
     ap.add_argument("--n_stages", type=int, default=50)
@@ -158,6 +178,8 @@ def main():
         jobs += forward_jobs(save)
     if "smc" in args.suite:
         jobs += smc_jobs(save, args.n_stages, args.n_mcmc, args.G, args.which_stat, args.gpu_only)
+    if "mcmc" in args.suite:
+        jobs += mcmc_jobs(save, args.n_warmup, args.n_samples, args.G, args.which_stat, args.gpu_only)
     if "nuts" in args.suite:
         jobs += nuts_jobs(save, args.n_warmup, args.n_samples, args.G, args.which_stat, args.gpu_only)
 
