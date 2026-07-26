@@ -657,12 +657,13 @@ def main():
         else:  # smc_abc  (likelihood-free)
             distance_fn = lambda G: jnp.sqrt(jnp.sum((fwd(G) - obs) ** 2))
             n_feat = int(obs.shape[0])
-            # target epsilon = the irreducible noise floor: at the true G the
-            # simulated features still differ from the observed by ~obs_err per
-            # feature, i.e. distance ~ obs_err*sqrt(n_feat). Annealing BELOW this
-            # over-tightens and biases G (particles overfit the noise).
-            noise_floor = float(obs_err * np.sqrt(n_feat))
-            eps_target = args.abc_eps_target if args.abc_eps_target is not None else noise_floor
+            # target epsilon = the PER-FEATURE noise sd = obs_err (NOT obs_err*sqrt(n_feat)).
+            # The Gaussian ABC kernel -0.5*(dist/eps)^2 with dist=||sim-obs|| EQUALS the
+            # Gaussian log-likelihood -0.5*sum((sim-obs)/obs_err)^2 exactly when eps=obs_err;
+            # annealing only to obs_err*sqrt(n_feat) (~sqrt(n_feat)x too loose) leaves the
+            # kernel flat over G -> accept~0.94, uninformative posterior. So eps_target=obs_err
+            # calibrates ABC to the likelihood (it then recovers G like smc_lik).
+            eps_target = args.abc_eps_target if args.abc_eps_target is not None else float(obs_err)
             if args.abc_eps0 is not None:
                 eps0 = args.abc_eps0
             else:
