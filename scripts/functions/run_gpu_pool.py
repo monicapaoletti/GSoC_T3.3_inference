@@ -19,9 +19,10 @@ from datetime import date
 FUNCS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(FUNCS_DIR, "..", ".."))
 
-# shared model/config knobs; small 10-node model for CPU-comparability
+# shared model/config knobs; small 10-node model for CPU-comparability.
+# G is threaded per-run (see --G) so the same runner drives the multi-G campaign.
 COMMON = ["--which_stat", "FC", "--grad_method", "fd", "--grad_horizon", "100",
-          "--G", "0.2", "--SC_type", "data", "--SC_size", "10", "--fast_bold",
+          "--SC_type", "data", "--SC_size", "10", "--fast_bold",
           "--cut", "10", "--tr", "1", "--t_end", "30000", "--seed", "42"]
 
 
@@ -39,40 +40,42 @@ def forward_jobs(save):
     ]
 
 
-def smc_jobs(save, n_stages, n_mcmc):
+def smc_jobs(save, n_stages, n_mcmc, g):
     jobs = []
+    G = ["--G", str(g)]
     for flavor in ["smc_lik", "smc_abc"]:
         # GPU: full particle sweep (batched axis -> ~free on GPU)
         for npart in [64, 256, 1024, 4096]:
-            jobs.append((f"{flavor}_gpu_np{npart}", "gpu",
+            jobs.append((f"{flavor}_gpu_np{npart}_G{g}", "gpu",
                          ["mpr_jax_numpyro.py", "--sampler", flavor,
                           "--n_particles", str(npart), "--n_stages", str(n_stages),
-                          "--n_mcmc", str(n_mcmc), "--save_dir", save] + COMMON))
+                          "--n_mcmc", str(n_mcmc), "--save_dir", save] + G + COMMON))
         # CPU: only the smaller particle counts (large batch collapses on CPU)
         for npart in [64, 256]:
-            jobs.append((f"{flavor}_cpu_np{npart}", "cpu",
+            jobs.append((f"{flavor}_cpu_np{npart}_G{g}", "cpu",
                          ["mpr_jax_numpyro.py", "--sampler", flavor,
                           "--n_particles", str(npart), "--n_stages", str(n_stages),
-                          "--n_mcmc", str(n_mcmc), "--save_dir", save] + COMMON))
+                          "--n_mcmc", str(n_mcmc), "--save_dir", save] + G + COMMON))
     return jobs
 
 
-def nuts_jobs(save, n_warmup, n_samples):
+def nuts_jobs(save, n_warmup, n_samples, g):
     jobs = []
+    G = ["--G", str(g)]
     # GPU: vectorized chains sweep (n_chains is the batched axis)
     for nc in [1, 8, 32, 128]:
-        jobs.append((f"nuts_gpu_nc{nc}", "gpu",
+        jobs.append((f"nuts_gpu_nc{nc}_G{g}", "gpu",
                      ["mpr_jax_numpyro.py", "--sampler", "nuts",
                       "--chain_method", "vectorized", "--n_chains", str(nc),
                       "--n_warmup", str(n_warmup), "--n_samples", str(n_samples),
-                      "--save_dir", save] + COMMON))
+                      "--save_dir", save] + G + COMMON))
     # CPU baseline: only low chain counts (multi-chain CPU NUTS is impractical)
     for nc in [1, 8]:
-        jobs.append((f"nuts_cpu_nc{nc}", "cpu",
+        jobs.append((f"nuts_cpu_nc{nc}_G{g}", "cpu",
                      ["mpr_jax_numpyro.py", "--sampler", "nuts",
                       "--chain_method", "parallel", "--n_chains", str(nc),
                       "--n_warmup", str(n_warmup), "--n_samples", str(n_samples),
-                      "--save_dir", save] + COMMON))
+                      "--save_dir", save] + G + COMMON))
     return jobs
 
 
@@ -135,16 +138,18 @@ def main():
     ap.add_argument("--n_stages", type=int, default=50)
     ap.add_argument("--n_mcmc", type=int, default=5)
     ap.add_argument("--cpu_cap", type=int, default=1)
+    ap.add_argument("--G", type=float, default=0.2,
+                    help="true G for this run (multi-G campaign loops the runner over G).")
     args = ap.parse_args()
 
     save = results_dir()
     jobs = []
-    if "forward" in args.suite:
+    if "forward" in args.suite:      # forward throughput is G-independent -> run once
         jobs += forward_jobs(save)
     if "smc" in args.suite:
-        jobs += smc_jobs(save, args.n_stages, args.n_mcmc)
+        jobs += smc_jobs(save, args.n_stages, args.n_mcmc, args.G)
     if "nuts" in args.suite:
-        jobs += nuts_jobs(save, args.n_warmup, args.n_samples)
+        jobs += nuts_jobs(save, args.n_warmup, args.n_samples, args.G)
 
     print(f"scheduling {len(jobs)} jobs -> {save}/out/  (GPUs={len(range(2))}, cpu_cap={args.cpu_cap})", flush=True)
     run(jobs, save, cpu_cap=args.cpu_cap)
