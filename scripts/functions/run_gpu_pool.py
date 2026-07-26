@@ -20,8 +20,9 @@ FUNCS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(FUNCS_DIR, "..", ".."))
 
 # shared model/config knobs; small 10-node model for CPU-comparability.
-# G is threaded per-run (see --G) so the same runner drives the multi-G campaign.
-COMMON = ["--which_stat", "FC", "--grad_method", "fd", "--grad_horizon", "100",
+# G and which_stat (FC/FCD) are threaded per-run so the same runner drives both
+# the multi-G and the FC-vs-FCD campaigns.
+COMMON = ["--grad_method", "fd", "--grad_horizon", "100",
           "--SC_type", "data", "--SC_size", "10", "--fast_bold",
           "--cut", "10", "--tr", "1", "--t_end", "30000", "--seed", "42"]
 
@@ -40,46 +41,46 @@ def forward_jobs(save):
     ]
 
 
-def smc_jobs(save, n_stages, n_mcmc, g, gpu_only=False):
+def smc_jobs(save, n_stages, n_mcmc, g, stat, gpu_only=False):
     jobs = []
-    G = ["--G", str(g)]
+    GS = ["--G", str(g), "--which_stat", stat]
     for flavor in ["smc_lik", "smc_abc"]:
         # GPU: full particle sweep (batched axis -> ~free on GPU)
         for npart in [64, 256, 1024, 4096]:
-            jobs.append((f"{flavor}_gpu_np{npart}_G{g}", "gpu",
+            jobs.append((f"{flavor}_gpu_np{npart}_G{g}_{stat}", "gpu",
                          ["mpr_jax_numpyro.py", "--sampler", flavor,
                           "--n_particles", str(npart), "--n_stages", str(n_stages),
-                          "--n_mcmc", str(n_mcmc), "--save_dir", save] + G + COMMON))
+                          "--n_mcmc", str(n_mcmc), "--save_dir", save] + GS + COMMON))
         # CPU: only the smaller particle counts (large batch collapses on CPU).
-        # Skipped for the multi-G campaign (--gpu_only): CPU np256 ~5.6h would
-        # bottleneck every G; the CPU baseline is already established at G=0.2.
+        # Skipped for the multi-G/FCD campaigns (--gpu_only): CPU np256 ~5.6h would
+        # bottleneck every cell; the CPU baseline is already established at G=0.2 FC.
         if not gpu_only:
             for npart in [64, 256]:
-                jobs.append((f"{flavor}_cpu_np{npart}_G{g}", "cpu",
+                jobs.append((f"{flavor}_cpu_np{npart}_G{g}_{stat}", "cpu",
                              ["mpr_jax_numpyro.py", "--sampler", flavor,
                               "--n_particles", str(npart), "--n_stages", str(n_stages),
-                              "--n_mcmc", str(n_mcmc), "--save_dir", save] + G + COMMON))
+                              "--n_mcmc", str(n_mcmc), "--save_dir", save] + GS + COMMON))
     return jobs
 
 
-def nuts_jobs(save, n_warmup, n_samples, g, gpu_only=False):
+def nuts_jobs(save, n_warmup, n_samples, g, stat, gpu_only=False):
     jobs = []
-    G = ["--G", str(g)]
+    GS = ["--G", str(g), "--which_stat", stat]
     # GPU: vectorized chains sweep (n_chains is the batched axis)
     for nc in [1, 8, 32, 128]:
-        jobs.append((f"nuts_gpu_nc{nc}_G{g}", "gpu",
+        jobs.append((f"nuts_gpu_nc{nc}_G{g}_{stat}", "gpu",
                      ["mpr_jax_numpyro.py", "--sampler", "nuts",
                       "--chain_method", "vectorized", "--n_chains", str(nc),
                       "--n_warmup", str(n_warmup), "--n_samples", str(n_samples),
-                      "--save_dir", save] + G + COMMON))
+                      "--save_dir", save] + GS + COMMON))
     # CPU baseline: only low chain counts (multi-chain CPU NUTS is impractical)
     if not gpu_only:
         for nc in [1, 8]:
-            jobs.append((f"nuts_cpu_nc{nc}_G{g}", "cpu",
+            jobs.append((f"nuts_cpu_nc{nc}_G{g}_{stat}", "cpu",
                          ["mpr_jax_numpyro.py", "--sampler", "nuts",
                           "--chain_method", "parallel", "--n_chains", str(nc),
                           "--n_warmup", str(n_warmup), "--n_samples", str(n_samples),
-                          "--save_dir", save] + G + COMMON))
+                          "--save_dir", save] + GS + COMMON))
     return jobs
 
 
@@ -145,18 +146,20 @@ def main():
     ap.add_argument("--G", type=float, default=0.2,
                     help="true G for this run (multi-G campaign loops the runner over G).")
     ap.add_argument("--gpu_only", action="store_true",
-                    help="skip CPU baseline cells (multi-G campaign: GPU-only to avoid the "
-                         "slow CPU np256 bottleneck; CPU baseline already done at G=0.2).")
+                    help="skip CPU baseline cells (multi-G/FCD campaign: GPU-only to avoid the "
+                         "slow CPU np256 bottleneck; CPU baseline already done at G=0.2 FC).")
+    ap.add_argument("--which_stat", type=str, default="FC", choices=["FC", "FCD"],
+                    help="summary statistic for the SMC/NUTS jobs (FC or FCD).")
     args = ap.parse_args()
 
     save = results_dir()
     jobs = []
-    if "forward" in args.suite:      # forward throughput is G-independent -> run once
+    if "forward" in args.suite:      # forward throughput is G-/stat-independent -> run once
         jobs += forward_jobs(save)
     if "smc" in args.suite:
-        jobs += smc_jobs(save, args.n_stages, args.n_mcmc, args.G, args.gpu_only)
+        jobs += smc_jobs(save, args.n_stages, args.n_mcmc, args.G, args.which_stat, args.gpu_only)
     if "nuts" in args.suite:
-        jobs += nuts_jobs(save, args.n_warmup, args.n_samples, args.G, args.gpu_only)
+        jobs += nuts_jobs(save, args.n_warmup, args.n_samples, args.G, args.which_stat, args.gpu_only)
 
     print(f"scheduling {len(jobs)} jobs -> {save}/out/  (GPUs={len(range(2))}, cpu_cap={args.cpu_cap})", flush=True)
     run(jobs, save, cpu_cap=args.cpu_cap)
