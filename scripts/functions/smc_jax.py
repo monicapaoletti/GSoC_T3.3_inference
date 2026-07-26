@@ -1,0 +1,130 @@
+"""JAX-native, particle-vmapped Sequential Monte Carlo for the MPR G-inference.
+
+Why hand-rolled (not blackjax.smc): (1) the ABC variant is likelihood-free and
+blackjax has no built-in ABC kernel; (2) writing the particle loop ourselves
+guarantees that every forward-model evaluation is a `jax.vmap` over the N
+particles, which is exactly the on-device batching that makes the GPU win
+(measured: forward throughput is flat in wall-time up to batch 1024). The whole
+SMC run is one `jax.lax.scan`, so it compiles to a single GPU program.
+
+Two flavors, one framework (fixed tempering schedule -> predictable cost, good
+for benchmarking):
+  * run_tempered_smc  -- LIKELIHOOD tempering, exponent lambda: 0 -> 1.
+                         Target = exact posterior (analog of pymc `smclik`,
+                         same target as NUTS/BlackJAX).
+  * run_abc_smc       -- ABC epsilon tempering, eps: eps0 -> eps_target with a
+                         Gaussian ABC kernel pseudo-likelihood -0.5*(dist/eps)^2
+                         (analog of pymc `smcabc`, likelihood-free).
+
+Both operate on a scalar POSITIVE parameter G with a multiplicative
+(log-space) random-walk MH move, so they stay in the constrained support and
+need no unconstraining transform. `loglik_fn` / `distance_fn` take a scalar G;
+we vmap them over the particle cloud internally.
+"""
+import jax
+import jax.numpy as jnp
+
+
+def systematic_resample(key, w):
+    """Systematic resampling indices for normalized weights w (shape (N,))."""
+    N = w.shape[0]
+    u = (jax.random.uniform(key) + jnp.arange(N)) / N
+    return jnp.clip(jnp.searchsorted(jnp.cumsum(w), u), 0, N - 1)
+
+
+def _ess(logw):
+    w = jax.nn.softmax(logw)
+    return 1.0 / jnp.sum(w ** 2)
+
+
+def run_tempered_smc(key, init_particles, logprior_fn, loglik_fn,
+                     n_stages=50, n_mcmc=5, rw_step=0.1):
+    """Likelihood-tempered SMC. `loglik_fn(G)`/`logprior_fn(G)` are scalar->scalar
+    (vmapped here). Returns (particles (N,), info dict with per-stage ess/accept)."""
+    vprior = jax.vmap(logprior_fn)
+    vloglik = jax.vmap(loglik_fn)
+    lambdas = jnp.linspace(0.0, 1.0, n_stages + 1)
+
+    def mh_scan(key, parts, lp, ll, lmbda):
+        def step(carry, k):
+            parts, lp, ll = carry
+            k1, k2 = jax.random.split(k)
+            prop = parts * jnp.exp(rw_step * jax.random.normal(k1, parts.shape))
+            lp_p, ll_p = vprior(prop), vloglik(prop)   # N forward evals, vmapped
+            # tempered target logprior + lambda*loglik; multiplicative RW is
+            # symmetric in log-space -> Hastings correction is log(prop/parts).
+            logr = (lp_p + lmbda * ll_p) - (lp + lmbda * ll) + (jnp.log(prop) - jnp.log(parts))
+            acc = jnp.log(jax.random.uniform(k2, parts.shape)) < logr
+            parts = jnp.where(acc, prop, parts)
+            lp = jnp.where(acc, lp_p, lp)
+            ll = jnp.where(acc, ll_p, ll)
+            return (parts, lp, ll), acc.mean()
+        keys = jax.random.split(key, n_mcmc)
+        (parts, lp, ll), accs = jax.lax.scan(step, (parts, lp, ll), keys)
+        return parts, lp, ll, accs.mean()
+
+    def stage(carry, lam_pair):
+        parts, lp, ll, key = carry
+        lam_prev, lam = lam_pair
+        key, kr, km = jax.random.split(key, 3)
+        logw = (lam - lam_prev) * ll               # incremental importance weight
+        w = jax.nn.softmax(logw)
+        ess = 1.0 / jnp.sum(w ** 2)
+        idx = systematic_resample(kr, w)
+        parts, lp, ll = parts[idx], lp[idx], ll[idx]
+        parts, lp, ll, acc = mh_scan(km, parts, lp, ll, lam)
+        return (parts, lp, ll, key), (ess, acc)
+
+    lp0, ll0 = vprior(init_particles), vloglik(init_particles)
+    lam_pairs = (lambdas[:-1], lambdas[1:])
+    (parts, lp, ll, _), (ess, acc) = jax.lax.scan(
+        stage, (init_particles, lp0, ll0, key), lam_pairs)
+    return parts, {"ess": ess, "accept": acc}
+
+
+def run_abc_smc(key, init_particles, logprior_fn, distance_fn, eps_schedule,
+                n_mcmc=5, rw_step=0.1):
+    """ABC epsilon-tempered SMC (likelihood-free). `distance_fn(G)` -> scalar
+    distance between simulated and observed features. `eps_schedule` is a
+    decreasing (n_stages+1,) array eps0 -> eps_target. Gaussian ABC kernel
+    pseudo-loglik = -0.5*(dist/eps)^2. Returns (particles, info)."""
+    vprior = jax.vmap(logprior_fn)
+    vdist = jax.vmap(distance_fn)
+
+    def pseudo_ll(dist, eps):
+        return -0.5 * (dist / eps) ** 2
+
+    def mh_scan(key, parts, lp, dist, eps):
+        def step(carry, k):
+            parts, lp, dist = carry
+            k1, k2 = jax.random.split(k)
+            prop = parts * jnp.exp(rw_step * jax.random.normal(k1, parts.shape))
+            lp_p, dist_p = vprior(prop), vdist(prop)   # N forward evals, vmapped
+            logr = (lp_p + pseudo_ll(dist_p, eps)) - (lp + pseudo_ll(dist, eps)) \
+                   + (jnp.log(prop) - jnp.log(parts))
+            acc = jnp.log(jax.random.uniform(k2, parts.shape)) < logr
+            parts = jnp.where(acc, prop, parts)
+            lp = jnp.where(acc, lp_p, lp)
+            dist = jnp.where(acc, dist_p, dist)
+            return (parts, lp, dist), acc.mean()
+        keys = jax.random.split(key, n_mcmc)
+        (parts, lp, dist), accs = jax.lax.scan(step, (parts, lp, dist), keys)
+        return parts, lp, dist, accs.mean()
+
+    def stage(carry, eps_pair):
+        parts, lp, dist, key = carry
+        eps_prev, eps = eps_pair
+        key, kr, km = jax.random.split(key, 3)
+        logw = pseudo_ll(dist, eps) - pseudo_ll(dist, eps_prev)
+        w = jax.nn.softmax(logw)
+        ess = 1.0 / jnp.sum(w ** 2)
+        idx = systematic_resample(kr, w)
+        parts, lp, dist = parts[idx], lp[idx], dist[idx]
+        parts, lp, dist, acc = mh_scan(km, parts, lp, dist, eps)
+        return (parts, lp, dist, key), (ess, acc)
+
+    lp0, dist0 = vprior(init_particles), vdist(init_particles)
+    eps_pairs = (eps_schedule[:-1], eps_schedule[1:])
+    (parts, lp, dist, _), (ess, acc) = jax.lax.scan(
+        stage, (init_particles, lp0, dist0, key), eps_pairs)
+    return parts, {"ess": ess, "accept": acc, "final_dist": dist}

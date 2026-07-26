@@ -39,6 +39,7 @@ import mpr_jax
 mpr_jax = __import__("mpr_jax")
 import json
 from benchmark_utils import benchmark_metrics
+from smc_jax import run_tempered_smc, run_abc_smc
 
 # ------------------ Argument parser ------------------
 def parse_args():
@@ -67,10 +68,30 @@ def parse_args():
     parser.add_argument("--n_warmup", type=int, default=20)
     parser.add_argument("--n_samples", type=int, default=20)
     parser.add_argument("--n_chains", type=int, default=1)
+    parser.add_argument("--chain_method", type=str, default="vectorized",
+                    choices=["parallel", "vectorized", "sequential"],
+                    help="NumPyro NUTS chain execution: 'vectorized' vmaps chains on-device "
+                         "(fills the GPU -> more chains ~free); 'parallel' spawns host "
+                         "processes (CPU-style); 'sequential' one after another.")
     parser.add_argument("--scale", type=int, default=1, help="prior scale")
     parser.add_argument("--sampler", type=str, default="pathfinder",
-                    choices=["nuts", "pathfinder", "blackjax"],
-                    help="nuts=NumPyro NUTS, blackjax=BlackJAX NUTS, pathfinder=BlackJAX Pathfinder VI")
+                    choices=["nuts", "pathfinder", "blackjax", "smc_lik", "smc_abc"],
+                    help="nuts=NumPyro NUTS, blackjax=BlackJAX NUTS, pathfinder=BlackJAX "
+                         "Pathfinder VI, smc_lik=JAX likelihood-tempered SMC (particles "
+                         "vmapped on-device), smc_abc=JAX ABC epsilon-tempered SMC.")
+    # --- batched-SMC controls (smc_lik / smc_abc); n_particles is the batched axis ---
+    parser.add_argument("--n_particles", type=int, default=1000,
+                    help="SMC particle-cloud size (the on-device vmap batch).")
+    parser.add_argument("--n_stages", type=int, default=50,
+                    help="SMC tempering stages (lambda 0->1, or eps schedule length).")
+    parser.add_argument("--n_mcmc", type=int, default=5,
+                    help="random-walk MH moves per SMC stage.")
+    parser.add_argument("--rw_step", type=float, default=0.1,
+                    help="log-space random-walk proposal scale for the SMC MH move.")
+    parser.add_argument("--abc_eps0", type=float, default=None,
+                    help="smc_abc initial (large) epsilon; default = median prior distance.")
+    parser.add_argument("--abc_eps_target", type=float, default=None,
+                    help="smc_abc final epsilon; default = obs_err * sqrt(n_features).")
 
     # Misc
     parser.add_argument("--save_dir", type=str, default=None)
@@ -354,8 +375,12 @@ def main():
     print(f"obs_err = {obs_err}, n_prior = {n_prior}, n_warmup = {n_warmup}, "
           f"n_samples = {n_samples}, n_chains = {n_chains}")
 
+    # backend (gpu/cpu) + chain_method go into the tag so parallel sweep cells
+    # (GPU-vectorized vs CPU-parallel at the same n_chains) don't overwrite each other.
+    backend = jax.devices()[0].platform
+
     # --- parameter tag for filenames ---  # <<< added
-    tag = f"G{G}_cut{cut}_tr{tr}_seed{seed}_tend{t_end}_ns{n_samples}_nc{n_chains}_SC_{SC_size}_sampler_{sampler}_which_stat_{which_stat}"
+    tag = f"G{G}_cut{cut}_tr{tr}_seed{seed}_tend{t_end}_ns{n_samples}_nc{n_chains}_SC_{SC_size}_sampler_{sampler}_which_stat_{which_stat}_{backend}_cm{args.chain_method}_np{args.n_particles}"
     print(f"\nSaving all outputs with tag: {tag}\n")
 
     # --- file paths ---  # <<< added
@@ -478,7 +503,7 @@ def main():
         init_to_low_prob = init_to_value(values={"G": tails_5th})
         kernel = NUTS(model, init_strategy=init_to_low_prob)
         mcmc = MCMC(kernel, num_warmup=n_warmup, num_samples=n_samples,
-                    num_chains=n_chains, chain_method="parallel")
+                    num_chains=n_chains, chain_method=args.chain_method)
         start_time = time.time()
         mcmc.run(rng_key_run, data, prior_specs, extra_fields=("potential_energy", "num_steps", "diverging"))
         runtime = time.time() - start_time
@@ -605,6 +630,60 @@ def main():
         print(posterior_samples)
 
 
+    elif sampler in ("smc_lik", "smc_abc"):
+        which = "likelihood-tempered" if sampler == "smc_lik" else "ABC epsilon-tempered"
+        print(f"Running {which} SMC ({args.n_particles} particles vmapped on-device, "
+              f"{args.n_stages} stages x {args.n_mcmc} MH moves)...")
+        fwd = data["forward_fn"]                 # config-baked forward (vmaps over G)
+        obs = jnp.asarray(FC_obs_flat)
+        scale_G = prior_specs["scale_G"]
+        logprior_fn = lambda G: dist.HalfNormal(scale_G).log_prob(G)
+
+        rng_key, k_init, k_smc = jax.random.split(rng_key_run, 3)
+        init_particles = dist.HalfNormal(scale_G).sample(k_init, (args.n_particles,))
+
+        if sampler == "smc_lik":
+            # exact Normal-likelihood posterior (same target as NUTS/BlackJAX)
+            loglik_fn = lambda G: jnp.sum(dist.Normal(fwd(G), obs_err).log_prob(obs))
+            start_time = time.time()
+            parts, info = run_tempered_smc(k_smc, init_particles, logprior_fn, loglik_fn,
+                                           n_stages=args.n_stages, n_mcmc=args.n_mcmc,
+                                           rw_step=args.rw_step)
+            jax.block_until_ready(parts)
+            runtime = time.time() - start_time
+        else:  # smc_abc  (likelihood-free)
+            distance_fn = lambda G: jnp.sqrt(jnp.sum((fwd(G) - obs) ** 2))
+            n_feat = int(obs.shape[0])
+            eps_target = args.abc_eps_target if args.abc_eps_target is not None \
+                else float(obs_err * np.sqrt(n_feat))                    # noise floor
+            if args.abc_eps0 is not None:
+                eps0 = args.abc_eps0
+            else:
+                d0 = np.asarray(jax.vmap(distance_fn)(init_particles))
+                eps0 = float(np.median(d0))
+            eps_target = min(eps_target, eps0 * 0.5)                     # ensure decreasing
+            eps_schedule = jnp.geomspace(eps0, eps_target, args.n_stages + 1)
+            print(f"  ABC epsilon schedule: {eps0:.3g} -> {eps_target:.3g}")
+            start_time = time.time()
+            parts, info = run_abc_smc(k_smc, init_particles, logprior_fn, distance_fn,
+                                      eps_schedule, n_mcmc=args.n_mcmc, rw_step=args.rw_step)
+            jax.block_until_ready(parts)
+            runtime = time.time() - start_time
+
+        parts_np = np.asarray(parts).reshape(1, -1)          # (chain=1, draw=N particles)
+        posterior_samples = az.from_dict(posterior={"G": parts_np})
+        mcmc = posterior_samples
+        print(f"SMC done in {runtime:.1f}s | posterior G mean={parts_np.mean():.4f} "
+              f"sd={parts_np.std():.4f} | mean accept={float(np.mean(np.asarray(info['accept']))):.2f} "
+              f"| final ESS={float(np.asarray(info['ess'])[-1]):.1f}")
+
+        az_summary = az.summary(posterior_samples, var_names=["G"]).reset_index().rename(columns={"index": "parameter"})
+        az_summary["runtime_sec"] = runtime
+        az_summary["n_particles"] = args.n_particles
+        az_summary.to_csv(fname_summary_csv, index=False)
+        print(f"Summary saved to {fname_summary_csv}")
+
+
 
     # --- diagnostics and plots ---
     summary = az.summary(mcmc, var_names=["G"])
@@ -644,6 +723,8 @@ def main():
             "SC_type": SC_type, "SC_size": SC_size, "G_true": float(params["G"]),
             "t_end": t_end, "cut": cut, "obs_err": obs_err, "seed": seed,
             "n_warmup": n_warmup, "grad_method": args.grad_method, "clip_mode": args.clip_mode,
+            "platform": backend, "chain_method": args.chain_method,
+            "n_particles": args.n_particles,
             "fcd_stride1": bool(args.fcd_stride1), "fisher_z": bool(args.fisher_z),
             "standardize_features": bool(args.standardize_features), "noisy_obs": bool(args.noisy_obs),
             "keep_negative_fc": bool(args.keep_negative_fc),
