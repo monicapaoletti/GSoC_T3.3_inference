@@ -41,10 +41,10 @@ def forward_jobs(save):
     ]
 
 
-def smc_jobs(save, n_stages, n_mcmc, g, stat, gpu_only=False):
+def smc_jobs(save, n_stages, n_mcmc, g, stat, gpu_only=False, flavors=None):
     jobs = []
     GS = ["--G", str(g), "--which_stat", stat]
-    for flavor in ["smc_lik", "smc_abc"]:
+    for flavor in (flavors or ["smc_lik", "smc_abc"]):
         # GPU: full particle sweep (batched axis -> ~free on GPU)
         for npart in [64, 256, 1024, 4096]:
             jobs.append((f"{flavor}_gpu_np{npart}_G{g}_{stat}", "gpu",
@@ -178,6 +178,10 @@ def main():
                     choices=["rwmh", "demc", "slice"],
                     help="subset of chain-vmapped samplers for the mcmc suite "
                          "(default all three; e.g. run slice only at one G).")
+    ap.add_argument("--smc_samplers", nargs="+", default=None,
+                    choices=["smc_lik", "smc_abc"],
+                    help="subset of SMC flavors for the smc suite (default both; "
+                         "e.g. smc_abc only for the fixed-epsilon re-run).")
     ap.add_argument("--results_dir", default=None,
                     help="pin the output directory (avoids the midnight date-rollover "
                          "splitting a long campaign across two results/<date> folders).")
@@ -189,7 +193,8 @@ def main():
     if "forward" in args.suite:      # forward throughput is G-/stat-independent -> run once
         jobs += forward_jobs(save)
     if "smc" in args.suite:
-        jobs += smc_jobs(save, args.n_stages, args.n_mcmc, args.G, args.which_stat, args.gpu_only)
+        jobs += smc_jobs(save, args.n_stages, args.n_mcmc, args.G, args.which_stat,
+                         args.gpu_only, args.smc_samplers)
     if "mcmc" in args.suite:
         jobs += mcmc_jobs(save, args.n_warmup, args.n_samples, args.G, args.which_stat,
                           args.gpu_only, args.mcmc_samplers)
