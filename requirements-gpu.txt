@@ -1,0 +1,36 @@
+# GPU inference environment (doslis / any CUDA-12 box), pinned to the versions
+# validated for this benchmark. Reproduces the doslis `jax_GSoC` venv.
+#
+# Build:
+#   python3 -m venv jax_GSoC && source jax_GSoC/bin/activate
+#   pip install --upgrade pip
+#   pip install -r requirements-gpu.txt
+#
+# Notes:
+#  - jax[cuda12]==0.6.2 pulls self-contained CUDA-12 wheels from PyPI; runs on an
+#    NVIDIA driver >= 525 via CUDA minor-version forward compatibility (tested on
+#    driver 535 / L4). For CPU-only, replace `jax[cuda12]==0.6.2` with `jax==0.6.2`.
+#  - Keep pip's cache/TMPDIR off a full root disk (see scripts/functions/README / env.sh).
+
+jax[cuda12]==0.6.2
+numpyro==0.19.0
+pymc==5.20.0
+pytensor==2.26.4
+blackjax==1.2.4
+arviz==0.20.0
+flax==0.10.7
+seaborn==0.13.2
+numpy==1.26.4
+scipy==1.15.1
+networkx==3.4.2
+optax==0.2.4
+matplotlib==3.9.2
+pandas==2.0.3
+h5py==3.12.1
+scikit-learn==1.6.1
+tqdm==4.66.5
+xarray==2024.7.0
+jaxopt==0.8.3
+equinox==0.13.2
+chex==0.1.88
+orbax-checkpoint==0.11.25

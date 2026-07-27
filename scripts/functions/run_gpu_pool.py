@@ -174,9 +174,13 @@ def main():
                     choices=["rwmh", "demc", "slice"],
                     help="subset of chain-vmapped samplers for the mcmc suite "
                          "(default all three; e.g. run slice only at one G).")
+    ap.add_argument("--results_dir", default=None,
+                    help="pin the output directory (avoids the midnight date-rollover "
+                         "splitting a long campaign across two results/<date> folders).")
     args = ap.parse_args()
 
-    save = results_dir()
+    save = args.results_dir if args.results_dir else results_dir()
+    os.makedirs(os.path.join(save, "out"), exist_ok=True)
     jobs = []
     if "forward" in args.suite:      # forward throughput is G-/stat-independent -> run once
         jobs += forward_jobs(save)

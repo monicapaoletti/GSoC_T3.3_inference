@@ -1,0 +1,114 @@
+# Canonical definition of the gradient-free inference benchmark: the model/likelihood
+# configuration (identical for every cell) and the per-sampler budgets (which differ,
+# for feasibility). This file is the reproducibility record and the source for the
+# Methods "settings" table; make_paper_assets.py reads it to annotate the results.
+
+# -------- shared model + likelihood (identical across ALL cells) --------
+model:
+  name: MPR                 # Montbrio-Pazo-Roxin neural-mass
+  SC_type: data
+  SC_size: 10               # nodes (small, so CPU and GPU are comparable at every batch)
+  t_end: 30000
+  dt: 0.01
+  cut: 10                   # transient BOLD frames dropped
+  tr: 1
+  fast_bold: true
+  eta: -4.6
+  noise_amp: 0.037
+likelihood:
+  fisher_z: true
+  standardize_features: true
+  noisy_obs: true
+  obs_err: 1.0
+  n_ref_seeds: 8            # reference sims for per-feature standardization
+  n_prior: 100              # prior-predictive samples
+prior:
+  G: {dist: HalfNormal, scale: 1.0}
+sweep:
+  G_true: [0.2, 0.33, 0.5, 0.7]
+  which_stat: [FC, FCD]
+  seed: 42
+
+# -------- per-sampler budgets (batched_axis is the on-device vmap dimension) --------
+# Comparison across samplers uses ESS/sec (budget-normalized), since budgets differ.
+samplers:
+  smc_lik:
+    kind: gradient-free
+    family: SMC (likelihood-tempered)
+    batched_axis: n_particles
+    n_particles: [64, 256, 1024, 4096]     # CPU baseline: [64, 256] only
+    n_stages: 50
+    n_mcmc: 5
+    stats: [FC, FCD]
+    backends: [gpu, cpu]
+  smc_abc:
+    kind: gradient-free
+    family: SMC (ABC, epsilon-tempered)
+    batched_axis: n_particles
+    n_particles: [64, 256, 1024, 4096]
+    n_stages: 50
+    n_mcmc: 5
+    eps_target: obs_err                    # = sigma_obs (calibrated); NOT obs_err*sqrt(m)
+    stats: [FC, FCD]
+    backends: [gpu, cpu]
+  rwmh:
+    kind: gradient-free
+    family: Random-walk Metropolis
+    pymc_equivalent: Metropolis
+    batched_axis: n_chains
+    n_chains: [64, 256, 1024, 4096]
+    n_warmup: 200            # NOTE: too short -> did not converge; re-run planned at 1000
+    n_samples: 500
+    stats: [FC, FCD]
+    backends: [gpu]          # CPU covered by PyMC Metropolis on ulysses
+  demc:
+    kind: gradient-free
+    family: Differential-Evolution Monte Carlo
+    pymc_equivalent: DEMetropolis
+    batched_axis: n_chains
+    n_chains: [64, 256, 1024, 4096]
+    n_warmup: 200
+    n_samples: 500
+    stats: [FC, FCD]
+    backends: [gpu]
+  slice:
+    kind: gradient-free
+    family: Slice sampling
+    pymc_equivalent: Slice
+    batched_axis: n_chains
+    n_chains: [64, 256, 1024, 4096]
+    n_warmup: 15             # reduced: slice is ~25x more forward-evals/step
+    n_samples: 30
+    max_expand: 10
+    max_shrink: 20
+    stats: [FC]             # G=0.2 only (eval-heavy)
+    G_true: [0.2]
+    backends: [gpu]
+  nuts:
+    kind: gradient-based
+    family: NUTS (finite-difference gradient)
+    status: FAILS           # step-size collapse on the chaotic forward model
+    n_warmup: 1000
+    n_samples: 1000
+    n_chains: [1, 8, 32, 128]
+    backends: [gpu, cpu]
+
+# PyMC host-side CPU reference samplers (ulysses), 1000 tune / 1000 draws:
+#   Metropolis, DEMetropolis (4 chains), DEMetropolisZ, Slice, SMC(likelihood), SMC-ABC
+cpu_reference:
+  framework: pymc
+  n_warmup: 1000
+  n_samples: 1000
+  n_chains: 2               # 4 for DEMetropolis
+  n_prior: 1000
+  samplers: [slice, metropolis, demetropolisz, demetropolis, smclik, smcabc]
+
+# -------- forward-throughput micro-benchmark (mechanism figure) --------
+forward_throughput:
+  batches: [1, 4, 16, 64, 256, 1024]
+  reps: 3
+
+hardware:
+  gpu: {node: doslis, device: NVIDIA L4, n_devices: 2}
+  cpu: {node: ulysses, cores_per_task: 4, scheduler: SLURM}
+  cpu_baseline: {node: doslis, cores: 64}
