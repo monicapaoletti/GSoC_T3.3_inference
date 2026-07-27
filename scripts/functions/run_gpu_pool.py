@@ -163,6 +163,10 @@ def main():
     ap.add_argument("--n_stages", type=int, default=50)
     ap.add_argument("--n_mcmc", type=int, default=5)
     ap.add_argument("--cpu_cap", type=int, default=1)
+    ap.add_argument("--gpu_concurrency", type=int, default=1,
+                    help="GPU jobs to run PER DEVICE concurrently. Each job is tiny "
+                         "(~250 MiB, GPU under-utilized), so several fit and fill the "
+                         "idle device -> higher matrix throughput at no memory cost.")
     ap.add_argument("--G", type=float, default=0.2,
                     help="true G for this run (multi-G campaign loops the runner over G).")
     ap.add_argument("--gpu_only", action="store_true",
@@ -192,8 +196,10 @@ def main():
     if "nuts" in args.suite:
         jobs += nuts_jobs(save, args.n_warmup, args.n_samples, args.G, args.which_stat, args.gpu_only)
 
-    print(f"scheduling {len(jobs)} jobs -> {save}/out/  (GPUs={len(range(2))}, cpu_cap={args.cpu_cap})", flush=True)
-    run(jobs, save, cpu_cap=args.cpu_cap)
+    gpu_slots = tuple(d for d in (0, 1) for _ in range(max(1, args.gpu_concurrency)))
+    print(f"scheduling {len(jobs)} jobs -> {save}/out/  (gpu_slots={gpu_slots}, "
+          f"cpu_cap={args.cpu_cap})", flush=True)
+    run(jobs, save, gpu_slots=gpu_slots, cpu_cap=args.cpu_cap)
 
 
 if __name__ == "__main__":
