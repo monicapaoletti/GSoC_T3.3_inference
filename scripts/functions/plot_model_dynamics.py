@@ -41,8 +41,8 @@ def simulate(G, eta, t_end, seed=42):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--G", type=float, nargs="+", default=[0.0, 0.5, 0.7],
-                    help="coupling values (swept unless --eta has >1 value)")
+    ap.add_argument("--G", type=float, nargs="+", default=[0.2, 0.33, 0.5, 0.7],
+                    help="coupling values (swept unless --eta has >1 value); default matches inference")
     ap.add_argument("--eta", type=float, nargs="+", default=[-4.6],
                     help="excitability values; pass >1 (e.g. -5.5 -4.6 -3.7, prior U(-6,-3.5)) "
                          "to sweep eta at fixed G instead of sweeping G")
