@@ -123,7 +123,7 @@ def plot_benchmark(Ns, times_jax, times_numba, resultspath, cpugpu):
     plt.legend()
     plt.grid(True, which='both', linestyle='--', alpha=0.6)
 
-    filename = f'benchmarking_{cpugpu}.png'
+    filename = f"benchmarking_{cpugpu}_tend{os.environ.get('SIM_T_END','1000')}.png"
     np.savez(os.path.join(resultspath, filename + '.npz'),
              Ns=Ns, times_jax=times_jax, times_numba=times_numba)
     plt.savefig(os.path.join(resultspath, filename), dpi=300)
@@ -133,7 +133,7 @@ def plot_benchmark(Ns, times_jax, times_numba, resultspath, cpugpu):
 # Main
 # -----------------------------
 if __name__ == "__main__":
-    t_end = 1_000
+    t_end = int(os.environ.get("SIM_T_END", 1000))
 
     print("JAX devices:", jax.devices())
     device_type = "GPU" if any(d.platform == "gpu" for d in jax.devices()) else "CPU"
@@ -184,7 +184,7 @@ if __name__ == "__main__":
     # -----------------------------
     # Benchmark
     # -----------------------------
-    Ns = [10, 100, 1000, 10000, 100000]
+    Ns = [int(x) for x in os.environ.get("SIM_NS", "10,100,1000,10000,100000").split(",")]
     batch_size = 200  # optimized for GPU batching
 
     times_jax = []
