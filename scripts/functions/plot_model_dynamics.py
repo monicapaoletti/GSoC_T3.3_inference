@@ -25,11 +25,11 @@ import utils
 from FCD_jax import extract_FCD
 
 
-def simulate(G, t_end, seed=42):
-    """Run the MPR model at coupling G; return firing rate r, BOLD, and time axes."""
+def simulate(G, eta, t_end, seed=42):
+    """Run the MPR model at coupling G and excitability eta; return r, BOLD, time axes."""
     weights = jnp.array(np.loadtxt(utils.DATA_ROOT + "/weights.txt"))
     params = {"G": float(G), "t_end": t_end, "weights": weights / jnp.max(weights),
-              "dt": 0.01, "eta": jnp.array([-4.6]), "rv_decimate": 10,
+              "dt": 0.01, "eta": jnp.array([float(eta)]), "rv_decimate": 10,
               "noise_amp": 0.037, "tr": 300.0, "seed": seed}
     sde = mpr_jax.MPR_sde.create(params)
     out = sde.run({}, record_rv=True)
@@ -41,27 +41,40 @@ def simulate(G, t_end, seed=42):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--G", type=float, nargs="+", default=[0.0, 0.5, 0.7])
+    ap.add_argument("--G", type=float, nargs="+", default=[0.0, 0.5, 0.7],
+                    help="coupling values (swept unless --eta has >1 value)")
+    ap.add_argument("--eta", type=float, nargs="+", default=[-4.6],
+                    help="excitability values; pass >1 (e.g. -5.5 -4.6 -3.7, prior U(-6,-3.5)) "
+                         "to sweep eta at fixed G instead of sweeping G")
     ap.add_argument("--t_end", type=int, default=int(os.environ.get("SIM_T_END", 300000)))
     ap.add_argument("--cut", type=int, default=10, help="drop initial BOLD frames (transient)")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
     out = args.out or utils.results_folder()
 
-    nG = len(args.G)
-    fig, axes = plt.subplots(nG, 4, figsize=(16, 3.4 * nG),
+    # sweep eta (at fixed G) if multiple eta given, else sweep G (at fixed eta)
+    if len(args.eta) > 1:
+        sweep, fixed = "eta", f"G={args.G[0]}"
+        rows = [(args.G[0], e, f"$\\eta$={e}") for e in args.eta]
+    else:
+        sweep, fixed = "G", f"$\\eta$={args.eta[0]}"
+        rows = [(g, args.eta[0], f"G={g}") for g in args.G]
+
+    nrow = len(rows)
+    fig, axes = plt.subplots(nrow, 4, figsize=(16, 3.4 * nrow),
                              gridspec_kw={"width_ratios": [2.2, 2.2, 1, 1]})
     axes = np.atleast_2d(axes)
+    fig.suptitle(f"MPR dynamics: sweep {sweep} ({fixed} fixed), t_end={args.t_end}", y=1.0)
 
-    for row, G in enumerate(args.G):
-        r, rv_t, bold, bold_t = simulate(G, args.t_end)
+    for row, (G, eta, rlabel) in enumerate(rows):
+        r, rv_t, bold, bold_t = simulate(G, eta, args.t_end)
         b = bold[args.cut:]
         FC = np.corrcoef(b.T)
         FCD = np.asarray(extract_FCD(b, wwidth=30, maxNwindows=200, olap=0.94, mode="corr"))
 
         ax = axes[row, 0]                                    # firing rate
         ax.plot(rv_t, r[:, :min(5, r.shape[1])], lw=0.5)
-        ax.set_ylabel(f"G={G}\nr(t)"); ax.set_xlabel("time")
+        ax.set_ylabel(f"{rlabel}\nr(t)"); ax.set_xlabel("time")
         if row == 0: ax.set_title("firing rate (5 regions)")
 
         ax = axes[row, 1]                                    # BOLD
@@ -78,10 +91,10 @@ def main():
         im = ax.imshow(FCD, vmin=0, vmax=1, cmap="jet"); ax.set_xticks([]); ax.set_yticks([])
         if row == 0: ax.set_title("FCD")
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        print(f"G={G}: r{r.shape} bold{bold.shape} FC{FC.shape} FCD{FCD.shape}")
+        print(f"G={G} eta={eta}: r{r.shape} bold{bold.shape} FC{FC.shape} FCD{FCD.shape}")
 
     fig.tight_layout()
-    f = os.path.join(out, f"model_dynamics_tend{args.t_end}.png")
+    f = os.path.join(out, f"model_dynamics_sweep{sweep}_tend{args.t_end}.png")
     fig.savefig(f, dpi=200); plt.close(fig)
     print(f"wrote {f}")
 
