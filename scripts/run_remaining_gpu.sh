@@ -7,6 +7,7 @@
 #   - rwmh converged FC+FCD (all G, 1000/1000)[proper warm-up -> fair Metropolis number]
 #   - ABC fixed-epsilon FC+FCD (all G, full particle sweep) [eps=obs_err, calibrated]
 # All outputs pinned to one results folder (no midnight split).
+source /CNSdata/mpaolett/env.sh   # activate the GPU venv (jax/numpyro/...); MUST come first
 set -uo pipefail
 FUNCS=/CNSdata/mpaolett/GSoC_T3.3_inference/scripts/functions
 LOG=/CNSdata/mpaolett/pool_gpu_final.log
