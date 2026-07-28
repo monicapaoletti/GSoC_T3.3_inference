@@ -27,7 +27,7 @@ import arviz as az
 import numpyro as npr
 from numpyro import plate
 import numpyro.distributions as dist
-from numpyro.infer import MCMC, NUTS, Predictive, init_to_value#, Pathfinder
+from numpyro.infer import MCMC, NUTS, HMC, Predictive, init_to_value#, Pathfinder
 import blackjax
 from numpyro.infer.util import initialize_model
 
@@ -74,9 +74,20 @@ def parse_args():
                     help="NumPyro NUTS chain execution: 'vectorized' vmaps chains on-device "
                          "(fills the GPU -> more chains ~free); 'parallel' spawns host "
                          "processes (CPU-style); 'sequential' one after another.")
+    # --- bounded gradient-based controls (nuts/hmc): keep the chaotic-gradient cost finite ---
+    parser.add_argument("--max_tree_depth", type=int, default=10,
+                    help="NUTS: cap the trajectory at 2^depth leapfrogs (bounds per-step cost).")
+    parser.add_argument("--target_accept", type=float, default=0.8,
+                    help="target acceptance for step-size adaptation; lower (e.g. 0.6) "
+                         "reduces step-size collapse in the chaotic regime.")
+    parser.add_argument("--hmc_num_steps", type=int, default=10,
+                    help="HMC: fixed number of leapfrog steps per iteration.")
+    parser.add_argument("--fixed_step_size", type=float, default=None,
+                    help="if set, use this fixed step size and DISABLE adaptation "
+                         "(fixed-step HMC / floored NUTS -> avoids the collapse entirely).")
     parser.add_argument("--scale", type=int, default=1, help="prior scale")
     parser.add_argument("--sampler", type=str, default="pathfinder",
-                    choices=["nuts", "pathfinder", "blackjax", "smc_lik", "smc_abc",
+                    choices=["nuts", "hmc", "pathfinder", "blackjax", "smc_lik", "smc_abc",
                              "rwmh", "demc", "slice"],
                     help="nuts=NumPyro NUTS, blackjax=BlackJAX NUTS, pathfinder=BlackJAX "
                          "Pathfinder VI, smc_lik=JAX likelihood-tempered SMC, smc_abc=JAX "
@@ -500,11 +511,21 @@ def main():
 
     rng_key, rng_key_run = jax.random.split(rng_key)
 
-    if sampler == "nuts":
-        print("Running NUTS inference...")
+    if sampler in ("nuts", "hmc"):
+        print(f"Running {sampler.upper()} inference "
+              f"(max_tree_depth={args.max_tree_depth}, target_accept={args.target_accept}, "
+              f"fixed_step_size={args.fixed_step_size})...")
         tails_5th = jnp.percentile(prior_predictions["G"], 5, axis=0)
         init_to_low_prob = init_to_value(values={"G": tails_5th})
-        kernel = NUTS(model, init_strategy=init_to_low_prob)
+        # bounded gradient-based: cap trajectory (max_tree_depth / fixed num_steps) and,
+        # optionally, floor the step size (fixed_step_size) to avoid the chaotic collapse.
+        kw = dict(init_strategy=init_to_low_prob, target_accept_prob=args.target_accept)
+        if args.fixed_step_size is not None:
+            kw.update(step_size=args.fixed_step_size, adapt_step_size=False)
+        if sampler == "nuts":
+            kernel = NUTS(model, max_tree_depth=args.max_tree_depth, **kw)
+        else:  # fixed-trajectory HMC
+            kernel = HMC(model, num_steps=args.hmc_num_steps, **kw)
         mcmc = MCMC(kernel, num_warmup=n_warmup, num_samples=n_samples,
                     num_chains=n_chains, chain_method=args.chain_method)
         start_time = time.time()
