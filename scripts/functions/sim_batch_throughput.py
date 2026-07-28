@@ -24,12 +24,17 @@ import utils
 
 
 def build_batched_run(sde):
-    """jit(vmap) over a batch of (seed, G) -> one full simulation each."""
+    """jit(vmap) over a batch of (seed, G) -> one full simulation each.
+
+    CRITICAL: return a scalar REDUCTION of the actual simulation output
+    (sum of the BOLD trace). Returning a constant (e.g. 0) lets XLA
+    dead-code-eliminate the whole scan, so the timing measures nothing.
+    """
     @jax.jit
     def batched(seeds, gs):
         def single(seed, g):
-            sde.run({"G": g, "seed": seed})
-            return 0
+            out = sde.run({"G": g, "seed": seed})
+            return jnp.nansum(out["bold_d"])
         return jax.vmap(single)(seeds, gs)
     return batched
 
