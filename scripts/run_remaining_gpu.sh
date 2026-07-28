@@ -12,7 +12,7 @@ set -uo pipefail
 FUNCS=/CNSdata/mpaolett/GSoC_T3.3_inference/scripts/functions
 LOG=/CNSdata/mpaolett/pool_gpu_final.log
 OUT=/CNSdata/mpaolett/GSoC_T3.3_inference/results/final_matrix
-CONC="--gpu_only --gpu_concurrency 3 --results_dir $OUT"
+CONC="--gpu_only --gpu_concurrency 1 --results_dir $OUT"
 cd "$FUNCS"
 
 run(){ python3 run_gpu_pool.py "$@" $CONC >> "$LOG" 2>&1; }
