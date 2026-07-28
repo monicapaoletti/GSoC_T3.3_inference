@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""Model-dynamics figure (paper point 7 / extended-abstract Fig. 2A).
+
+For each ground-truth coupling G, simulate the MPR whole-brain model and show, on one
+row: (i) example regional firing-rate r(t) and BOLD traces, (ii) the static FC matrix,
+(iii) the FCD matrix. This grounds the reader in the dynamical regimes before the
+inference results, and reproduces the switching behaviour (bistability -> FCD structure)
+described in the model section.
+
+This is the standalone version of the mpr_jax.ipynb cells (`plot` + `plot_fc_fcd`).
+
+Usage:
+  python plot_model_dynamics.py                 # default G grid, t_end=300000
+  SIM_T_END=100000 python plot_model_dynamics.py --G 0.2 0.5 0.7 --out ../../results
+"""
+import os, argparse
+import numpy as np
+import jax.numpy as jnp
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+import mpr_jax
+import utils
+from FCD_jax import extract_FCD
+
+
+def simulate(G, t_end, seed=42):
+    """Run the MPR model at coupling G; return firing rate r, BOLD, and time axes."""
+    weights = jnp.array(np.loadtxt(utils.DATA_ROOT + "/weights.txt"))
+    params = {"G": float(G), "t_end": t_end, "weights": weights / jnp.max(weights),
+              "dt": 0.01, "eta": jnp.array([-4.6]), "rv_decimate": 10,
+              "noise_amp": 0.037, "tr": 300.0, "seed": seed}
+    sde = mpr_jax.MPR_sde.create(params)
+    out = sde.run({}, record_rv=True)
+    r = np.asarray(out["rv_d"][:, 0, :])          # (time, nodes) firing rate
+    bold = np.asarray(out["bold_d"])              # (time, nodes)
+    rv_t = np.asarray(out["rv_t"]); bold_t = np.asarray(out["bold_t"])
+    return r, rv_t, bold, bold_t
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--G", type=float, nargs="+", default=[0.0, 0.5, 0.7])
+    ap.add_argument("--t_end", type=int, default=int(os.environ.get("SIM_T_END", 300000)))
+    ap.add_argument("--cut", type=int, default=10, help="drop initial BOLD frames (transient)")
+    ap.add_argument("--out", default=None)
+    args = ap.parse_args()
+    out = args.out or utils.results_folder()
+
+    nG = len(args.G)
+    fig, axes = plt.subplots(nG, 4, figsize=(16, 3.4 * nG),
+                             gridspec_kw={"width_ratios": [2.2, 2.2, 1, 1]})
+    axes = np.atleast_2d(axes)
+
+    for row, G in enumerate(args.G):
+        r, rv_t, bold, bold_t = simulate(G, args.t_end)
+        b = bold[args.cut:]
+        FC = np.corrcoef(b.T)
+        FCD = np.asarray(extract_FCD(b, wwidth=30, maxNwindows=200, olap=0.94, mode="corr"))
+
+        ax = axes[row, 0]                                    # firing rate
+        ax.plot(rv_t, r[:, :min(5, r.shape[1])], lw=0.5)
+        ax.set_ylabel(f"G={G}\nr(t)"); ax.set_xlabel("time")
+        if row == 0: ax.set_title("firing rate (5 regions)")
+
+        ax = axes[row, 1]                                    # BOLD
+        ax.plot(bold_t, bold[:, :min(5, bold.shape[1])], lw=0.6)
+        ax.set_ylabel("BOLD"); ax.set_xlabel("time")
+        if row == 0: ax.set_title("BOLD (5 regions)")
+
+        ax = axes[row, 2]                                    # FC
+        im = ax.imshow(FC, vmin=-1, vmax=1, cmap="jet"); ax.set_xticks([]); ax.set_yticks([])
+        if row == 0: ax.set_title("FC")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+        ax = axes[row, 3]                                    # FCD
+        im = ax.imshow(FCD, vmin=0, vmax=1, cmap="jet"); ax.set_xticks([]); ax.set_yticks([])
+        if row == 0: ax.set_title("FCD")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        print(f"G={G}: r{r.shape} bold{bold.shape} FC{FC.shape} FCD{FCD.shape}")
+
+    fig.tight_layout()
+    f = os.path.join(out, f"model_dynamics_tend{args.t_end}.png")
+    fig.savefig(f, dpi=200); plt.close(fig)
+    print(f"wrote {f}")
+
+
+if __name__ == "__main__":
+    main()
