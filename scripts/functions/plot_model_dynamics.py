@@ -47,7 +47,9 @@ def main():
                     help="excitability values; pass >1 (e.g. -5.5 -4.6 -3.7, prior U(-6,-3.5)) "
                          "to sweep eta at fixed G instead of sweeping G")
     ap.add_argument("--t_end", type=int, default=int(os.environ.get("SIM_T_END", 300000)))
-    ap.add_argument("--cut", type=int, default=10, help="drop initial BOLD frames (transient)")
+    ap.add_argument("--cut", type=int, default=50,
+                    help="drop initial BOLD frames (transient + Balloon-Windkessel startup); "
+                         "50 matches the mpr_jax.ipynb cells this script reproduces (t_end=300000 -> 1000 frames)")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
     out = args.out or utils.results_folder()
@@ -68,9 +70,11 @@ def main():
 
     for row, (G, eta, rlabel) in enumerate(rows):
         r, rv_t, bold, bold_t = simulate(G, eta, args.t_end)
+        # cut once, then feed the SAME trimmed series to both features.
+        # extract_FCD expects (nodes, timepoints) -- pass b.T, not b (or set coldata=True).
         b = bold[args.cut:]
         FC = np.corrcoef(b.T)
-        FCD = np.asarray(extract_FCD(b, wwidth=30, maxNwindows=200, olap=0.94, mode="corr"))
+        FCD = np.asarray(extract_FCD(b.T, wwidth=30, maxNwindows=200, olap=0.94, mode="corr"))
 
         ax = axes[row, 0]                                    # firing rate
         ax.plot(rv_t, r[:, :min(5, r.shape[1])], lw=0.5)

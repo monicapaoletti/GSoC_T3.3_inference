@@ -28,11 +28,36 @@ def run_single_simulation(params, G, seed):
 def create_sde_jax(params):
     return mpr_jax.MPR_sde.create(params)
 
-def benchmark_sde_run_vmap_chunked(sde, N, batch_size=200):
+
+def build_batched_run(sde):
+    """jit(vmap) over a batch of (seed, G) -> one full simulation each.
+
+    CRITICAL: return a scalar REDUCTION of the actual simulation output (sum of the
+    BOLD trace). Returning a constant (e.g. 0) lets XLA dead-code-eliminate the whole
+    scan, so the timing measures nothing. Same trap already fixed in
+    sim_batch_throughput.py (commit 1a95403).
+
+    Built ONCE and reused: defining the jitted function inside the batch loop creates a
+    fresh function object per batch, so jax.jit re-enters its compile path every time and
+    the "timing" becomes compile/dispatch bookkeeping instead of simulation work.
     """
-    Run sde.run({}) N times using vmap in batches.
-    This version is optimized for both CPU and GPU.
+    @jax.jit
+    def batched(seeds, gs):
+        def single(seed, g):
+            out = sde.run({"G": g, "seed": seed})
+            return jnp.nansum(out["bold_d"])
+        return jax.vmap(single)(seeds, gs)
+    return batched
+
+
+def benchmark_sde_run_vmap_chunked(run, sde, N, batch_size=200, warmed=None):
+    """Run the model N times via jit(vmap) in batches of `batch_size`; return seconds.
+
+    Compilation is excluded (each distinct batch shape is warmed up untimed first) and
+    every timed call is wrapped in jax.block_until_ready, so the result reflects real
+    device work rather than JAX's asynchronous dispatch returning a future immediately.
     """
+    warmed = warmed if warmed is not None else set()
     seeds = jnp.arange(sde.P.seed, sde.P.seed + N, dtype=jnp.int32)
     g_values = jnp.linspace(0.0, 1.0, N)
 
@@ -42,15 +67,13 @@ def benchmark_sde_run_vmap_chunked(sde, N, batch_size=200):
         seeds_batch = seeds[start:end]
         g_batch = g_values[start:end]
 
-        @jax.jit
-        def vmap_run(seeds_local, g_local):
-            def single_run(seed, g):
-                sde.run({"G": g, "seed": seed})
-                return 0
-            return jax.vmap(single_run)(seeds_local, g_local)
+        n = end - start
+        if n not in warmed:                       # compile once per batch shape, untimed
+            jax.block_until_ready(run(seeds_batch, g_batch))
+            warmed.add(n)
 
         start_time = time.time()
-        vmap_run(seeds_batch, g_batch)
+        jax.block_until_ready(run(seeds_batch, g_batch))
         elapsed += time.time() - start_time
     return elapsed
 
@@ -176,10 +199,20 @@ if __name__ == "__main__":
         "seed": 42,
     }
 
-    # Warmup Numba
-    sde_numba = create_sde_numba(params_numba)
-    sde_numba.run({"seed": params_numba["seed"]})
-    print("Numba warmup done!")
+    # Reuse a previous Numba arm instead of re-running it (it dominates the runtime and
+    # is unaffected by the JAX timing fix, so its old numbers are still valid).
+    #   SIM_REUSE_NUMBA=/path/to/benchmarking_CPU_tend30000.png.npz
+    # The stored Ns must match the Ns being run, otherwise the two curves would be
+    # plotted against different x values.
+    reuse_numba = os.environ.get("SIM_REUSE_NUMBA", "")
+
+    if not reuse_numba:
+        # Warmup Numba
+        sde_numba = create_sde_numba(params_numba)
+        sde_numba.run({"seed": params_numba["seed"]})
+        print("Numba warmup done!")
+    else:
+        print(f"Reusing Numba timings from {reuse_numba} (skipping Numba benchmark)")
 
     # -----------------------------
     # Benchmark
@@ -190,8 +223,11 @@ if __name__ == "__main__":
     times_jax = []
     times_numba = []
 
+    run_jax = build_batched_run(sde_jax)   # build ONCE, reuse across every N and batch
+    warmed = set()                         # batch shapes already compiled (untimed)
     for N in Ns:
-        elapsed_jax = benchmark_sde_run_vmap_chunked(sde_jax, N, batch_size=batch_size)
+        elapsed_jax = benchmark_sde_run_vmap_chunked(run_jax, sde_jax, N,
+                                                     batch_size=batch_size, warmed=warmed)
         times_jax.append(elapsed_jax)
         print(f"JAX repeated {N} times: {elapsed_jax:.4f}s")
 
@@ -200,10 +236,23 @@ if __name__ == "__main__":
     #    times_numba.append(elapsed_numba)
     #    print(f"Numba repeated {N} times: {elapsed_numba:.4f}s")
 
-    for N in Ns:
-        elapsed_numba = benchmark_sde_run_parallel(params_numba, N, max_workers=os.cpu_count())
-        times_numba.append(elapsed_numba)
-        print(f"Numba parallel repeated {N} times: {elapsed_numba:.4f}s")
+    if reuse_numba:
+        prev = np.load(reuse_numba)
+        prev_Ns = list(np.asarray(prev["Ns"]).astype(int))
+        if prev_Ns != list(Ns):
+            raise SystemExit(
+                f"SIM_REUSE_NUMBA Ns mismatch: stored {prev_Ns} != requested {list(Ns)}.\n"
+                f"Re-run with SIM_NS={','.join(map(str, prev_Ns))}, or drop SIM_REUSE_NUMBA "
+                f"to re-measure Numba."
+            )
+        times_numba = list(np.asarray(prev["times_numba"], dtype=float))
+        for N, t in zip(Ns, times_numba):
+            print(f"Numba (reused) repeated {N} times: {t:.4f}s")
+    else:
+        for N in Ns:
+            elapsed_numba = benchmark_sde_run_parallel(params_numba, N, max_workers=os.cpu_count())
+            times_numba.append(elapsed_numba)
+            print(f"Numba parallel repeated {N} times: {elapsed_numba:.4f}s")
 
 
     # -----------------------------

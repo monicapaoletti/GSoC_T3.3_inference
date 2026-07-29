@@ -41,6 +41,7 @@ parser.add_argument('--do_fc_bold', type=lambda x: (str(x).lower() == 'true'), d
 parser.add_argument('--do_fcd_bold', type=lambda x: (str(x).lower() == 'true'), default=True, help='Calculate and save FCD for bold (default: True)')
 parser.add_argument('--do_fc_r', type=lambda x: (str(x).lower() == 'true'), default=False, help='Calculate and save FC for r (default: False)')
 parser.add_argument('--do_plot', type=lambda x: (str(x).lower() == 'true'), default=False, help='If True, run plotting only and skip simulation and FC/FCD calculations (default: False)')
+parser.add_argument('--cut', type=int, default=50, help='Drop the first `cut` BOLD frames (initial transient + Balloon-Windkessel startup) before FC/FCD (default: 50)')
 
 
 mpr_jax = reload(mpr_jax)
@@ -251,7 +252,10 @@ if __name__ == "__main__":
             logging.error(f"File {sim_filename} not found. Please run simulation first or check the path.")
             sys.exit(1)
 
-    bold = jnp.array(bold_d.T)
+    # Drop the initial transient ONCE, here, so every downstream feature (FC and FCD)
+    # sees the same trimmed series -- mirrors vbi's model-level `t_cut` and prevents the
+    # FC-cut-but-FCD-uncut inconsistency. r is left uncut (different time base: rv_decimate, not tr).
+    bold = jnp.array(bold_d[args.cut:].T)
     r = jnp.array(r)
 
     if args.do_fc_r:
