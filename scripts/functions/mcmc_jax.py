@@ -97,10 +97,20 @@ def run_demc(key, init_G, logprior_G, loglik_G, n_tune, n_draws,
 
 # -------------------------------------------------------------------- Slice
 def run_slice(key, init_G, logprior_G, loglik_G, n_tune, n_draws,
-              w=1.0, max_expand=10, max_shrink=20):
+              w=1.0, max_expand=4, max_shrink=10):
     """N parallel univariate slice-sampling chains on z=log G (Neal 2003:
     stepping-out + shrinkage). Uses fixed-iteration fori_loops with masking instead
-    of while_loops so it is efficient and safe under vmap. Returns (G_draws, info)."""
+    of while_loops so it is efficient and safe under vmap. Returns (G_draws, info).
+
+    COST NOTE: under vmap every chain pays the WORST-CASE trip count, because lanes
+    cannot exit early independently -- so each step costs exactly
+    2*max_expand + max_shrink likelihood evaluations regardless of how quickly the
+    bracket would have converged. On CPU slice is cheap because it exits early; that
+    advantage is structurally unavailable here. Defaults were 10/20 (=40 evals/step,
+    ~40x rwmh, measured 122 s/step) which forced a 15-tune/30-draw budget and left
+    R-hat ~= 2.95 (unconverged). 4/10 (=18 evals/step) is ~2.2x cheaper, buying ~2.2x
+    more draws for the same wall clock. For a 1-D log-G posterior, 10 doublings of a
+    w=1.0 bracket is far more than needed."""
     logpost_z = _make_logpost_z(logprior_G, loglik_G)
     z0 = jnp.log(init_G)
 

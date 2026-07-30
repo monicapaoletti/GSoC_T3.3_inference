@@ -56,6 +56,12 @@ def parse_args():
     parser.add_argument("--t_end", type=int, default=3000)
     parser.add_argument("--tr", type=int, default=5)
     parser.add_argument("--cut", type=int, default=10)
+    parser.add_argument("--slice_max_expand", type=int, default=4,
+                        help="slice stepping-out bound; cost is 2*max_expand+max_shrink "
+                             "likelihood evals PER STEP (worst case, always paid under vmap)")
+    parser.add_argument("--slice_max_shrink", type=int, default=10,
+                        help="slice shrinkage bound; see --slice_max_expand. Old 10/20 "
+                             "defaults = 40 evals/step and left R-hat ~2.95 unconverged")
 
     parser.add_argument("--wwidth", type=int, default=30)
     parser.add_argument("--maxWindows", type=int, default=200)
@@ -730,8 +736,17 @@ def main():
         init_G = dist.HalfNormal(scale_G).sample(k_init, (n_chains,))
         sampler_fn = {"rwmh": run_parallel_rwmh, "demc": run_demc, "slice": run_slice}[sampler]
 
+        # slice pays 2*max_expand+max_shrink evals/step at WORST case under vmap
+        # (no early exit per lane), so these bounds set its cost directly.
+        extra = {}
+        if sampler == "slice":
+            extra = {"max_expand": args.slice_max_expand, "max_shrink": args.slice_max_shrink}
+            print(f"  slice bracket bounds: max_expand={extra['max_expand']} "
+                  f"max_shrink={extra['max_shrink']} "
+                  f"-> {2*extra['max_expand']+extra['max_shrink']} evals/step")
+
         start_time = time.time()
-        G_draws, info = sampler_fn(k_run, init_G, logprior_G, loglik_G, n_warmup, n_samples)
+        G_draws, info = sampler_fn(k_run, init_G, logprior_G, loglik_G, n_warmup, n_samples, **extra)
         jax.block_until_ready(G_draws)
         runtime = time.time() - start_time
 
