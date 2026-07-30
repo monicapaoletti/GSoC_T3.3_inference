@@ -218,7 +218,11 @@ if __name__ == "__main__":
     # Benchmark
     # -----------------------------
     Ns = [int(x) for x in os.environ.get("SIM_NS", "10,100,1000,10000,100000").split(",")]
-    batch_size = 200  # optimized for GPU batching
+    # vmap width per chunk. 200 under-feeds the GPU: the t_end=1000 batch sweep
+    # (sim_batch_throughput) showed GPU wall time flat out to batch 1024 and only
+    # saturating at 4096, so a wider chunk is close to free on device. Keep it
+    # IDENTICAL between the CPU and GPU runs or the two curves aren't comparable.
+    batch_size = int(os.environ.get("SIM_BATCH_SIZE", 200))
 
     times_jax = []
     times_numba = []

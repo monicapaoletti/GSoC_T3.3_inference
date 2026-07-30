@@ -9,8 +9,12 @@ flat in batch size), with NO gradient (so none of the FD-NUTS step-size patholog
 These are the GPU counterparts of the pymc host-side samplers (which stay CPU-only):
   * run_parallel_rwmh  -- Random-Walk Metropolis (analog of pymc Metropolis)
   * run_demc           -- Differential-Evolution Metropolis, a POPULATION sampler
-                          whose ensemble-difference proposal is naturally vmappable
-                          (analog of pymc DEMetropolis / DEMetropolisZ)
+                          whose ensemble-difference proposal is naturally vmappable.
+                          Analog of pymc DEMetropolis ONLY: the difference vector is
+                          drawn from the CURRENT ensemble. There is deliberately no
+                          DEMetropolisZ analog here -- Z substitutes a per-chain history
+                          archive for a large population, which is precisely what
+                          on-device chain batching (n_chains up to 4096) already provides.
   * run_slice          -- univariate Slice sampling with stepping-out + shrinkage
                           (analog of pymc Slice); bounded fori_loops keep it vmap-safe
 
