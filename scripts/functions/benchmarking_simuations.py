@@ -205,8 +205,12 @@ if __name__ == "__main__":
     # The stored Ns must match the Ns being run, otherwise the two curves would be
     # plotted against different x values.
     reuse_numba = os.environ.get("SIM_REUSE_NUMBA", "")
+    # SIM_SKIP_NUMBA=1 drops the Numba arm entirely (times recorded as NaN). Needed at
+    # t_end values where no cached Numba run exists and measuring one is not worth it
+    # (t_end=300000 would be ~10 h for a baseline already established at t_end=30000).
+    skip_numba = os.environ.get("SIM_SKIP_NUMBA", "") not in ("", "0", "false", "False")
 
-    if not reuse_numba:
+    if not reuse_numba and not skip_numba:
         # Warmup Numba
         sde_numba = create_sde_numba(params_numba)
         sde_numba.run({"seed": params_numba["seed"]})
@@ -240,7 +244,10 @@ if __name__ == "__main__":
     #    times_numba.append(elapsed_numba)
     #    print(f"Numba repeated {N} times: {elapsed_numba:.4f}s")
 
-    if reuse_numba:
+    if skip_numba:
+        times_numba = [float("nan")] * len(Ns)
+        print("SIM_SKIP_NUMBA set -> Numba arm skipped (times recorded as NaN)")
+    elif reuse_numba:
         prev = np.load(reuse_numba)
         prev_Ns = list(np.asarray(prev["Ns"]).astype(int))
         if prev_Ns != list(Ns):
