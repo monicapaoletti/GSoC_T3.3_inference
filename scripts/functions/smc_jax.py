@@ -37,10 +37,50 @@ def _ess(logw):
     return 1.0 / jnp.sum(w ** 2)
 
 
+def _make_proposal(move, rw_step, demc_gamma, demc_jitter):
+    """Within-stage MCMC proposal on the particle cloud, in log-G space.
+
+    move="rw"   : independent multiplicative random walk (one particle at a time).
+    move="demc" : DE-MC ensemble-difference proposal -- z_i' = z_i + gamma*(z_r1 - z_r2)
+                  + jitter, with r1,r2 drawn from the CURRENT cloud. This is the
+                  run_demc proposal from mcmc_jax, applied INSIDE the tempering ladder:
+                  the SMC particle cloud already *is* the population DE-MC needs, so
+                  tempering (which is what lets ABC succeed at G=0.7, RMSE 0.0099,
+                  where plain DE-MC stalls at 0.155) combines with a proposal that
+                  adapts to the cloud's own scale instead of a fixed rw_step.
+
+    Both are symmetric in z=log(G), so the Hastings correction stays log(prop/parts)
+    exactly as in the plain-RW case -- callers need no other change."""
+    gamma = float(2.38 / jnp.sqrt(2.0)) if demc_gamma is None else demc_gamma
+
+    def rw(key, parts):
+        return parts * jnp.exp(rw_step * jax.random.normal(key, parts.shape))
+
+    def demc(key, parts):
+        N = parts.shape[0]
+        k1, k2, k3 = jax.random.split(key, 3)
+        z = jnp.log(parts)
+        r1 = jax.random.randint(k1, (N,), 0, N)
+        r2 = jax.random.randint(k2, (N,), 0, N)
+        zp = z + gamma * (z[r1] - z[r2]) + demc_jitter * jax.random.normal(k3, z.shape)
+        return jnp.exp(zp)
+
+    if move == "demc":
+        return demc
+    if move == "rw":
+        return rw
+    raise ValueError(f"move must be 'rw' or 'demc', got {move!r}")
+
+
 def run_tempered_smc(key, init_particles, logprior_fn, loglik_fn,
-                     n_stages=50, n_mcmc=5, rw_step=0.1):
+                     n_stages=50, n_mcmc=5, rw_step=0.1,
+                     move="rw", demc_gamma=None, demc_jitter=1e-4):
     """Likelihood-tempered SMC. `loglik_fn(G)`/`logprior_fn(G)` are scalar->scalar
-    (vmapped here). Returns (particles (N,), info dict with per-stage ess/accept)."""
+    (vmapped here). Returns (particles (N,), info dict with per-stage ess/accept).
+
+    `move` selects the within-stage kernel: "rw" (default, unchanged behaviour) or
+    "demc" for tempered DE-MC. See _make_proposal."""
+    propose = _make_proposal(move, rw_step, demc_gamma, demc_jitter)
     vprior = jax.vmap(logprior_fn)
     vloglik = jax.vmap(loglik_fn)
     lambdas = jnp.linspace(0.0, 1.0, n_stages + 1)
@@ -49,7 +89,7 @@ def run_tempered_smc(key, init_particles, logprior_fn, loglik_fn,
         def step(carry, k):
             parts, lp, ll = carry
             k1, k2 = jax.random.split(k)
-            prop = parts * jnp.exp(rw_step * jax.random.normal(k1, parts.shape))
+            prop = propose(k1, parts)
             lp_p, ll_p = vprior(prop), vloglik(prop)   # N forward evals, vmapped
             # tempered target logprior + lambda*loglik; multiplicative RW is
             # symmetric in log-space -> Hastings correction is log(prop/parts).
@@ -83,11 +123,16 @@ def run_tempered_smc(key, init_particles, logprior_fn, loglik_fn,
 
 
 def run_abc_smc(key, init_particles, logprior_fn, distance_fn, eps_schedule,
-                n_mcmc=5, rw_step=0.1):
+                n_mcmc=5, rw_step=0.1,
+                move="rw", demc_gamma=None, demc_jitter=1e-4):
     """ABC epsilon-tempered SMC (likelihood-free). `distance_fn(G)` -> scalar
     distance between simulated and observed features. `eps_schedule` is a
     decreasing (n_stages+1,) array eps0 -> eps_target. Gaussian ABC kernel
-    pseudo-loglik = -0.5*(dist/eps)^2. Returns (particles, info)."""
+    pseudo-loglik = -0.5*(dist/eps)^2. Returns (particles, info).
+
+    `move` selects the within-stage kernel: "rw" (default, unchanged behaviour) or
+    "demc" for tempered DE-MC. See _make_proposal."""
+    propose = _make_proposal(move, rw_step, demc_gamma, demc_jitter)
     vprior = jax.vmap(logprior_fn)
     vdist = jax.vmap(distance_fn)
 
@@ -98,7 +143,7 @@ def run_abc_smc(key, init_particles, logprior_fn, distance_fn, eps_schedule,
         def step(carry, k):
             parts, lp, dist = carry
             k1, k2 = jax.random.split(k)
-            prop = parts * jnp.exp(rw_step * jax.random.normal(k1, parts.shape))
+            prop = propose(k1, parts)
             lp_p, dist_p = vprior(prop), vdist(prop)   # N forward evals, vmapped
             logr = (lp_p + pseudo_ll(dist_p, eps)) - (lp + pseudo_ll(dist, eps)) \
                    + (jnp.log(prop) - jnp.log(parts))
