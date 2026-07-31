@@ -92,14 +92,47 @@ def load_master(results_dirs):
     return df[keep].copy()
 
 
+# Cells whose numbers WILL change once queued re-runs land. Marked with * in the table
+# and spelled out in a footnote, so a provisional number is never mistaken for a final
+# one. Keyed by (sampler, platform); remove an entry once its re-run is in.
+_PROVISIONAL = {
+    ("demc", "gpu"): r"200/500 budget; 1000/1000 re-run in progress",
+    ("slice", "gpu"): r"15/30 budget, $\widehat{R}\approx2.95$ (not converged); "
+                      r"50/100 re-run at a cheaper bracket in progress",
+    ("smc_lik", "cpu"): r"$G^\star=0.7$ cells still running",
+}
+
+
+def _provisional_note(sub):
+    """LaTeX footnote listing only the provisional groups actually present in `sub`."""
+    present = {(r.get("sampler"), r.get("platform")) for _, r in sub.iterrows()}
+    items = [(k, v) for k, v in _PROVISIONAL.items() if k in present]
+    if not items:
+        return []
+    bits = [f"{_tt(s)} ({p}): {why}" for (s, p), why in sorted(items)]
+    return [
+        r"\\[2pt]",
+        r"\multicolumn{7}{p{0.95\linewidth}}{\footnotesize $^{*}$Provisional --- final "
+        r"results arriving. " + "; ".join(bits) + r".}\\",
+    ]
+
+
+def _tt(s):
+    r"""Sampler slug as \texttt, with _ escaped -- a bare underscore in text mode is a
+    LaTeX error ("Missing $ inserted"), and every SMC slug contains one."""
+    return r"\texttt{" + str(s).replace("_", r"\_") + "}"
+
+
 def _fmt(x, nd=3):
+    """Format a number, rendering NaN/inf as -- (SMC cells have no R-hat: one 'chain')."""
     try:
-        return f"{float(x):.{nd}g}"
+        v = float(x)
     except Exception:
         return "--"
+    return f"{v:.{nd}g}" if np.isfinite(v) else "--"
 
 
-def latex_benchmark_table(df, out_tex, G=0.2):
+def latex_benchmark_table(df, out_tex, G=0.2, label="tab:benchmark"):
     """Accuracy + performance at a chosen true G: representative (largest) batch per
     (sampler, platform, which_stat)."""
     sub = df[np.isclose(df["G_true"].astype(float), G)] if "G_true" in df else df
@@ -114,18 +147,20 @@ def latex_benchmark_table(df, out_tex, G=0.2):
         r"\caption{Recovery accuracy and cost per cell (true $G^\star=%s$, largest "
         r"batch). $|\Delta G|=|\hat G-G^\star|$; ESS/s is budget-normalized throughput.}"
         % _fmt(G, 2),
-        r"\label{tab:benchmark}\small",
+        rf"\label{{{label}}}\small",
         r"\begin{tabular}{lllrrrr}",
         r"\toprule",
         r"Sampler & Backend & Feat. & $|\Delta G|$ & runtime (s) & ESS/s & $\widehat{R}$ \\",
         r"\midrule",
     ]
     for _, r in sub.iterrows():
+        samp = r.get("sampler", "")
+        star = "$^{*}$" if (samp, r.get("platform")) in _PROVISIONAL else ""
         lines.append(
-            f"{r.get('sampler','')} & {r.get('platform','')} & {r.get('which_stat','')} & "
+            f"{_tt(samp)}{star} & {r.get('platform','')} & {r.get('which_stat','')} & "
             f"{_fmt(r.get('abs_err'))} & {_fmt(r.get('runtime_sec'),4)} & "
             f"{_fmt(r.get('ess_per_sec'),3)} & {_fmt(r.get('max_r_hat'),3)} \\\\")
-    lines += [r"\bottomrule", r"\end{tabular}", r"\end{table}"]
+    lines += [r"\bottomrule"] + _provisional_note(sub) + [r"\end{tabular}", r"\end{table}"]
     with open(out_tex, "w") as fh:
         fh.write("\n".join(lines) + "\n")
     print(f"wrote {out_tex} ({len(sub)} rows)")
@@ -211,6 +246,9 @@ def main():
                     default=os.path.join(here, "..", "..", "config", "benchmark_config.yaml"))
     ap.add_argument("--out", default=os.path.join(here, "..", "..", "paper"))
     ap.add_argument("--table_G", type=float, default=0.2)
+    ap.add_argument("--table_label", default="tab:benchmark",
+                    help="LaTeX label for the benchmark table; set to match the "
+                         "\\ref already used in main.tex")
     args = ap.parse_args()
 
     tables = os.path.join(args.out, "tables"); os.makedirs(tables, exist_ok=True)
@@ -221,7 +259,8 @@ def main():
     df.to_csv(master, index=False)
     print(f"wrote {master} ({len(df)} cells)")
 
-    latex_benchmark_table(df, os.path.join(tables, "benchmark_table.tex"), G=args.table_G)
+    latex_benchmark_table(df, os.path.join(tables, "benchmark_table.tex"),
+                          G=args.table_G, label=args.table_label)
     latex_settings_table(args.config, os.path.join(tables, "settings_table.tex"))
     fig_recovery_vs_G(df, os.path.join(figs, "recovery_vs_G.png"))
     fig_throughput(df, os.path.join(figs, "throughput_ess.png"))
