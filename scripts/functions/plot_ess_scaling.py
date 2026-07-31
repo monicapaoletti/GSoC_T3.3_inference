@@ -33,8 +33,13 @@ import matplotlib.pyplot as plt
 
 # Validated categorical order (all six checks pass in light mode; the contrast WARN on
 # the lighter hues is discharged by the legend + end-of-line direct labels).
-PALETTE = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4"]
-SAMPLER_ORDER = ["smc_abc", "smc_lik", "demc", "rwmh", "slice"]
+#
+# COLOR ENCODES THE ALGORITHM, MARKER ENCODES WHERE IT RAN. That way PyMC's Metropolis
+# sits in the same hue as the GPU rwmh line and can be read against it directly --
+# colour follows the entity, not the platform. demcz gets its own slot because PyMC has
+# it and the JAX side deliberately does not (see mcmc_jax docstring).
+PALETTE = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"]
+SAMPLER_ORDER = ["smc_abc", "smc_lik", "demc", "rwmh", "slice", "demcz"]
 DPI = 300
 
 
@@ -57,6 +62,7 @@ def main():
     for ax, stat in zip(axes, stats):
         d = df[df["which_stat"] == stat]
         gpu = d[d["platform"] == "gpu"]
+        ends = []
         for samp in SAMPLER_ORDER:
             g = gpu[gpu["sampler"] == samp]
             if g.empty:
@@ -69,24 +75,37 @@ def main():
                 continue
             ax.plot(m.index, m.values, "-o", color=colors[samp], lw=2, ms=8,
                     markeredgecolor="white", markeredgewidth=1.2, zorder=4,
-                    label=samp if ax is axes[0] else None)
-            # direct label at the line end (discharges the contrast WARN)
-            ax.annotate(samp, xy=(m.index[-1], m.values[-1]), xytext=(6, 0),
-                        textcoords="offset points", va="center", fontsize=9,
-                        color="#333333")
+                    )
+            ends.append((float(m.index[-1]), float(m.values[-1]), samp))
 
-        # CPU cells as markers only -- never joined into a line (see module docstring)
+        # Direct labels at the line ends (these discharge the contrast WARN), pushed
+        # apart where curves nearly coincide -- smc_lik and smc_abc overlap almost
+        # exactly, so un-nudged labels print on top of one another.
+        ends.sort(key=lambda t: t[1])
+        min_gap = 0.075                      # in log10 units of the y axis
+        placed = []
+        for x_e, y_e, samp in ends:
+            y_lab = np.log10(y_e)
+            if placed and y_lab - placed[-1] < min_gap:
+                y_lab = placed[-1] + min_gap
+            placed.append(y_lab)
+            ax.annotate(samp, xy=(x_e, 10 ** y_lab), xytext=(7, 0),
+                        textcoords="offset points", va="center", fontsize=9,
+                        color=colors[samp])
+
+        # CPU cells as markers only -- never joined into a line (see module docstring).
+        # Same hue as the algorithm's GPU line, so like can be read against like.
         cpu = d[d["platform"] == "cpu"]
-        jax_cpu = cpu[cpu["framework"] != "pymc"]
-        pymc_cpu = cpu[cpu["framework"] == "pymc"]
-        if not jax_cpu.empty:
-            ax.plot(jax_cpu["batch"], jax_cpu["ess_per_sec"], "o", mfc="none",
-                    mec="#444444", ms=9, mew=1.6, zorder=5,
-                    label="JAX on CPU (same code)" if ax is axes[0] else None)
-        if not pymc_cpu.empty:
-            ax.plot(pymc_cpu["batch"], pymc_cpu["ess_per_sec"], "x", color="#888888",
-                    ms=7, mew=1.5, zorder=5,
-                    label="PyMC on CPU (other framework)" if ax is axes[0] else None)
+        for samp in SAMPLER_ORDER:
+            c = colors[samp]
+            jc = cpu[(cpu["sampler"] == samp) & (cpu["framework"] != "pymc")]
+            pc = cpu[(cpu["sampler"] == samp) & (cpu["framework"] == "pymc")]
+            if not jc.empty:
+                ax.plot(jc["batch"], jc["ess_per_sec"], "o", mfc="none", mec=c,
+                        ms=10, mew=2.0, zorder=6)
+            if not pc.empty:
+                ax.plot(pc["batch"], pc["ess_per_sec"], "x", color=c,
+                        ms=7, mew=1.8, alpha=0.9, zorder=5)
 
         ax.set_xscale("log", base=2); ax.set_yscale("log")
         ax.set_xlabel("batch width (chains / particles)")
@@ -96,7 +115,26 @@ def main():
             ax.spines[s].set_visible(False)
 
     axes[0].set_ylabel("ESS / second")
-    axes[0].legend(frameon=False, fontsize=9, loc="upper left")
+    # Two legends: hue = algorithm, marker = where it ran. Keeping them separate stops
+    # the reader having to decode a 12-entry cross-product.
+    from matplotlib.lines import Line2D
+    alg = [Line2D([], [], color=colors[s], lw=2, marker="o", ms=7,
+                  markeredgecolor="white", label=s)
+           for s in SAMPLER_ORDER if (df["sampler"] == s).any()]
+    plat = [
+        Line2D([], [], color="#555555", lw=2, marker="o", ms=7,
+               markeredgecolor="white", label="JAX, GPU"),
+        Line2D([], [], color="#555555", lw=0, marker="o", mfc="none", ms=9, mew=2,
+               label="JAX, CPU (same code)"),
+        Line2D([], [], color="#555555", lw=0, marker="x", ms=7, mew=1.8,
+               label="PyMC, CPU (other framework)"),
+    ]
+    l1 = axes[0].legend(handles=alg, frameon=False, fontsize=9, loc="upper left",
+                        title="algorithm", alignment="left")
+    l1.get_title().set_fontsize(9)
+    axes[0].add_artist(l1)
+    axes[-1].legend(handles=plat, frameon=False, fontsize=9, loc="lower right",
+                    title="backend", alignment="left")
     fig.suptitle("Sampling throughput vs on-device batch width", y=1.0)
     fig.tight_layout()
 
