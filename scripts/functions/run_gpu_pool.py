@@ -41,16 +41,20 @@ def forward_jobs(save):
     ]
 
 
-def smc_jobs(save, n_stages, n_mcmc, g, stat, gpu_only=False, flavors=None):
+def smc_jobs(save, n_stages, n_mcmc, g, stat, gpu_only=False, flavors=None, smc_move="rw"):
     jobs = []
     GS = ["--G", str(g), "--which_stat", stat]
+    # tempered DE-MC is a separate algorithm -> separate job name and (via the driver)
+    # a separate sampler label in the results, so it never collides with the rw cells.
+    MOVE = [] if smc_move == "rw" else ["--smc_move", smc_move]
+    sfx = "" if smc_move == "rw" else f"_{smc_move}"
     for flavor in (flavors or ["smc_lik", "smc_abc"]):
         # GPU: full particle sweep (batched axis -> ~free on GPU)
         for npart in [64, 256, 1024, 4096]:
-            jobs.append((f"{flavor}_gpu_np{npart}_G{g}_{stat}", "gpu",
+            jobs.append((f"{flavor}{sfx}_gpu_np{npart}_G{g}_{stat}", "gpu",
                          ["mpr_jax_numpyro.py", "--sampler", flavor,
                           "--n_particles", str(npart), "--n_stages", str(n_stages),
-                          "--n_mcmc", str(n_mcmc), "--save_dir", save] + GS + COMMON))
+                          "--n_mcmc", str(n_mcmc), "--save_dir", save] + MOVE + GS + COMMON))
         # CPU: only the smaller particle counts (large batch collapses on CPU).
         # Skipped for the multi-G/FCD campaigns (--gpu_only): CPU np256 ~5.6h would
         # bottleneck every cell; the CPU baseline is already established at G=0.2 FC.
@@ -160,6 +164,9 @@ def main():
                     choices=["forward", "smc", "mcmc", "nuts"])
     ap.add_argument("--n_warmup", type=int, default=1000)
     ap.add_argument("--n_samples", type=int, default=1000)
+    ap.add_argument("--smc_move", type=str, default="rw", choices=["rw", "demc"],
+                    help="within-stage SMC kernel; 'demc' = tempered DE-MC, recorded as a "
+                         "separate sampler row (<flavor>_demc)")
     ap.add_argument("--n_stages", type=int, default=50)
     ap.add_argument("--n_mcmc", type=int, default=5)
     ap.add_argument("--cpu_cap", type=int, default=1)
@@ -194,7 +201,7 @@ def main():
         jobs += forward_jobs(save)
     if "smc" in args.suite:
         jobs += smc_jobs(save, args.n_stages, args.n_mcmc, args.G, args.which_stat,
-                         args.gpu_only, args.smc_samplers)
+                         args.gpu_only, args.smc_samplers, args.smc_move)
     if "mcmc" in args.suite:
         jobs += mcmc_jobs(save, args.n_warmup, args.n_samples, args.G, args.which_stat,
                           args.gpu_only, args.mcmc_samplers)
