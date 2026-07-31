@@ -112,6 +112,12 @@ def parse_args():
                     help="smc_abc initial (large) epsilon; default = median prior distance.")
     parser.add_argument("--abc_eps_target", type=float, default=None,
                     help="smc_abc final epsilon; default = obs_err * sqrt(n_features).")
+    parser.add_argument("--smc_move", type=str, default="rw", choices=["rw", "demc"],
+                    help="within-stage SMC kernel: 'rw' = multiplicative random walk "
+                         "(default, unchanged); 'demc' = tempered DE-MC, i.e. the "
+                         "ensemble-difference proposal drawn from the particle cloud. "
+                         "Recorded as sampler '<smc_lik|smc_abc>_demc' so it is a "
+                         "separate benchmark row, not a retuning of the parent.")
 
     # Misc
     parser.add_argument("--save_dir", type=str, default=None)
@@ -400,7 +406,13 @@ def main():
     backend = jax.devices()[0].platform
 
     # --- parameter tag for filenames ---  # <<< added
-    tag = f"G{G}_cut{cut}_tr{tr}_seed{seed}_tend{t_end}_ns{n_samples}_nc{n_chains}_SC_{SC_size}_sampler_{sampler}_which_stat_{which_stat}_{backend}_cm{args.chain_method}_np{args.n_particles}"
+    # Tempered DE-MC is a DISTINCT algorithm, not a tuning of smc_lik/smc_abc, so it gets
+    # its own label -> its own filename tag and its own row in the benchmark table.
+    sampler_label = sampler
+    if args.smc_move == "demc" and sampler in ("smc_lik", "smc_abc"):
+        sampler_label = f"{sampler}_demc"
+
+    tag = f"G{G}_cut{cut}_tr{tr}_seed{seed}_tend{t_end}_ns{n_samples}_nc{n_chains}_SC_{SC_size}_sampler_{sampler_label}_which_stat_{which_stat}_{backend}_cm{args.chain_method}_np{args.n_particles}"
     print(f"\nSaving all outputs with tag: {tag}\n")
 
     # --- file paths ---  # <<< added
@@ -678,7 +690,7 @@ def main():
             start_time = time.time()
             parts, info = run_tempered_smc(k_smc, init_particles, logprior_fn, loglik_fn,
                                            n_stages=args.n_stages, n_mcmc=args.n_mcmc,
-                                           rw_step=args.rw_step)
+                                           rw_step=args.rw_step, move=args.smc_move)
             jax.block_until_ready(parts)
             runtime = time.time() - start_time
         else:  # smc_abc  (likelihood-free)
@@ -701,7 +713,8 @@ def main():
             print(f"  ABC epsilon schedule: {eps0:.3g} -> {eps_target:.3g}")
             start_time = time.time()
             parts, info = run_abc_smc(k_smc, init_particles, logprior_fn, distance_fn,
-                                      eps_schedule, n_mcmc=args.n_mcmc, rw_step=args.rw_step)
+                                      eps_schedule, n_mcmc=args.n_mcmc, rw_step=args.rw_step,
+                                      move=args.smc_move)
             jax.block_until_ready(parts)
             runtime = time.time() - start_time
 
@@ -797,7 +810,7 @@ def main():
         }
         prior_sd = {"G": float(np.std(np.asarray(prior_predictions["G"]).ravel(), ddof=1))}
         meta = {
-            "sampler": sampler, "framework": "numpyro/blackjax", "which_stat": which_stat,
+            "sampler": sampler_label, "framework": "numpyro/blackjax", "which_stat": which_stat,
             "SC_type": SC_type, "SC_size": SC_size, "G_true": float(params["G"]),
             "t_end": t_end, "cut": cut, "obs_err": obs_err, "seed": seed,
             "n_warmup": n_warmup, "grad_method": args.grad_method, "clip_mode": args.clip_mode,
