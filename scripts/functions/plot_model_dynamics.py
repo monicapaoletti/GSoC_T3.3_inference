@@ -33,7 +33,11 @@ def simulate(G, eta, t_end, seed=42):
               "noise_amp": 0.037, "tr": 300.0, "seed": seed}
     sde = mpr_jax.MPR_sde.create(params)
     out = sde.run({}, record_rv=True)
-    r = np.asarray(out["rv_d"][:, 0, :])          # (time, nodes) firing rate
+    # rv_d is (time, 2*nn): r and v CONCATENATED along the last axis, not stacked as
+    # (time, 2, nn). Indexing [:, 0, :] raises "Too many indices: 2-dimensional array
+    # indexed with 3 regular indices". Mirrors the notebook's rv_d[:, :nn] / [:, nn:].
+    nn = int(weights.shape[0])
+    r = np.asarray(out["rv_d"][:, :nn])           # (time, nodes) firing rate
     bold = np.asarray(out["bold_d"])              # (time, nodes)
     rv_t = np.asarray(out["rv_t"]); bold_t = np.asarray(out["bold_t"])
     return r, rv_t, bold, bold_t
@@ -74,7 +78,10 @@ def main():
         # extract_FCD expects (nodes, timepoints) -- pass b.T, not b (or set coldata=True).
         b = bold[args.cut:]
         FC = np.corrcoef(b.T)
-        FCD = np.asarray(extract_FCD(b.T, wwidth=30, maxNwindows=200, olap=0.94, mode="corr"))
+        # extract_FCD returns (fcd_matrix, corr_vectors, shift) -- unpack it. Wrapping
+        # the whole tuple in np.asarray gives "inhomogeneous shape ... detected (3,)".
+        FCD, _, _ = extract_FCD(b.T, wwidth=30, maxNwindows=200, olap=0.94, mode="corr")
+        FCD = np.asarray(FCD)
 
         ax = axes[row, 0]                                    # firing rate
         ax.plot(rv_t, r[:, :min(5, r.shape[1])], lw=0.5)

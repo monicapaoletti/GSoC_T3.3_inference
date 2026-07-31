@@ -30,6 +30,11 @@ _COLS = ["sampler", "sampler_raw", "framework", "platform", "which_stat", "G_tru
 
 COLORS = {"gpu": "#295785", "cpu": "#B5651D"}
 
+# Validated categorical order, shared with plot_ess_scaling so a sampler keeps the same
+# hue across every figure in the paper. All six palette checks pass in light mode.
+PALETTE = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"]
+SAMPLER_ORDER = ["smc_abc", "smc_lik", "demc", "rwmh", "slice", "demcz"]
+
 
 # mpr_jax_pymc.py records the sampler as a DISPLAY string (one even contains LaTeX),
 # and writes neither `platform` nor `framework`. mpr_jax_numpyro.py records canonical
@@ -209,22 +214,72 @@ def latex_settings_table(config, out_tex):
 
 
 def fig_recovery_vs_G(df, out_png):
-    """Posterior recovery |Delta G| vs true G, per sampler, GPU cells (largest batch)."""
+    """Posterior recovery |Delta G| vs true G.
+
+    COLOUR = ALGORITHM, LINESTYLE = (feature x backend). Each sampler can appear up to
+    four times -- {FC,FCD} x {CPU,GPU} -- and the previous version left colour to
+    matplotlib's default cycle, which repeats after ten entries and assigned a fresh
+    colour to every (sampler, feature, backend) triple. Different algorithms therefore
+    shared a colour while one algorithm's four lines were four different colours,
+    i.e. exactly backwards. Colour now follows the entity; the four variants of one
+    algorithm are separated by dash pattern, with the headline case (FCD on GPU) solid.
+    """
     d = df.dropna(subset=["G_true", "abs_err"])
     if d.empty:
         print("(recovery figure skipped: no data)"); return
-    fig, ax = plt.subplots(figsize=(7, 5))
-    for (samp, stat, plat), g in d.groupby(["sampler", "which_stat", "platform"]):
-        g = g.sort_values("batch").groupby("G_true").tail(1).sort_values("G_true")
-        if len(g) < 1:
-            continue
-        ls = "-" if stat == "FC" else "--"
-        ax.plot(g["G_true"].astype(float), g["abs_err"].astype(float), ls, marker="o",
-                label=f"{samp}/{stat}/{plat}", alpha=0.8)
-    ax.set_xlabel(r"true $G^\star$"); ax.set_ylabel(r"$|\hat G - G^\star|$")
-    ax.set_title("Posterior recovery across regimes")
-    ax.grid(True, ls=":", alpha=0.4); ax.legend(fontsize=7, ncol=2, frameon=False)
-    fig.tight_layout(); fig.savefig(out_png, dpi=300); plt.close(fig)
+
+    colors = {s: PALETTE[i % len(PALETTE)] for i, s in enumerate(SAMPLER_ORDER)}
+    # (feature, platform) -> dash pattern. GPU heavier, CPU lighter.
+    STYLES = {("FCD", "gpu"): "-", ("FC", "gpu"): "--",
+              ("FCD", "cpu"): "-.", ("FC", "cpu"): ":"}
+
+    # FACETED 2x2. On a single axes this is 6 algorithms x 4 (feature,backend) variants
+    # = up to 24 crossing lines: the encoding is unambiguous but unreadable. One panel
+    # per variant leaves <=6 lines each, so COLOUR ALONE identifies the algorithm and no
+    # dash pattern has to be decoded. The linestyle is retained per panel so a single
+    # extracted panel still says which variant it is.
+    combos = [("FC", "gpu"), ("FCD", "gpu"), ("FC", "cpu"), ("FCD", "cpu")]
+    combos = [c for c in combos
+              if not d[(d["which_stat"] == c[0]) & (d["platform"] == c[1])].empty]
+    ncol = 2
+    nrow = int(np.ceil(len(combos) / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(5.2 * ncol, 3.9 * nrow),
+                             sharex=True, sharey=True)
+    axes = np.atleast_1d(axes).ravel()
+
+    for ax, (stat, plat) in zip(axes, combos):
+        ls = STYLES[(stat, plat)]
+        for samp in SAMPLER_ORDER:
+            g = d[(d["sampler"] == samp) & (d["which_stat"] == stat)
+                  & (d["platform"] == plat)]
+            if g.empty:
+                continue
+            # one point per G: the widest batch available for that cell
+            g = g.sort_values("batch").groupby("G_true").tail(1).sort_values("G_true")
+            ax.plot(g["G_true"].astype(float), g["abs_err"].astype(float), ls,
+                    color=colors.get(samp, "#777777"), marker="o", ms=5.5, lw=1.8,
+                    alpha=0.95, markeredgecolor="white", markeredgewidth=0.8)
+        ax.set_yscale("log")
+        ax.set_title(f"{stat}, {plat.upper()}", fontsize=10)
+        ax.grid(True, ls=":", alpha=0.4)
+        for s in ("top", "right"):
+            ax.spines[s].set_visible(False)
+    for ax in axes[len(combos):]:
+        ax.set_visible(False)
+
+    for ax in axes[len(combos) - ncol:len(combos)]:
+        ax.set_xlabel(r"true $G^\star$")
+    for i in range(0, len(combos), ncol):
+        axes[i].set_ylabel(r"$|\hat G - G^\star|$")
+
+    from matplotlib.lines import Line2D
+    alg = [Line2D([], [], color=colors[s], lw=2, marker="o", ms=5, label=s)
+           for s in SAMPLER_ORDER if (d["sampler"] == s).any()]
+    fig.legend(handles=alg, frameon=False, fontsize=9, ncol=len(alg),
+               loc="lower center", bbox_to_anchor=(0.5, -0.02))
+    fig.suptitle("Posterior recovery across regimes", y=1.0)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=300, bbox_inches="tight"); plt.close(fig)
     print(f"wrote {out_png}")
 
 
