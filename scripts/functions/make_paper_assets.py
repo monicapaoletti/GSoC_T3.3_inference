@@ -261,7 +261,13 @@ def fig_recovery_vs_G(df, out_png):
     # per variant leaves <=6 lines each, so COLOUR ALONE identifies the algorithm and no
     # dash pattern has to be decoded. The linestyle is retained per panel so a single
     # extracted panel still says which variant it is.
-    combos = [("FC", "gpu"), ("FCD", "gpu"), ("FC", "cpu"), ("FCD", "cpu")]
+    # GPU only. The CPU panels are dropped from the figure: they are not needed for the
+    # argument, and several CPU cells look structurally wrong rather than merely noisy
+    # (PyMC smcabc saturates near 0.5 regardless of G*, which is the uncalibrated
+    # epsilon=10 signature its own sampler label records). NOTE those cells are still
+    # in master_results.csv and still feed Table 1 -- hiding the panels does not remove
+    # them from the paper, so the anomaly needs diagnosing separately.
+    combos = [("FC", "gpu"), ("FCD", "gpu")]
     combos = [c for c in combos
               if not d[(d["which_stat"] == c[0]) & (d["platform"] == c[1])].empty]
     ncol = 2
@@ -276,13 +282,23 @@ def fig_recovery_vs_G(df, out_png):
         ls = STYLES[(stat, plat)]
         # identity: perfect recovery. Distance from it IS the error, to scale.
         ax.plot(lim, lim, "-", color="#999999", lw=1.2, zorder=1)
+        # one point per G: the widest batch available for that cell
+        series = {}
         for samp in SAMPLER_ORDER:
             g = d[(d["sampler"] == samp) & (d["which_stat"] == stat)
                   & (d["platform"] == plat)]
             if g.empty:
                 continue
-            # one point per G: the widest batch available for that cell
-            g = g.sort_values("batch").groupby("G_true").tail(1).sort_values("G_true")
+            series[samp] = (g.sort_values("batch").groupby("G_true").tail(1)
+                             .sort_values("G_true"))
+
+        # No +/-1 sd shading. It was tried and removed: the poorly-converged cells have
+        # posterior sd comparable to the prior width (GPU rwmh on FCD at G*=0.2: sd 0.82
+        # about a mean of 0.37), so their bands cover the entire panel and bury the tight
+        # SMC bands regardless of draw order or alpha. The dispersion is reported per
+        # cell in master_results.csv (G_sd, G_lo, G_hi) and via R-hat in Table 1, where
+        # it is legible; here it destroyed the figure it was meant to enrich.
+        for samp, g in series.items():
             ax.plot(g["G_true"].astype(float), g[ycol].astype(float), ls,
                     color=colors.get(samp, "#777777"), marker="o", ms=5.5, lw=1.8,
                     alpha=0.95, markeredgecolor="white", markeredgewidth=0.8, zorder=3)
