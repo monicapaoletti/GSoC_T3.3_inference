@@ -261,13 +261,7 @@ def fig_recovery_vs_G(df, out_png):
     # per variant leaves <=6 lines each, so COLOUR ALONE identifies the algorithm and no
     # dash pattern has to be decoded. The linestyle is retained per panel so a single
     # extracted panel still says which variant it is.
-    # GPU only. The CPU panels are dropped from the figure: they are not needed for the
-    # argument, and several CPU cells look structurally wrong rather than merely noisy
-    # (PyMC smcabc saturates near 0.5 regardless of G*, which is the uncalibrated
-    # epsilon=10 signature its own sampler label records). NOTE those cells are still
-    # in master_results.csv and still feed Table 1 -- hiding the panels does not remove
-    # them from the paper, so the anomaly needs diagnosing separately.
-    combos = [("FC", "gpu"), ("FCD", "gpu")]
+    combos = [("FC", "gpu"), ("FCD", "gpu"), ("FC", "cpu"), ("FCD", "cpu")]
     combos = [c for c in combos
               if not d[(d["which_stat"] == c[0]) & (d["platform"] == c[1])].empty]
     ncol = 2
@@ -298,8 +292,18 @@ def fig_recovery_vs_G(df, out_png):
         # SMC bands regardless of draw order or alpha. The dispersion is reported per
         # cell in master_results.csv (G_sd, G_lo, G_hi) and via R-hat in Table 1, where
         # it is legible; here it destroyed the figure it was meant to enrich.
-        for samp, g in series.items():
-            ax.plot(g["G_true"].astype(float), g[ycol].astype(float), ls,
+        # Nudge each sampler by a small x-offset. Several samplers agree to within a
+        # line width -- smc_lik and smc_abc are nearly identical on FCD -- and drawn at
+        # the true x they hide one another completely, so a reader sees five lines where
+        # there are six. The offset is a presentation device only: it is ~1% of the G
+        # range, far below any difference being claimed, and the markers still sit at
+        # their own G. Stated in the caption.
+        present = list(series)
+        span = 0.008
+        for i, samp in enumerate(present):
+            g = series[samp]
+            dx = (i - (len(present) - 1) / 2.0) * span
+            ax.plot(g["G_true"].astype(float) + dx, g[ycol].astype(float), ls,
                     color=colors.get(samp, "#777777"), marker="o", ms=5.5, lw=1.8,
                     alpha=0.95, markeredgecolor="white", markeredgewidth=0.8, zorder=3)
         ax.set_title(f"{stat}, {plat.upper()}", fontsize=10)
