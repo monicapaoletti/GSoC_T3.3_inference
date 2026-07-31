@@ -24,11 +24,43 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # columns we try to read from the run-row benchmark CSVs (missing ones are tolerated)
-_COLS = ["sampler", "framework", "platform", "which_stat", "G_true", "n_chains",
+_COLS = ["sampler", "sampler_raw", "framework", "platform", "which_stat", "G_true", "n_chains",
          "n_particles", "runtime_sec", "max_r_hat", "min_ess_bulk",
          "min_ess_bulk_per_sec", "rmse_param_mean", "mean_accept", "coverage_94hdi"]
 
 COLORS = {"gpu": "#295785", "cpu": "#B5651D"}
+
+
+# mpr_jax_pymc.py records the sampler as a DISPLAY string (one even contains LaTeX),
+# and writes neither `platform` nor `framework`. mpr_jax_numpyro.py records canonical
+# slugs plus both fields. Without reconciling them the pymc cells cannot join the JAX
+# cells at all -- "Slice Sampler" and "slice" are the same algorithm -- and every
+# pymc row silently drops out of any platform-split table or figure.
+_SAMPLER_ALIASES = {
+    "Metropolis": "rwmh",
+    "DEMetropolis": "demc",
+    "DE MetropolisZ": "demcz",
+    "Slice Sampler": "slice",
+    "SMC with Likelihood": "smc_lik",
+    r"SMC, $\epsilon$ = 10": "smc_abc",
+}
+
+
+def _normalize_provenance(df):
+    """Canonicalise sampler names and backfill platform/framework across frameworks."""
+    if "sampler" in df:
+        df["sampler_raw"] = df["sampler"]
+        df["sampler"] = df["sampler"].replace(_SAMPLER_ALIASES)
+    # every pymc cell in this project ran on the ulysses CPU cluster; the JAX cells
+    # always write their own platform, so a missing value identifies pymc unambiguously.
+    if "framework" not in df:
+        df["framework"] = np.nan
+    if "platform" not in df:
+        df["platform"] = np.nan
+    is_pymc = df["framework"].isna()
+    df.loc[is_pymc, "framework"] = "pymc"
+    df.loc[is_pymc & df["platform"].isna(), "platform"] = "cpu"
+    return df
 
 
 def load_master(results_dirs):
@@ -50,6 +82,7 @@ def load_master(results_dirs):
     if not rows:
         raise SystemExit("no benchmark_*.csv found under: " + ", ".join(results_dirs))
     df = pd.DataFrame(rows)
+    df = _normalize_provenance(df)
     # tidy: unified batch column (particles for SMC, chains otherwise), abs error
     df["batch"] = df.get("n_particles").fillna(df.get("n_chains")) \
         if "n_particles" in df and "n_chains" in df else df.get("n_particles", df.get("n_chains"))
