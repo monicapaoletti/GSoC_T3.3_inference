@@ -66,11 +66,20 @@ def main():
         sweep, fixed = "G", f"$\\eta$={args.eta[0]}"
         rows = [(g, args.eta[0], f"G={g}") for g in args.G]
 
+    # Layout and styling follow the mpr_jax.ipynb `plot_fc_fcd` cell this script is the
+    # standalone version of: traces stacked on the LEFT (firing rate above BOLD), FC and
+    # FCD as square matrices on the RIGHT, 'hot' colormap, FC on [-0.5, 1] and FCD on
+    # [0, 1], every region drawn at lw=0.1, and time in SECONDS (the model integrates in
+    # ms, so the axis is divided by 1000).
     nrow = len(rows)
-    fig, axes = plt.subplots(nrow, 4, figsize=(16, 3.4 * nrow),
-                             gridspec_kw={"width_ratios": [2.2, 2.2, 1, 1]})
-    axes = np.atleast_2d(axes)
-    fig.suptitle(f"MPR dynamics: sweep {sweep} ({fixed} fixed), t_end={args.t_end}", y=1.0)
+    step = 10                     # decimate traces for a legible line density
+    fig = plt.figure(figsize=(13, 2.35 * nrow))
+    # hspace is generous because each row's "G=" title sits directly under the previous
+    # row's "Time (s)" label and they collide at tighter spacing.
+    gs = fig.add_gridspec(2 * nrow, 5, width_ratios=[1, 1, 1, 1.05, 1.05],
+                          hspace=0.75, wspace=0.5)
+    fig.suptitle(f"MPR dynamics: sweep {sweep} ({fixed} fixed), "
+                 f"$t_{{end}}={args.t_end/1000:g}\\,\\mathrm{{s}}$", y=1.0)
 
     for row, (G, eta, rlabel) in enumerate(rows):
         r, rv_t, bold, bold_t = simulate(G, eta, args.t_end)
@@ -83,26 +92,50 @@ def main():
         FCD, _, _ = extract_FCD(b.T, wwidth=30, maxNwindows=200, olap=0.94, mode="corr")
         FCD = np.asarray(FCD)
 
-        ax = axes[row, 0]                                    # firing rate
-        ax.plot(rv_t, r[:, :min(5, r.shape[1])], lw=0.5)
-        ax.set_ylabel(f"{rlabel}\nr(t)"); ax.set_xlabel("time")
-        if row == 0: ax.set_title("firing rate (5 regions)")
+        # Firing rate and BOLD are the SAME run -- BOLD is simply subsampled -- so they
+        # must span the same window and end together.
+        #
+        # They do not, as returned: mpr_jax.py builds rv_t as arange(n)*(rv_decimate*dt*10)
+        # but bold_t as linspace(0, t_end, n)*10, applying the x10 to a per-sample
+        # increment in one case and to a total duration in the other. Measured on one run,
+        # rv_t spans 0..30000 while bold_t spans 0..267000 -- a factor of ~10. rv_t is the
+        # correct one (t_end=300000 -> 300 s); bold_t carries a spurious extra decade. So
+        # the BOLD axis is rebuilt from the firing-rate span rather than trusted. The
+        # notebook never hit this because its two panels are independent and autoscale.
+        t_s = np.asarray(rv_t)[::step] / 1000.0          # seconds
+        T = float(t_s[-1])
+        b_x = np.linspace(0.0, T, bold.shape[0])         # same window, subsampled
 
-        ax = axes[row, 1]                                    # BOLD
-        ax.plot(bold_t, bold[:, :min(5, bold.shape[1])], lw=0.6)
-        ax.set_ylabel("BOLD"); ax.set_xlabel("time")
-        if row == 0: ax.set_title("BOLD (5 regions)")
+        ax1 = fig.add_subplot(gs[2 * row, 0:3])
+        ax1.plot(t_s, r[::step, :], lw=0.1)
+        ax1.set_ylabel("r")
+        ax1.set_title(rlabel, fontsize=13, loc="left")
+        ax1.set_xlim(0, T)
+        ax1.set_xticklabels([])
+        for s in ("top", "right"):
+            ax1.spines[s].set_visible(False)
 
-        ax = axes[row, 2]                                    # FC
-        im = ax.imshow(FC, vmin=-1, vmax=1, cmap="jet"); ax.set_xticks([]); ax.set_yticks([])
-        if row == 0: ax.set_title("FC")
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        ax2 = fig.add_subplot(gs[2 * row + 1, 0:3])
+        ax2.plot(b_x, bold, lw=0.1)
+        ax2.set_ylabel("BOLD")
+        ax2.set_xlabel("Time (s)")
+        ax2.set_xlim(0, T)
+        for s in ("top", "right"):
+            ax2.spines[s].set_visible(False)
 
-        ax = axes[row, 3]                                    # FCD
-        im = ax.imshow(FCD, vmin=0, vmax=1, cmap="jet"); ax.set_xticks([]); ax.set_yticks([])
-        if row == 0: ax.set_title("FCD")
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        print(f"G={G} eta={eta}: r{r.shape} bold{bold.shape} FC{FC.shape} FCD{FCD.shape}")
+        # --- right: FC and FCD, square, notebook colormap and limits ---
+        ax3 = fig.add_subplot(gs[2 * row:2 * row + 2, 3])
+        im1 = ax3.imshow(FC, vmin=-0.5, vmax=1, cmap="hot")
+        ax3.set_title("FC"); ax3.set_xticks([]); ax3.set_yticks([])
+        fig.colorbar(im1, ax=ax3, fraction=0.046, pad=0.04)
+
+        ax4 = fig.add_subplot(gs[2 * row:2 * row + 2, 4])
+        im2 = ax4.imshow(FCD, vmin=0, vmax=1, cmap="hot")
+        ax4.set_title("FCD"); ax4.set_xticks([]); ax4.set_yticks([])
+        fig.colorbar(im2, ax=ax4, fraction=0.046, pad=0.04)
+
+        print(f"G={G} eta={eta}: r{r.shape} bold{bold.shape} "
+              f"FC{FC.shape} FCD{FCD.shape} ({r.shape[1]} regions plotted)")
 
     fig.tight_layout()
     f = os.path.join(out, f"model_dynamics_sweep{sweep}_tend{args.t_end}.png")
