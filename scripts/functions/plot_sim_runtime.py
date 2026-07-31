@@ -58,10 +58,8 @@ def main():
     ax.set_xscale("log"); ax.set_yscale("log")
     ax.set_xlabel("Number of simulations")
     ax.set_ylabel("Running time (s)")
-    # thin-space the thousands separator INSIDE the math only -- replacing on the whole
-    # title also hits the comma after "cost" and leaves a literal backslash-comma.
-    tend = f"{args.t_end:,}".replace(",", r"\,")
-    ax.set_title(f"MPR simulation cost, $t_{{end}}={tend}$")
+    # No in-figure title: the manuscript captions carry it (as a bold lead-in), so a
+    # title inside the image duplicates the caption and wastes vertical space.
     ax.grid(True, which="both", ls="--", alpha=0.3, zorder=0)
     for s in ("top", "right"):
         ax.spines[s].set_visible(False)

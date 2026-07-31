@@ -327,7 +327,6 @@ def fig_recovery_vs_G(df, out_png):
            for s in SAMPLER_ORDER if (d["sampler"] == s).any()]
     fig.legend(handles=alg, frameon=False, fontsize=9, ncol=len(alg),
                loc="lower center", bbox_to_anchor=(0.5, -0.02))
-    fig.suptitle("Posterior recovery across regimes", y=1.0)
     fig.tight_layout()
     fig.savefig(out_png, dpi=300, bbox_inches="tight"); plt.close(fig)
     print(f"wrote {out_png}")
@@ -345,7 +344,6 @@ def fig_throughput(df, out_png):
                    color=COLORS.get(plat, "#444"), label=plat, alpha=0.7)
     ax.set_xscale("log", base=2); ax.set_yscale("log")
     ax.set_xlabel("batch (particles / chains)"); ax.set_ylabel("ESS / sec")
-    ax.set_title("Throughput vs batch, GPU vs CPU")
     ax.grid(True, which="both", ls=":", alpha=0.4); ax.legend(frameon=False)
     fig.tight_layout(); fig.savefig(out_png, dpi=300); plt.close(fig)
     print(f"wrote {out_png}")

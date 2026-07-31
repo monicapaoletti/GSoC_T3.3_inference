@@ -135,7 +135,6 @@ def main():
     axes[0].add_artist(l1)
     axes[-1].legend(handles=plat, frameon=False, fontsize=9, loc="lower right",
                     title="backend", alignment="left")
-    fig.suptitle("Sampling throughput vs on-device batch width", y=1.0)
     fig.tight_layout()
 
     for d_ in args.out:

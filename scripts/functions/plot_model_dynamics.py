@@ -80,8 +80,9 @@ def main():
     # FC and FCD -- which is what it does.
     gs = fig.add_gridspec(2 * nrow, 6, width_ratios=[0.13, 1, 1, 1, 1.05, 1.05],
                           hspace=0.45, wspace=0.5)
-    fig.suptitle(f"MPR dynamics: sweep {sweep} ({fixed} fixed), "
-                 f"$t_{{end}}={args.t_end/1000:g}\\,\\mathrm{{s}}$", y=0.995)
+    # No suptitle: the manuscript gives every figure a caption, so a title inside the
+    # image duplicates it and eats vertical space. The swept value is on each row and
+    # the fixed one belongs in the caption.
 
     for row, (G, eta, rlabel) in enumerate(rows):
         r, rv_t, bold, bold_t = simulate(G, eta, args.t_end)
@@ -146,7 +147,7 @@ def main():
         print(f"G={G} eta={eta}: r{r.shape} bold{bold.shape} "
               f"FC{FC.shape} FCD{FCD.shape} ({r.shape[1]} regions plotted)")
 
-    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    fig.tight_layout()
     f = os.path.join(out, f"model_dynamics_sweep{sweep}_tend{args.t_end}.png")
     fig.savefig(f, dpi=300, bbox_inches="tight"); plt.close(fig)
     print(f"wrote {f}")

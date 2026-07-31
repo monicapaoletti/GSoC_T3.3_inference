@@ -289,7 +289,16 @@ def integrate_fast_noise_remat(
     # --- assemble recorded outputs ---
     if record_rv and rv_stack is not None:
         rv_d = rv_stack[:n_rv]
-        rv_t = jnp.arange(n_rv, dtype=jnp.float32) * (rv_decimate * dt * 10.0)
+        # Time axes are derived from t_end and the recorded LENGTH, not rebuilt from the
+        # decimation constants. The constants disagree with the arrays actually returned
+        # (measured at t_end=30000: n_rv=30000 and n_bold=90, i.e. 333 rv-samples per
+        # BOLD sample, while bold_decimate is 3000), which put r and BOLD on scales
+        # differing by ~10x for the SAME run. Both series cover the same simulated
+        # window -- BOLD is only subsampled -- so anchoring both to t_end makes that
+        # true by construction and immune to the decimation bookkeeping.
+        # P.t_end is stored in the model's internal 10 ms tick, so the x10 converts the
+        # endpoint to MILLISECONDS, preserving the scale rv_t had before this change.
+        rv_t = jnp.linspace(0.0, P.t_end * 10.0, n_rv, endpoint=False, dtype=jnp.float32)
     else:
         rv_d = jnp.zeros((1, 2 * nn), dtype=jnp.float32)
         rv_t = jnp.zeros((1,), dtype=jnp.float32)
@@ -298,7 +307,7 @@ def integrate_fast_noise_remat(
         vv_d = vv_stack[::bold_stride][:n_bold]
         qq_d = qq_stack[::bold_stride][:n_bold]
         bold_d = vo * (k1 * (1 - qq_d) + k2 * (1 - qq_d / vv_d) + k3 * (1 - vv_d))
-        bold_t = jnp.linspace(0, P.t_end - dt * bold_decimate, len(bold_d)) * 10.0
+        bold_t = jnp.linspace(0.0, P.t_end * 10.0, len(bold_d), endpoint=False, dtype=jnp.float32)
     else:
         bold_d = jnp.zeros((1,), dtype=jnp.float32)
         bold_t = jnp.zeros((1,), dtype=jnp.float32)
@@ -603,13 +612,15 @@ class MPR_sde:
         # ------------------ stitch blocks ------------------
         if record_rv:
             rv = jnp.concatenate([jnp.concatenate(rb, axis=0) for rb in rv_blocks], axis=0)
-            rv_t = jnp.arange(rv.shape[0]) * (dt * rv_decimate) * 10.0
+            rv_t = jnp.linspace(0.0, P.t_end * 10.0, rv.shape[0], endpoint=False, dtype=jnp.float32)
         else:
             rv = None
             rv_t = None
 
         bold = jnp.concatenate([jnp.concatenate(bb, axis=0) for bb in bold_blocks], axis=0)
-        bold_t = jnp.arange(bold.shape[0]) * (dt * rv_decimate * bold_decimate) * 10.0 if P.RECORD_BOLD else None
+        # Same anchoring as the non-chunked path: both axes span t_end by construction.
+        bold_t = (jnp.linspace(0.0, P.t_end * 10.0, bold.shape[0], endpoint=False, dtype=jnp.float32)
+                  if P.RECORD_BOLD else None)
 
         result = {
             "rv_d": rv,

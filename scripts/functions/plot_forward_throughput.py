@@ -70,8 +70,6 @@ def main():
 
     ax.set_xlabel("batch size  (G-values evaluated together via vmap)")
     ax.set_ylabel("throughput  (forward evals / s)")
-    ax.set_title("MPR forward-model throughput: GPU batching vs CPU\n"
-                 "(10-node FC; flat GPU wall-time -> ~linear throughput)")
     ax.grid(True, which="both", ls=":", alpha=0.4)
     ax.legend(frameon=False)
     fig.tight_layout()
