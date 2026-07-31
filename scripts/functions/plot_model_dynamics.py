@@ -74,12 +74,14 @@ def main():
     nrow = len(rows)
     step = 10                     # decimate traces for a legible line density
     fig = plt.figure(figsize=(13, 2.35 * nrow))
-    # hspace is generous because each row's "G=" title sits directly under the previous
-    # row's "Time (s)" label and they collide at tighter spacing.
-    gs = fig.add_gridspec(2 * nrow, 5, width_ratios=[1, 1, 1, 1.05, 1.05],
-                          hspace=0.75, wspace=0.5)
+    # Column 0 is a narrow strip carrying the row label (the swept value). Putting it
+    # there rather than as a title over the traces stops it colliding with the previous
+    # row's "Time (s)" label, and makes it read as labelling the WHOLE row -- traces,
+    # FC and FCD -- which is what it does.
+    gs = fig.add_gridspec(2 * nrow, 6, width_ratios=[0.13, 1, 1, 1, 1.05, 1.05],
+                          hspace=0.45, wspace=0.5)
     fig.suptitle(f"MPR dynamics: sweep {sweep} ({fixed} fixed), "
-                 f"$t_{{end}}={args.t_end/1000:g}\\,\\mathrm{{s}}$", y=1.0)
+                 f"$t_{{end}}={args.t_end/1000:g}\\,\\mathrm{{s}}$", y=0.995)
 
     for row, (G, eta, rlabel) in enumerate(rows):
         r, rv_t, bold, bold_t = simulate(G, eta, args.t_end)
@@ -106,30 +108,37 @@ def main():
         T = float(t_s[-1])
         b_x = np.linspace(0.0, T, bold.shape[0])         # same window, subsampled
 
-        ax1 = fig.add_subplot(gs[2 * row, 0:3])
+        ax0 = fig.add_subplot(gs[2 * row:2 * row + 2, 0])
+        ax0.axis("off")
+        ax0.text(0.5, 0.5, rlabel, rotation=90, ha="center", va="center", fontsize=14)
+
+        ax1 = fig.add_subplot(gs[2 * row, 1:4])
         ax1.plot(t_s, r[::step, :], lw=0.1)
         ax1.set_ylabel("r")
-        ax1.set_title(rlabel, fontsize=13, loc="left")
         ax1.set_xlim(0, T)
         ax1.set_xticklabels([])
         for s in ("top", "right"):
             ax1.spines[s].set_visible(False)
 
-        ax2 = fig.add_subplot(gs[2 * row + 1, 0:3])
+        ax2 = fig.add_subplot(gs[2 * row + 1, 1:4])
         ax2.plot(b_x, bold, lw=0.1)
         ax2.set_ylabel("BOLD")
-        ax2.set_xlabel("Time (s)")
+        # Only the bottom row carries the axis label: every row shares the same axis, so
+        # repeating it is noise, and at tight row spacing it collides with the next row's
+        # firing-rate panel. Tick numbers stay on every row.
+        if row == nrow - 1:
+            ax2.set_xlabel("Time (s)")
         ax2.set_xlim(0, T)
         for s in ("top", "right"):
             ax2.spines[s].set_visible(False)
 
         # --- right: FC and FCD, square, notebook colormap and limits ---
-        ax3 = fig.add_subplot(gs[2 * row:2 * row + 2, 3])
+        ax3 = fig.add_subplot(gs[2 * row:2 * row + 2, 4])
         im1 = ax3.imshow(FC, vmin=-0.5, vmax=1, cmap="hot")
         ax3.set_title("FC"); ax3.set_xticks([]); ax3.set_yticks([])
         fig.colorbar(im1, ax=ax3, fraction=0.046, pad=0.04)
 
-        ax4 = fig.add_subplot(gs[2 * row:2 * row + 2, 4])
+        ax4 = fig.add_subplot(gs[2 * row:2 * row + 2, 5])
         im2 = ax4.imshow(FCD, vmin=0, vmax=1, cmap="hot")
         ax4.set_title("FCD"); ax4.set_xticks([]); ax4.set_yticks([])
         fig.colorbar(im2, ax=ax4, fraction=0.046, pad=0.04)
@@ -137,9 +146,9 @@ def main():
         print(f"G={G} eta={eta}: r{r.shape} bold{bold.shape} "
               f"FC{FC.shape} FCD{FCD.shape} ({r.shape[1]} regions plotted)")
 
-    fig.tight_layout()
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
     f = os.path.join(out, f"model_dynamics_sweep{sweep}_tend{args.t_end}.png")
-    fig.savefig(f, dpi=200); plt.close(fig)
+    fig.savefig(f, dpi=300, bbox_inches="tight"); plt.close(fig)
     print(f"wrote {f}")
 
 
