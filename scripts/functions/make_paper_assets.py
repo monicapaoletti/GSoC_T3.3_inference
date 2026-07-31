@@ -24,7 +24,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # columns we try to read from the run-row benchmark CSVs (missing ones are tolerated)
-_COLS = ["sampler", "sampler_raw", "framework", "platform", "which_stat", "G_true", "n_chains",
+_COLS = ["sampler", "sampler_raw", "framework", "platform", "which_stat", "G_true",
+         "G_hat", "G_sd", "G_lo", "G_hi", "n_chains",
          "n_particles", "runtime_sec", "max_r_hat", "min_ess_bulk",
          "min_ess_bulk_per_sec", "rmse_param_mean", "mean_accept", "coverage_94hdi"]
 
@@ -83,6 +84,23 @@ def load_master(results_dirs):
             continue
         r = d.iloc[0].to_dict()
         r["_file"] = os.path.basename(f)
+        # The run also writes summary_<TAG>.csv beside benchmark_<TAG>.csv, holding the
+        # ArviZ summary. The benchmark row records only rmse_param_mean = |Ghat - G*|,
+        # which is unsigned -- so the posterior mean itself has to come from here if we
+        # want to show recovery against the identity rather than an absolute error.
+        sm = os.path.join(os.path.dirname(f),
+                          os.path.basename(f).replace("benchmark_", "summary_", 1))
+        if os.path.exists(sm):
+            try:
+                s = pd.read_csv(sm)
+                s = s[s["parameter"].astype(str) == "G"] if "parameter" in s else s
+                if not s.empty:
+                    r["G_hat"] = float(s.iloc[0].get("mean", np.nan))
+                    r["G_sd"] = float(s.iloc[0].get("sd", np.nan))
+                    r["G_lo"] = float(s.iloc[0].get("hdi_3%", np.nan))
+                    r["G_hi"] = float(s.iloc[0].get("hdi_97%", np.nan))
+            except Exception:
+                pass
         rows.append(r)
     if not rows:
         raise SystemExit("no benchmark_*.csv found under: " + ", ".join(results_dirs))
@@ -224,7 +242,12 @@ def fig_recovery_vs_G(df, out_png):
     i.e. exactly backwards. Colour now follows the entity; the four variants of one
     algorithm are separated by dash pattern, with the headline case (FCD on GPU) solid.
     """
-    d = df.dropna(subset=["G_true", "abs_err"])
+    # Plot the ESTIMATE against the truth, not the absolute error. |Ghat - G*| = 0.1 is
+    # unreadable on its own -- it is 50% of G*=0.2 but 14% of G*=0.7 -- whereas distance
+    # from the identity line is directly interpretable, and the sign shows whether a
+    # sampler over- or under-estimates the coupling.
+    ycol = "G_hat" if ("G_hat" in df and df["G_hat"].notna().any()) else "abs_err"
+    d = df.dropna(subset=["G_true", ycol])
     if d.empty:
         print("(recovery figure skipped: no data)"); return
 
@@ -247,8 +270,12 @@ def fig_recovery_vs_G(df, out_png):
                              sharex=True, sharey=True)
     axes = np.atleast_1d(axes).ravel()
 
+    gs = sorted(d["G_true"].dropna().astype(float).unique())
+    lim = (min(gs) - 0.08, max(gs) + 0.12)
     for ax, (stat, plat) in zip(axes, combos):
         ls = STYLES[(stat, plat)]
+        # identity: perfect recovery. Distance from it IS the error, to scale.
+        ax.plot(lim, lim, "-", color="#999999", lw=1.2, zorder=1)
         for samp in SAMPLER_ORDER:
             g = d[(d["sampler"] == samp) & (d["which_stat"] == stat)
                   & (d["platform"] == plat)]
@@ -256,21 +283,24 @@ def fig_recovery_vs_G(df, out_png):
                 continue
             # one point per G: the widest batch available for that cell
             g = g.sort_values("batch").groupby("G_true").tail(1).sort_values("G_true")
-            ax.plot(g["G_true"].astype(float), g["abs_err"].astype(float), ls,
+            ax.plot(g["G_true"].astype(float), g[ycol].astype(float), ls,
                     color=colors.get(samp, "#777777"), marker="o", ms=5.5, lw=1.8,
-                    alpha=0.95, markeredgecolor="white", markeredgewidth=0.8)
-        ax.set_yscale("log")
+                    alpha=0.95, markeredgecolor="white", markeredgewidth=0.8, zorder=3)
         ax.set_title(f"{stat}, {plat.upper()}", fontsize=10)
+        ax.set_xlim(*lim); ax.set_ylim(*lim)
+        ax.set_xticks(gs); ax.set_yticks(gs)
+        ax.set_aspect("equal", adjustable="box")
         ax.grid(True, ls=":", alpha=0.4)
         for s in ("top", "right"):
             ax.spines[s].set_visible(False)
     for ax in axes[len(combos):]:
         ax.set_visible(False)
 
+    ylab = r"posterior mean $\hat G$" if ycol == "G_hat" else r"$|\hat G - G^\star|$"
     for ax in axes[len(combos) - ncol:len(combos)]:
         ax.set_xlabel(r"true $G^\star$")
     for i in range(0, len(combos), ncol):
-        axes[i].set_ylabel(r"$|\hat G - G^\star|$")
+        axes[i].set_ylabel(ylab)
 
     from matplotlib.lines import Line2D
     alg = [Line2D([], [], color=colors[s], lw=2, marker="o", ms=5, label=s)
