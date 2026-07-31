@@ -84,8 +84,17 @@ def load_master(results_dirs):
     df = pd.DataFrame(rows)
     df = _normalize_provenance(df)
     # tidy: unified batch column (particles for SMC, chains otherwise), abs error
-    df["batch"] = df.get("n_particles").fillna(df.get("n_chains")) \
-        if "n_particles" in df and "n_chains" in df else df.get("n_particles", df.get("n_chains"))
+    # The batched axis is n_particles for SMC and n_chains for MCMC. It must be chosen
+    # BY SAMPLER FAMILY, not by "whichever is non-null": --n_particles has a default of
+    # 1000 that MCMC runs never use but still record, so a fillna() picks 1000 for every
+    # MCMC cell and silently collapses all four chain counts (64/256/1024/4096) onto a
+    # single x value.
+    if "n_particles" in df or "n_chains" in df:
+        npart = df["n_particles"] if "n_particles" in df else np.nan
+        nchain = df["n_chains"] if "n_chains" in df else np.nan
+        is_smc = df.get("sampler", pd.Series("", index=df.index)).astype(str).str.startswith("smc")
+        df["batch"] = np.where(is_smc, npart, nchain)
+        df["batch"] = pd.to_numeric(df["batch"], errors="coerce")
     df["abs_err"] = df.get("rmse_param_mean")
     df["ess_per_sec"] = df.get("min_ess_bulk_per_sec")
     keep = [c for c in _COLS + ["batch", "abs_err", "ess_per_sec", "_file"] if c in df]
