@@ -141,6 +141,17 @@ def parse_args():
                              "Pass --no-fcd_stride1 to revert to the prior overlap windowing.")
     parser.add_argument("--fc_eps", type=float, default=0.0,
                         help="Stabilise FC/FCD correlation denominator (e.g. 1e-6) to keep gradients finite.")
+    parser.add_argument("--fcd_band", type=int, default=0,
+                        help="Keep only FCD lags in [k, k+FCD_BAND) instead of every lag >= k "
+                             "(k=30). The default k=30 cut is NOT scale-invariant: at 51 windows "
+                             "it keeps ~18%% of the FCD matrix, at 861 windows ~93%%, so FCD "
+                             "features are not the same statistic across t_end. Banding fixes the "
+                             "lag range in physical time so long-t_end runs stay comparable. "
+                             "0 (default) = old behaviour, every lag >= k.")
+    parser.add_argument("--save_draws", action="store_true",
+                        help="Save the posterior draws of each parameter to draws_<TAG>.npz. "
+                             "The run otherwise persists only the ArviZ SUMMARY, which is not "
+                             "enough for rank-based diagnostics such as SBC.")
     # --- likelihood feature scaling (mirror of mpr_jax_pymc.py) ---
     parser.add_argument("--fisher_z", action=argparse.BooleanOptionalAction, default=True,
                         help="arctanh (Fisher z) on correlation features: variance-stabilizes and "
@@ -180,9 +191,32 @@ def _fisher_z(v, eps=1e-4):
     mpr_jax_pymc._fisher_z. Applied inside the forward so the FD gradient sees it."""
     return jnp.arctanh(jnp.clip(v, -1.0 + eps, 1.0 - eps))
 
+
+def _fcd_indices(n_win, k=30, band=0):
+    """Indices of the FCD entries used as features.
+
+    band=0 reproduces the original `triu_indices(n_win, k=30)`: every lag >= k. That
+    cut is not scale-invariant -- the number of windows grows with t_end, so the SAME
+    k keeps ~18% of the matrix at 51 windows but ~93% at 861. Two runs at different
+    t_end then compare different statistics.
+
+    band>0 keeps only lags in [k, k+band), i.e. a diagonal strip, which fixes the lag
+    range in physical time and makes long-t_end FCD comparable to short-t_end FCD.
+    """
+    # Built with NUMPY, not jnp: n_win comes from a static array shape, so these are
+    # compile-time constants. Selecting with a jnp boolean mask instead raises
+    # NonConcreteBooleanIndexError the moment the forward is traced/jitted.
+    if band <= 0:
+        rows, cols = np.triu_indices(n_win, k=k)
+    else:
+        rows, cols = np.triu_indices(n_win, k=k)
+        keep = (cols - rows) < (k + band)
+        rows, cols = rows[keep], cols[keep]
+    return jnp.asarray(rows), jnp.asarray(cols)
+
 @timer
 def wrapper_fc(G, par, cut, tr, starts, nn, grad_horizon=0, fast_bold=False, eps=0.0,
-               fisher_z=False, keep_negative=False):
+               fisher_z=False, keep_negative=False, fcd_band=0):   # fcd_band unused (no windows)
     par = deepcopy(par)
     par["G"] = G
     sde = mpr_jax.MPR_sde.create(par)
@@ -197,7 +231,7 @@ def wrapper_fc(G, par, cut, tr, starts, nn, grad_horizon=0, fast_bold=False, eps
 
 @timer
 def wrapper_fcd(G, par, cut, tr, starts, nn, grad_horizon=0, fast_bold=False, eps=0.0,
-                fisher_z=False, keep_negative=False):
+                fisher_z=False, keep_negative=False, fcd_band=0):
     par = deepcopy(par)
     par["G"] = G
     sde = mpr_jax.MPR_sde.create(par)
@@ -210,7 +244,7 @@ def wrapper_fcd(G, par, cut, tr, starts, nn, grad_horizon=0, fast_bold=False, ep
     # this lets eps be a concrete float for the stabilised correlation)
     FCD_full = extract_FCD_jax(bold_d_sub, starts, nn, wwidth=30, olap=0.94, eps=eps, keep_negative=keep_negative)
     #print(FCD_full)
-    tri_idx = jnp.triu_indices(FCD_full.shape[0], k=30)
+    tri_idx = _fcd_indices(FCD_full.shape[0], k=30, band=fcd_band)
     v = FCD_full[tri_idx]
     return _fisher_z(v) if fisher_z else v
 
@@ -237,7 +271,7 @@ def feature_reference_scatter(par, which_stat, cut, tr, starts, nn,
 
 
 # ------------------ Forward model (shared by NumPyro NUTS + BlackJAX) ------------------
-def make_forward_fn(par, which_stat, cut, tr, starts, nn, grad_horizon=0,
+def make_forward_fn(par, which_stat, cut, tr, starts, nn, grad_horizon=0, fcd_band=0,
                     fast_bold=False, eps=0.0, grad_method="fd", fd_h=1e-2,
                     fisher_z=False, keep_negative=False):
     """Return forward_fn(G) -> flat FC/FCD statistic, matching wrapper_fc/fcd.
@@ -259,7 +293,7 @@ def make_forward_fn(par, which_stat, cut, tr, starts, nn, grad_horizon=0,
         else:
             sub = bold[cut::tr].T
             F = extract_FCD_jax(sub, starts, nn, wwidth=30, olap=0.94, eps=eps, keep_negative=keep_negative)
-            v = F[jnp.triu_indices(F.shape[0], k=30)]
+            v = F[_fcd_indices(F.shape[0], k=30, band=fcd_band)]
         return _fisher_z(v) if fisher_z else v
 
     if grad_method == "autodiff":
@@ -472,11 +506,13 @@ def main():
     # grad_horizon is irrelevant here (no gradient) so we leave it at 0.
     FC_obs_flat = wrapper(G=G, par=params, cut=cut, tr=tr, starts=starts, nn=nn,
                           grad_horizon=0, fast_bold=args.fast_bold, eps=args.fc_eps,
-                          fisher_z=args.fisher_z, keep_negative=args.keep_negative_fc)
+                          fisher_z=args.fisher_z, keep_negative=args.keep_negative_fc,
+                          fcd_band=args.fcd_band)
     # Single config-baked forward used by the model (custom_vjp FD gradient by
     # default so NUTS/BlackJAX get the reliable finite-difference gradient).
     forward_fn = make_forward_fn(params, which_stat, cut, tr, starts, nn,
-                                 grad_horizon=args.grad_horizon, fast_bold=args.fast_bold,
+                                 grad_horizon=args.grad_horizon, fcd_band=args.fcd_band,
+                                 fast_bold=args.fast_bold,
                                  eps=args.fc_eps, grad_method=args.grad_method, fd_h=args.fd_h,
                                  fisher_z=args.fisher_z, keep_negative=args.keep_negative_fc)
 
@@ -787,6 +823,19 @@ def main():
     #az.to_netcdf(posterior_samples, fname_netcdf)
 
     chains_pooled = posterior_samples.posterior["G"].values.reshape(1, -1)
+
+    # Only the ArviZ SUMMARY is persisted by default, which cannot support rank-based
+    # diagnostics (SBC needs the rank of the true value among the draws). Save the raw
+    # draws compactly on request -- .npz of float32, not the full netcdf trace.
+    if args.save_draws:
+        fname_draws = os.path.join(resultspath, f"draws_{tag}.npz")
+        np.savez_compressed(
+            fname_draws,
+            G=np.asarray(posterior_samples.posterior["G"].values, dtype=np.float32),
+            G_true=np.float32(theta_true[0]),
+            seed=np.int64(seed),
+        )
+        print(f"saved posterior draws -> {fname_draws}")
     try:  # plotting is non-essential; never let it crash the run before benchmarks save
         plot_posterior_pooled(["G"], theta_true, prior_predictions, chains_pooled, "Pooled Posteriors", savepath=fname_posteriors)
     except Exception as _e:
@@ -795,7 +844,8 @@ def main():
     # --- comprehensive benchmark metrics (same schema/file as mpr_jax_pymc.py) ---
     try:
         fwd_eval = make_forward_fn(params, which_stat, cut, tr, starts, nn,
-                                   grad_horizon=0, fast_bold=args.fast_bold,
+                                   grad_horizon=0, fcd_band=args.fcd_band,
+                                   fast_bold=args.fast_bold,
                                    eps=args.fc_eps, grad_method="autodiff")
         obs_np = np.asarray(FC_obs_flat)
         Gmean = float(np.mean(posterior_samples.posterior["G"].values))
