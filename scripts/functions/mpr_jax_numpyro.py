@@ -153,6 +153,18 @@ def parse_args():
                              "features are not the same statistic across t_end. Banding fixes the "
                              "lag range in physical time so long-t_end runs stay comparable. "
                              "0 (default) = old behaviour, every lag >= k.")
+    parser.add_argument("--infer_eta", action="store_true",
+                        help="Infer the MPR excitability eta jointly with G (2-D "
+                             "posterior) instead of holding it at its default -4.6. "
+                             "eta is NEGATIVE but the samplers work in z=log(theta) and "
+                             "need positive support, so what is actually sampled is the "
+                             "MAGNITUDE eta_mag = -eta > 0; results are reported as "
+                             "eta_mag. Supported for smc_lik/smc_abc/demc only -- slice "
+                             "and the gradient-based samplers are still scalar-only.")
+    parser.add_argument("--eta_prior_scale", type=float, default=0.5,
+                        help="sigma of the LogNormal(log 4.6, sigma) prior on eta_mag. "
+                             "LogNormal rather than HalfNormal: it is positive, centred "
+                             "on the default |eta|=4.6, and does not pile mass at 0.")
     parser.add_argument("--save_draws", action="store_true",
                         help="Save the posterior draws of each parameter to draws_<TAG>.npz. "
                              "The run otherwise persists only the ArviZ SUMMARY, which is not "
@@ -197,6 +209,20 @@ def _fisher_z(v, eps=1e-4):
     return jnp.arctanh(jnp.clip(v, -1.0 + eps, 1.0 - eps))
 
 
+def _apply_theta(par, theta):
+    """Write a parameter vector into the model dict.
+
+    theta is either a scalar G (1-D, the historical case) or [G, eta_mag]. eta is stored
+    NEGATED because the MPR excitability is negative (-4.6) while the samplers require
+    positive support; see --infer_eta.
+    """
+    t = jnp.atleast_1d(jnp.asarray(theta))
+    par["G"] = t[0]
+    if t.shape[0] > 1:
+        par["eta"] = -t[1] * jnp.ones_like(jnp.asarray(par["eta"]))
+    return par
+
+
 def _fcd_indices(n_win, k=30, band=0):
     """Indices of the FCD entries used as features.
 
@@ -223,7 +249,7 @@ def _fcd_indices(n_win, k=30, band=0):
 def wrapper_fc(G, par, cut, tr, starts, nn, grad_horizon=0, fast_bold=False, eps=0.0,
                fisher_z=False, keep_negative=False, fcd_band=0):   # fcd_band unused (no windows)
     par = deepcopy(par)
-    par["G"] = G
+    par = _apply_theta(par, G)
     sde = mpr_jax.MPR_sde.create(par)
     data = sde.run({}, record_rv=False, fast_bold=fast_bold, grad_horizon=grad_horizon)
     bold_d = data["bold_d"]
@@ -238,7 +264,7 @@ def wrapper_fc(G, par, cut, tr, starts, nn, grad_horizon=0, fast_bold=False, eps
 def wrapper_fcd(G, par, cut, tr, starts, nn, grad_horizon=0, fast_bold=False, eps=0.0,
                 fisher_z=False, keep_negative=False, fcd_band=0):
     par = deepcopy(par)
-    par["G"] = G
+    par = _apply_theta(par, G)
     sde = mpr_jax.MPR_sde.create(par)
     data = sde.run({}, record_rv=False, fast_bold=fast_bold, grad_horizon=grad_horizon)
     bold_d = data["bold_d"]
@@ -289,7 +315,7 @@ def make_forward_fn(par, which_stat, cut, tr, starts, nn, grad_horizon=0, fcd_ba
     base = dict(par)
 
     def raw(G):
-        p = dict(base); p["G"] = G
+        p = _apply_theta(dict(base), G)
         sde = mpr_jax.MPR_sde.create(p)
         bold = sde.run({}, record_rv=False, fast_bold=fast_bold, grad_horizon=grad_horizon)["bold_d"]
         if which_stat == "FC":
@@ -565,7 +591,20 @@ def main():
     plt.savefig(fname_prior_pred, dpi=300); plt.close()
 
     # --- inference ---
-    theta_true = np.array([params["G"]])
+    # eta is stored negative in the model; the sampled quantity is its magnitude.
+    ETA_MAG_DEFAULT = float(np.abs(np.asarray(params["eta"]).ravel()[0]))
+    if args.infer_eta:
+        theta_true = np.array([params["G"], ETA_MAG_DEFAULT])
+        var_names = ["G", "eta_mag"]
+    else:
+        theta_true = np.array([params["G"]])
+        var_names = ["G"]
+    if args.infer_eta and sampler not in ("smc_lik", "smc_abc", "demc"):
+        raise SystemExit(
+            f"--infer_eta is not supported for sampler '{sampler}'. Only smc_lik, "
+            "smc_abc and demc are generalised to a parameter axis; slice is univariate "
+            "by construction and the gradient-based samplers are still scalar-only. "
+            "Erroring rather than silently inferring G alone.")
     runtime = float("nan")
 
     rng_key, rng_key_run = jax.random.split(rng_key)
@@ -604,7 +643,7 @@ def main():
         plt.close()
 
         # --- summary CSV ---
-        az_summary = az.summary(mcmc, var_names=["G"]).reset_index().rename(columns={"index": "parameter"})
+        az_summary = az.summary(mcmc, var_names=var_names).reset_index().rename(columns={"index": "parameter"})
         az_summary["runtime_sec"] = runtime
         az_summary.to_csv(fname_summary_csv, index=False)
         print(f"Summary saved to {fname_summary_csv}")
@@ -655,7 +694,7 @@ def main():
         posterior_samples = az.from_dict(posterior=posterior, sample_stats=sample_stats)
         mcmc = posterior_samples
 
-        az_summary = az.summary(posterior_samples, var_names=["G"]).reset_index().rename(columns={"index": "parameter"})
+        az_summary = az.summary(posterior_samples, var_names=var_names).reset_index().rename(columns={"index": "parameter"})
         az_summary["runtime_sec"] = runtime
         az_summary.to_csv(fname_summary_csv, index=False)
         print(f"Summary saved to {fname_summary_csv}")
@@ -720,10 +759,22 @@ def main():
         fwd = data["forward_fn"]                 # config-baked forward (vmaps over G)
         obs = jnp.asarray(FC_obs_flat)
         scale_G = prior_specs["scale_G"]
-        logprior_fn = lambda G: dist.HalfNormal(scale_G).log_prob(G)
-
         rng_key, k_init, k_smc = jax.random.split(rng_key_run, 3)
-        init_particles = dist.HalfNormal(scale_G).sample(k_init, (args.n_particles,))
+        if args.infer_eta:
+            # theta = [G, eta_mag]. Independent priors, so the joint log-prior is the
+            # sum; both have positive support, which is what the log-space move needs.
+            _eta_prior = dist.LogNormal(float(np.log(ETA_MAG_DEFAULT)), args.eta_prior_scale)
+            def logprior_fn(theta):
+                return (dist.HalfNormal(scale_G).log_prob(theta[0])
+                        + _eta_prior.log_prob(theta[1]))
+            k_g, k_e = jax.random.split(k_init)
+            init_particles = jnp.stack([
+                dist.HalfNormal(scale_G).sample(k_g, (args.n_particles,)),
+                _eta_prior.sample(k_e, (args.n_particles,)),
+            ], axis=-1)                                   # (n_particles, 2)
+        else:
+            logprior_fn = lambda G: dist.HalfNormal(scale_G).log_prob(G)
+            init_particles = dist.HalfNormal(scale_G).sample(k_init, (args.n_particles,))
 
         if sampler == "smc_lik":
             # exact Normal-likelihood posterior (same target as NUTS/BlackJAX)
@@ -759,14 +810,22 @@ def main():
             jax.block_until_ready(parts)
             runtime = time.time() - start_time
 
-        parts_np = np.asarray(parts).reshape(1, -1)          # (chain=1, draw=N particles)
-        posterior_samples = az.from_dict(posterior={"G": parts_np})
+        _raw = np.asarray(parts)                             # (N,) or (N, D)
+        # Build the posterior from the RAW cloud. The old reshape(1, -1) flattens a
+        # (N, D) cloud into (1, N*D), which silently destroys the parameter axis and
+        # left every variable with a single draw.
+        if _raw.ndim == 1:
+            _post = {"G": _raw[None, :]}
+        else:
+            _post = {nm: _raw[None, :, j] for j, nm in enumerate(var_names)}
+        parts_np = _raw.reshape(1, -1) if _raw.ndim == 1 else _raw[None, :, 0]
+        posterior_samples = az.from_dict(posterior=_post)
         mcmc = posterior_samples
         print(f"SMC done in {runtime:.1f}s | posterior G mean={parts_np.mean():.4f} "
               f"sd={parts_np.std():.4f} | mean accept={float(np.mean(np.asarray(info['accept']))):.2f} "
               f"| final ESS={float(np.asarray(info['ess'])[-1]):.1f}")
 
-        az_summary = az.summary(posterior_samples, var_names=["G"]).reset_index().rename(columns={"index": "parameter"})
+        az_summary = az.summary(posterior_samples, var_names=var_names).reset_index().rename(columns={"index": "parameter"})
         az_summary["runtime_sec"] = runtime
         az_summary["n_particles"] = args.n_particles
         az_summary.to_csv(fname_summary_csv, index=False)
@@ -783,11 +842,25 @@ def main():
         fwd = data["forward_fn"]
         obs = jnp.asarray(FC_obs_flat)
         scale_G = prior_specs["scale_G"]
-        logprior_G = lambda G: dist.HalfNormal(scale_G).log_prob(G)
+        if args.infer_eta:
+            _eta_prior = dist.LogNormal(float(np.log(ETA_MAG_DEFAULT)), args.eta_prior_scale)
+            def logprior_G(theta):
+                return (dist.HalfNormal(scale_G).log_prob(theta[0])
+                        + _eta_prior.log_prob(theta[1]))
+        else:
+            logprior_G = lambda G: dist.HalfNormal(scale_G).log_prob(G)
         loglik_G = lambda G: jnp.sum(dist.Normal(fwd(G), obs_err).log_prob(obs))
 
         rng_key, k_init, k_run = jax.random.split(rng_key_run, 3)
-        init_G = dist.HalfNormal(scale_G).sample(k_init, (n_chains,))
+        if args.infer_eta:
+            k_g, k_e = jax.random.split(k_init)
+            init_G = jnp.stack([
+                dist.HalfNormal(scale_G).sample(k_g, (n_chains,)),
+                dist.LogNormal(float(np.log(ETA_MAG_DEFAULT)),
+                               args.eta_prior_scale).sample(k_e, (n_chains,)),
+            ], axis=-1)                                   # (n_chains, 2)
+        else:
+            init_G = dist.HalfNormal(scale_G).sample(k_init, (n_chains,))
         sampler_fn = {"rwmh": run_parallel_rwmh, "demc": run_demc, "slice": run_slice}[sampler]
 
         # slice pays 2*max_expand+max_shrink evals/step at WORST case under vmap
@@ -804,13 +877,15 @@ def main():
         jax.block_until_ready(G_draws)
         runtime = time.time() - start_time
 
-        posterior = {"G": np.asarray(G_draws)}          # (chain=n_chains, draw=n_samples)
+        _gd = np.asarray(G_draws)                       # (chain, draw) or (chain, draw, D)
+        posterior = ({"G": _gd} if _gd.ndim == 2
+                     else {nm: _gd[..., j] for j, nm in enumerate(var_names)})
         posterior_samples = az.from_dict(posterior=posterior)
         mcmc = posterior_samples
         print(f"{sampler} done in {runtime:.1f}s | posterior G mean={float(np.mean(G_draws)):.4f} "
               f"sd={float(np.std(G_draws)):.4f} | accept={float(np.asarray(info['accept'])):.2f}")
 
-        az_summary = az.summary(posterior_samples, var_names=["G"]).reset_index().rename(columns={"index": "parameter"})
+        az_summary = az.summary(posterior_samples, var_names=var_names).reset_index().rename(columns={"index": "parameter"})
         az_summary["runtime_sec"] = runtime
         az_summary.to_csv(fname_summary_csv, index=False)
         print(f"Summary saved to {fname_summary_csv}")
@@ -818,9 +893,9 @@ def main():
 
 
     # --- diagnostics and plots ---
-    summary = az.summary(mcmc, var_names=["G"])
+    summary = az.summary(mcmc, var_names=var_names)
     print(summary)
-    plot_trace_chains(mcmc, theta_true, ["G"], savepath=fname_trace)
+    plot_trace_chains(mcmc, theta_true, var_names, savepath=fname_trace)
     
     #az_obj = az.from_numpyro(mcmc)
     #print(mcmc['G'])
@@ -839,10 +914,14 @@ def main():
             G=np.asarray(posterior_samples.posterior["G"].values, dtype=np.float32),
             G_true=np.float32(theta_true[0]),
             seed=np.int64(seed),
+            var_names=np.array(var_names),
+            theta_true=np.asarray(theta_true, dtype=np.float32),
+            **{nm: np.asarray(posterior_samples.posterior[nm].values, dtype=np.float32)
+               for nm in var_names if nm != "G"},
         )
         print(f"saved posterior draws -> {fname_draws}")
     try:  # plotting is non-essential; never let it crash the run before benchmarks save
-        plot_posterior_pooled(["G"], theta_true, prior_predictions, chains_pooled, "Pooled Posteriors", savepath=fname_posteriors)
+        plot_posterior_pooled(var_names, theta_true, prior_predictions, chains_pooled, "Pooled Posteriors", savepath=fname_posteriors)
     except Exception as _e:
         print(f"WARNING: plot_posterior_pooled failed ({type(_e).__name__}: {_e}); continuing to benchmark save.")
 
@@ -864,6 +943,11 @@ def main():
             "fit_map": float(np.sqrt(np.mean((xs_map - obs_np) ** 2))),
         }
         prior_sd = {"G": float(np.std(np.asarray(prior_predictions["G"]).ravel(), ddof=1))}
+        # benchmark_metrics loops over var_names and indexes prior_sd by name; without
+        # an entry for every sampled parameter it raises and the whole benchmark row is
+        # lost inside the surrounding try/except (the 2-D run wrote no benchmark CSV).
+        for _nm in var_names:
+            prior_sd.setdefault(_nm, float(args.eta_prior_scale))
         meta = {
             "sampler": sampler_label, "framework": "numpyro/blackjax", "which_stat": which_stat,
             "SC_type": SC_type, "SC_size": SC_size, "G_true": float(params["G"]),
@@ -875,7 +959,7 @@ def main():
             "standardize_features": bool(args.standardize_features), "noisy_obs": bool(args.noisy_obs),
             "keep_negative_fc": bool(args.keep_negative_fc),
         }
-        run_row, param_rows = benchmark_metrics(posterior_samples, theta_true, ["G"],
+        run_row, param_rows = benchmark_metrics(posterior_samples, theta_true, var_names,
                                                 prior_sd, runtime, rmse, meta)
         pd.DataFrame([run_row]).to_csv(fname_benchmark_csv, index=False)
         pd.DataFrame(param_rows).to_csv(fname_benchmark_params_csv, index=False)
