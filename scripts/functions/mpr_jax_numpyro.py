@@ -902,7 +902,11 @@ def main():
     #print(az_obj)
     #az.to_netcdf(posterior_samples, fname_netcdf)
 
-    chains_pooled = posterior_samples.posterior["G"].values.reshape(1, -1)
+    # (n_params, n_draws). plot_posterior_pooled indexes chains_pooled[i] per variable,
+    # so passing only G raised IndexError as soon as a second parameter existed.
+    chains_pooled = np.vstack([
+        np.asarray(posterior_samples.posterior[nm].values).reshape(1, -1)
+        for nm in var_names])
 
     # Only the ArviZ SUMMARY is persisted by default, which cannot support rank-based
     # diagnostics (SBC needs the rank of the true value among the draws). Save the raw
@@ -932,13 +936,23 @@ def main():
                                    fast_bold=args.fast_bold,
                                    eps=args.fc_eps, grad_method="autodiff")
         obs_np = np.asarray(FC_obs_flat)
-        Gmean = float(np.mean(posterior_samples.posterior["G"].values))
-        Gmap = float(calcula_map(chains_pooled)[0])
-        xs_mean = np.asarray(fwd_eval(jnp.float32(Gmean)))
-        xs_map = np.asarray(fwd_eval(jnp.float32(Gmap)))
+        # Posterior mean/MAP of EVERY sampled parameter. Evaluating the forward at a
+        # bare Gmean would leave eta at its default, so fit_mean/fit_map would describe
+        # a model the posterior never proposed.
+        theta_mean = np.array([float(np.mean(posterior_samples.posterior[nm].values))
+                               for nm in var_names])
+        theta_map = np.asarray(calcula_map(chains_pooled), dtype=float)
+        Gmean, Gmap = float(theta_mean[0]), float(theta_map[0])
+        _arg = (lambda v: jnp.float32(v[0]) if len(var_names) == 1
+                else jnp.asarray(v, dtype=jnp.float32))
+        xs_mean = np.asarray(fwd_eval(_arg(theta_mean)))
+        xs_map = np.asarray(fwd_eval(_arg(theta_map)))
+        # With >1 parameter a single scalar error is ambiguous; report the RMS across
+        # parameters so the run row summarises all of them. The PER-PARAMETER errors are
+        # unaffected and still written to benchmark_params_<TAG>.csv.
         rmse = {
-            "param_mean": abs(Gmean - float(theta_true[0])),
-            "param_map": abs(Gmap - float(theta_true[0])),
+            "param_mean": float(np.sqrt(np.mean((theta_mean - theta_true) ** 2))),
+            "param_map": float(np.sqrt(np.mean((theta_map - theta_true) ** 2))),
             "fit_mean": float(np.sqrt(np.mean((xs_mean - obs_np) ** 2))),
             "fit_map": float(np.sqrt(np.mean((xs_map - obs_np) ** 2))),
         }
@@ -946,8 +960,13 @@ def main():
         # benchmark_metrics loops over var_names and indexes prior_sd by name; without
         # an entry for every sampled parameter it raises and the whole benchmark row is
         # lost inside the surrounding try/except (the 2-D run wrote no benchmark CSV).
-        for _nm in var_names:
-            prior_sd.setdefault(_nm, float(args.eta_prior_scale))
+        if "eta_mag" in var_names:
+            # sd of LogNormal(mu, sigma) is exp(mu + sigma^2/2)*sqrt(exp(sigma^2)-1).
+            # Using sigma itself (0.5) understates it by ~5x (true ~2.45 at mu=log 4.6),
+            # which would make eta's `shrinkage` look far worse than it is.
+            _mu, _sg = float(np.log(ETA_MAG_DEFAULT)), float(args.eta_prior_scale)
+            prior_sd["eta_mag"] = float(np.exp(_mu + 0.5 * _sg ** 2)
+                                        * np.sqrt(np.expm1(_sg ** 2)))
         meta = {
             "sampler": sampler_label, "framework": "numpyro/blackjax", "which_stat": which_stat,
             "SC_type": SC_type, "SC_size": SC_size, "G_true": float(params["G"]),
