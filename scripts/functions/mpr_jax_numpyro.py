@@ -283,6 +283,7 @@ def wrapper_fcd(G, par, cut, tr, starts, nn, grad_horizon=0, fast_bold=False, ep
 # ------------------ per-feature scatter (for --standardize_features) ------------------
 def feature_reference_scatter(par, which_stat, cut, tr, starts, nn,
                               fast_bold=False, eps=0.0, n_ref=8, base_seed=10_000,
+                              fcd_band=0,
                               fisher_z=False, keep_negative=False):
     """Per-feature mean/std of the FC/FCD statistic over n_ref noise seeds. Mirrors
     mpr_jax_pymc.feature_reference_scatter; extraction matches wrapper_fc/fcd so the
@@ -291,7 +292,10 @@ def feature_reference_scatter(par, which_stat, cut, tr, starts, nn,
     reps = []
     for i in range(n_ref):
         p = dict(par); p["seed"] = base_seed + i
-        v = wrap(G=p["G"], par=p, cut=cut, tr=tr, starts=starts, nn=nn,
+        # fcd_band MUST match the model's: this scatter standardises the features, so
+        # an unbanded reference against a banded forward is a straight shape mismatch
+        # (345696 vs 24495 at t_end=300000) that only appears at long horizons.
+        v = wrap(G=p["G"], par=p, cut=cut, tr=tr, starts=starts, nn=nn, fcd_band=fcd_band,
                  grad_horizon=0, fast_bold=fast_bold, eps=eps, fisher_z=fisher_z,
                  keep_negative=keep_negative)
         reps.append(np.asarray(v, dtype=np.float32))
@@ -554,7 +558,7 @@ def main():
         feat_mu, feat_sd = feature_reference_scatter(
             params, which_stat, cut, tr, starts, nn, fast_bold=args.fast_bold,
             eps=args.fc_eps, n_ref=args.n_ref_seeds, fisher_z=args.fisher_z,
-            keep_negative=args.keep_negative_fc)
+            keep_negative=args.keep_negative_fc, fcd_band=args.fcd_band)
         print(f"Standardizing {which_stat} features over {args.n_ref_seeds} noise seeds: "
               f"dim={feat_sd.shape[0]}, median feature sd={np.median(feat_sd):.4g}")
         _mu_j, _sd_j = jnp.asarray(feat_mu), jnp.asarray(feat_sd)
