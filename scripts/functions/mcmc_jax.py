@@ -25,6 +25,7 @@ G; we vmap them over the chain axis internally. Each sampler returns G-space dra
 shaped (n_chains, n_draws) so ArviZ gets real chains -> split-R-hat/ESS available.
 """
 import jax
+import numpy as np
 import jax.numpy as jnp
 from functools import partial
 
@@ -33,9 +34,14 @@ def _make_logpost_z(logprior_G, loglik_G):
     vlp = jax.vmap(logprior_G)
     vll = jax.vmap(loglik_G)
 
-    def logpost_z(z):                      # z: (N,)
+    def logpost_z(z):                      # z: (N,) or (N, D)
         G = jnp.exp(z)
-        return vlp(G) + z + vll(G)         # +z = log|dG/dz| Jacobian
+        # +z is the log-Jacobian of G = exp(z). With a parameter axis the transform is
+        # applied coordinate-wise, so the Jacobian is DIAGONAL and its log-determinant
+        # is the SUM of z over that axis -- not the (N, D) array itself, which would not
+        # even broadcast against the (N,) log-density. Unchanged when z is (N,).
+        jac = z if z.ndim == 1 else z.sum(-1)
+        return vlp(G) + jac + vll(G)
     return logpost_z
 
 
@@ -72,7 +78,12 @@ def run_demc(key, init_G, logprior_G, loglik_G, n_tune, n_draws,
     chains -> the ensemble-difference vector is independent of z_i, so the proposal
     is symmetric and the MH ratio is just the target difference. Returns (G_draws, info)."""
     N = init_G.shape[0]
-    gamma = float(2.38 / jnp.sqrt(2.0)) if gamma is None else gamma   # d=1 default
+    # DE-MC scaling is 2.38/sqrt(2*d) in d dimensions. The old constant hard-coded
+    # d=1, so in 2-D the jump was sqrt(2) too long: chains still find the mode but mix
+    # badly, inflating the apparent posterior sd (measured 0.040/0.046 against a true
+    # 0.020/0.030). Identical to the previous value when d=1.
+    _d = 1 if init_G.ndim == 1 else init_G.shape[-1]
+    gamma = float(2.38 / jnp.sqrt(2.0 * _d)) if gamma is None else gamma
     logpost_z = _make_logpost_z(logprior_G, loglik_G)
     z0 = jnp.log(init_G)
     lp0 = logpost_z(z0)
@@ -84,14 +95,23 @@ def run_demc(key, init_G, logprior_G, loglik_G, n_tune, n_draws,
         r2 = jax.random.randint(k2, (N,), 0, N)
         zp = z + gamma * (z[r1] - z[r2]) + jitter * jax.random.normal(k3, z.shape)
         lpp = logpost_z(zp)                                      # N forward evals, vmapped
-        acc = jnp.log(jax.random.uniform(k4, z.shape)) < (lpp - lp)
-        z = jnp.where(acc, zp, z)
+        # Accept/reject is PER CHAIN. With a parameter axis (N, D) the old
+        # uniform(k4, z.shape) would decide each coordinate separately, accepting G
+        # while rejecting eta -- not Metropolis, and silently wrong rather than loud.
+        # At D=1 this draws from the same key with the same shape, so scalar runs are
+        # bit-for-bit unchanged.
+        acc = jnp.log(jax.random.uniform(k4, (N,))) < (lpp - lp)
+        accb = acc if z.ndim == 1 else acc[:, None]
+        z = jnp.where(accb, zp, z)
         lp = jnp.where(acc, lpp, lp)
         return (z, lp), (z, acc)
 
     keys = jax.random.split(key, n_tune + n_draws)
     _, (zs, accs) = jax.lax.scan(step, (z0, lp0), keys)
-    G_draws = jnp.exp(zs[n_tune:]).T
+    # (n_draws, N) -> (N, n_draws) for the scalar case; with a parameter axis the draws
+    # are (n_draws, N, D) and must keep that axis, so move only the chain axis forward.
+    kept = jnp.exp(zs[n_tune:])
+    G_draws = kept.T if kept.ndim == 2 else jnp.moveaxis(kept, 0, 1)
     return G_draws, {"accept": accs[n_tune:].mean()}
 
 

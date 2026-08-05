@@ -22,7 +22,13 @@ need no unconstraining transform. `loglik_fn` / `distance_fn` take a scalar G;
 we vmap them over the particle cloud internally.
 """
 import jax
+import numpy as np
 import jax.numpy as jnp
+
+
+def _bcast(mask, parts):
+    """Broadcast a per-particle (N,) boolean over a possibly (N, D) particle array."""
+    return mask if parts.ndim == 1 else mask[:, None]
 
 
 def systematic_resample(key, w):
@@ -37,7 +43,7 @@ def _ess(logw):
     return 1.0 / jnp.sum(w ** 2)
 
 
-def _make_proposal(move, rw_step, demc_gamma, demc_jitter):
+def _make_proposal(move, rw_step, demc_gamma, demc_jitter, d=1):
     """Within-stage MCMC proposal on the particle cloud, in log-G space.
 
     move="rw"   : independent multiplicative random walk (one particle at a time).
@@ -51,7 +57,11 @@ def _make_proposal(move, rw_step, demc_gamma, demc_jitter):
 
     Both are symmetric in z=log(G), so the Hastings correction stays log(prop/parts)
     exactly as in the plain-RW case -- callers need no other change."""
-    gamma = float(2.38 / jnp.sqrt(2.0)) if demc_gamma is None else demc_gamma
+    # DE-MC scaling is 2.38/sqrt(2*d). `d` is the PARAMETER dimension, passed in by the
+    # caller because it must be resolved here, outside the traced scan -- float() on a
+    # jnp value inside the proposal raises ConcretizationTypeError. At d=1 this is the
+    # original expression, so scalar runs stay bit-for-bit unchanged.
+    gamma = float(2.38 / jnp.sqrt(2.0 * d)) if demc_gamma is None else demc_gamma
 
     def rw(key, parts):
         return parts * jnp.exp(rw_step * jax.random.normal(key, parts.shape))
@@ -80,7 +90,8 @@ def run_tempered_smc(key, init_particles, logprior_fn, loglik_fn,
 
     `move` selects the within-stage kernel: "rw" (default, unchanged behaviour) or
     "demc" for tempered DE-MC. See _make_proposal."""
-    propose = _make_proposal(move, rw_step, demc_gamma, demc_jitter)
+    _d = 1 if init_particles.ndim == 1 else init_particles.shape[-1]
+    propose = _make_proposal(move, rw_step, demc_gamma, demc_jitter, _d)
     vprior = jax.vmap(logprior_fn)
     vloglik = jax.vmap(loglik_fn)
     lambdas = jnp.linspace(0.0, 1.0, n_stages + 1)
@@ -93,9 +104,22 @@ def run_tempered_smc(key, init_particles, logprior_fn, loglik_fn,
             lp_p, ll_p = vprior(prop), vloglik(prop)   # N forward evals, vmapped
             # tempered target logprior + lambda*loglik; multiplicative RW is
             # symmetric in log-space -> Hastings correction is log(prop/parts).
-            logr = (lp_p + lmbda * ll_p) - (lp + lmbda * ll) + (jnp.log(prop) - jnp.log(parts))
-            acc = jnp.log(jax.random.uniform(k2, parts.shape)) < logr
-            parts = jnp.where(acc, prop, parts)
+            # Hastings correction for the multiplicative RW, log(prop/parts). With a
+            # PARAMETER AXIS this is a per-coordinate array and must be summed: the
+            # proposal is a product of independent per-coordinate moves, so its
+            # log-Jacobian is the sum. Leaving it unsummed would compare an (N,D)
+            # quantity against an (N,) log-density below.
+            hast = jnp.log(prop) - jnp.log(parts)
+            if parts.ndim > 1:
+                hast = hast.sum(-1)
+            logr = (lp_p + lmbda * ll_p) - (lp + lmbda * ll) + hast
+            # Accept/reject is PER PARTICLE, never per coordinate. Drawing the uniform
+            # with parts.shape would accept G and reject eta independently, which is not
+            # Metropolis and yields a plausible-looking but wrong posterior. For D=1 this
+            # draws the identical numbers from the identical key, so scalar runs are
+            # bit-for-bit unchanged.
+            acc = jnp.log(jax.random.uniform(k2, (parts.shape[0],))) < logr
+            parts = jnp.where(_bcast(acc, parts), prop, parts)
             lp = jnp.where(acc, lp_p, lp)
             ll = jnp.where(acc, ll_p, ll)
             return (parts, lp, ll), acc.mean()
@@ -132,7 +156,8 @@ def run_abc_smc(key, init_particles, logprior_fn, distance_fn, eps_schedule,
 
     `move` selects the within-stage kernel: "rw" (default, unchanged behaviour) or
     "demc" for tempered DE-MC. See _make_proposal."""
-    propose = _make_proposal(move, rw_step, demc_gamma, demc_jitter)
+    _d = 1 if init_particles.ndim == 1 else init_particles.shape[-1]
+    propose = _make_proposal(move, rw_step, demc_gamma, demc_jitter, _d)
     vprior = jax.vmap(logprior_fn)
     vdist = jax.vmap(distance_fn)
 
@@ -145,10 +170,12 @@ def run_abc_smc(key, init_particles, logprior_fn, distance_fn, eps_schedule,
             k1, k2 = jax.random.split(k)
             prop = propose(k1, parts)
             lp_p, dist_p = vprior(prop), vdist(prop)   # N forward evals, vmapped
-            logr = (lp_p + pseudo_ll(dist_p, eps)) - (lp + pseudo_ll(dist, eps)) \
-                   + (jnp.log(prop) - jnp.log(parts))
-            acc = jnp.log(jax.random.uniform(k2, parts.shape)) < logr
-            parts = jnp.where(acc, prop, parts)
+            hast = jnp.log(prop) - jnp.log(parts)
+            if parts.ndim > 1:
+                hast = hast.sum(-1)          # see run_tempered_smc: per-coordinate
+            logr = (lp_p + pseudo_ll(dist_p, eps)) - (lp + pseudo_ll(dist, eps)) + hast
+            acc = jnp.log(jax.random.uniform(k2, (parts.shape[0],))) < logr
+            parts = jnp.where(_bcast(acc, parts), prop, parts)
             lp = jnp.where(acc, lp_p, lp)
             dist = jnp.where(acc, dist_p, dist)
             return (parts, lp, dist), acc.mean()
