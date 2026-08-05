@@ -25,7 +25,7 @@ import matplotlib.pyplot as plt
 
 # columns we try to read from the run-row benchmark CSVs (missing ones are tolerated)
 _COLS = ["sampler", "sampler_raw", "framework", "platform", "which_stat", "G_true",
-         "G_hat", "G_sd", "G_lo", "G_hi", "n_chains",
+         "G_hat", "G_sd", "G_lo", "G_hi", "SC_size", "t_end", "n_chains", "n_draws", "n_warmup",
          "n_particles", "runtime_sec", "max_r_hat", "min_ess_bulk",
          "min_ess_bulk_per_sec", "rmse_param_mean", "mean_accept", "coverage_94hdi"]
 
@@ -74,6 +74,20 @@ def load_master(results_dirs):
     for d in results_dirs:
         files += glob.glob(os.path.join(d, "**", "benchmark_*.csv"), recursive=True)
     files = [f for f in files if "_params_" not in f]
+    # benchmark_comparison.csv is a multi-row AGGREGATE of several cells, not a run row.
+    # The iloc[0] below would keep only its first sampler and silently discard the rest,
+    # injecting a row that also duplicates a per-cell file we already read.
+    files = [f for f in files if os.path.basename(f) != "benchmark_comparison.csv"]
+    # One cell can sit under several results dirs -- a date dir may hold an earlier copy
+    # of a sweep that a later dir supersedes (verified byte-identical). Recursive globbing
+    # would count it once per copy, which biases the per-group pick below and any median.
+    seen, uniq = set(), []
+    for f in sorted(files):
+        b = os.path.basename(f)
+        if b not in seen:
+            seen.add(b)
+            uniq.append(f)
+    files = uniq
     rows = []
     for f in files:
         try:
@@ -84,6 +98,9 @@ def load_master(results_dirs):
             continue
         r = d.iloc[0].to_dict()
         r["_file"] = os.path.basename(f)
+        # mtime is preserved by rsync -a off the clusters, so it dates the run itself.
+        # It is the final tie-break: "the last version of this cell that we produced".
+        r["_mtime"] = os.path.getmtime(f)
         # The run also writes summary_<TAG>.csv beside benchmark_<TAG>.csv, holding the
         # ArviZ summary. The benchmark row records only rmse_param_mean = |Ghat - G*|,
         # which is unsigned -- so the posterior mean itself has to come from here if we
@@ -118,34 +135,54 @@ def load_master(results_dirs):
         is_smc = df.get("sampler", pd.Series("", index=df.index)).astype(str).str.startswith("smc")
         df["batch"] = np.where(is_smc, npart, nchain)
         df["batch"] = pd.to_numeric(df["batch"], errors="coerce")
+        # pymc runs its SMC with n_draws as the particle population and never writes
+        # n_particles, so those cells came out batch=NaN. NaN sorts last in pandas, so
+        # such a row won (or lost) the per-group pick below by sort position rather than
+        # on merit -- next to a numpyro CPU cell of 256 particles it silently won as if
+        # it were the widest batch. Fall back to n_draws so the comparison is real.
+        if "n_draws" in df:
+            _nd = pd.to_numeric(df["n_draws"], errors="coerce")
+            df["batch"] = df["batch"].where(~(is_smc & df["batch"].isna()), _nd)
     df["abs_err"] = df.get("rmse_param_mean")
     df["ess_per_sec"] = df.get("min_ess_bulk_per_sec")
-    keep = [c for c in _COLS + ["batch", "abs_err", "ess_per_sec", "_file"] if c in df]
+    keep = [c for c in _COLS + ["batch", "abs_err", "ess_per_sec", "_file", "_mtime"]
+            if c in df]
     return df[keep].copy()
 
 
-# Cells whose numbers WILL change once queued re-runs land. Marked with * in the table
-# and spelled out in a footnote, so a provisional number is never mistaken for a final
-# one. Keyed by (sampler, platform); remove an entry once its re-run is in.
-_PROVISIONAL = {
-    ("demc", "gpu"): r"200/500 budget; 1000/1000 re-run in progress",
-    ("slice", "gpu"): r"15/30 budget, $\widehat{R}\approx2.95$ (not converged); "
-                      r"50/100 re-run at a cheaper bracket in progress",
-    ("smc_lik", "cpu"): r"$G^\star=0.7$ cells still running",
+# Cells the reader must not take at face value: either a queued re-run will change the
+# number, or the run landed but did not converge. Marked with * in the table and spelled
+# out in a footnote. Keyed by (sampler, platform); drop an entry once it is settled.
+#
+# Status 2026-08-03: the demc 1000/1000 GPU re-run landed ($\widehat{R}\le1.22$) and the
+# smc_lik CPU $G^\star=0.7$ cells finished, so both entries are gone. The slice 50/100
+# re-run also landed, but quadrupling the budget moved $\widehat{R}$ only 2.96 -> 2.56:
+# it stays flagged, now as a converged-failure rather than a pending result.
+_CAVEATS = {
+    ("slice", "gpu"): r"does not converge even at budget parity. Given the same "
+                      r"$1000/1000$ as DE-MC and RWMH --- $20\times$ the draws of the "
+                      r"earlier $50/100$ cells and $31$\,h per cell --- $\widehat{R}$ "
+                      r"falls only from $2.56$ to $2.17$ (FCD) and $1.79$ to $1.27$ "
+                      r"(FC). The earlier budget confound is therefore resolved against "
+                      r"budget: this is the proposal",
 }
 
 
-def _provisional_note(sub):
-    """LaTeX footnote listing only the provisional groups actually present in `sub`."""
+def _provisional_note(sub, ncols=7):
+    """LaTeX footnote listing only the caveated groups actually present in `sub`.
+
+    ncols must match the enclosing tabular: a \multicolumn wider or narrower than the
+    table is a LaTeX alignment error, and the two tables here have different widths.
+    """
     present = {(r.get("sampler"), r.get("platform")) for _, r in sub.iterrows()}
-    items = [(k, v) for k, v in _PROVISIONAL.items() if k in present]
+    items = [(k, v) for k, v in _CAVEATS.items() if k in present]
     if not items:
         return []
     bits = [f"{_tt(s)} ({p}): {why}" for (s, p), why in sorted(items)]
     return [
         r"\\[2pt]",
-        r"\multicolumn{7}{p{0.95\linewidth}}{\footnotesize $^{*}$Provisional --- final "
-        r"results arriving. " + "; ".join(bits) + r".}\\",
+        rf"\multicolumn{{{ncols}}}{{p{{0.95\linewidth}}}}{{\footnotesize $^{{*}}$Not to "
+        r"be read as a settled number. " + "; ".join(bits) + r".}\\",
     ]
 
 
@@ -153,6 +190,42 @@ def _tt(s):
     r"""Sampler slug as \texttt, with _ escaped -- a bare underscore in text mode is a
     LaTeX error ("Missing $ inserted"), and every SMC slug contains one."""
     return r"\texttt{" + str(s).replace("_", r"\_") + "}"
+
+
+# The benchmark tables describe ONE configuration: the 10-node subnetwork at
+# t_end=30000. The 88-node and long-t_end scaling runs share G*=0.2 with it, so without
+# this filter they land in the same (sampler, platform, feature) group and compete for
+# the per-cell pick -- silently mixing network sizes into a table that never says which
+# network it is. They are reported separately instead.
+BENCH_SC_SIZE = 10
+BENCH_T_END = 30000
+
+
+def bench_subset(df):
+    """Rows belonging to the main benchmark configuration."""
+    out = df
+    if "SC_size" in out:
+        out = out[out["SC_size"].astype(float).fillna(BENCH_SC_SIZE) == BENCH_SC_SIZE]
+    if "t_end" in out:
+        out = out[out["t_end"].astype(float).fillna(BENCH_T_END) == BENCH_T_END]
+    return out if len(out) else df
+
+
+def _latest_per_cell(sub, keys):
+    """One representative run per cell: widest batch, then longest budget, then newest.
+
+    Every step is needed. Batch alone is the reporting convention (a cell is swept over
+    batch widths), but a cell is also re-run at several BUDGETS at the same width -- a
+    short exploratory pass and a longer re-run that supersedes it. Sorting on batch alone
+    left that tie to glob order, which kept the superseded short run, so a landed re-run
+    never reached the table. mtime settles anything budget cannot.
+
+    na_position='first' matters: a row missing one of these keys must never win the pick
+    by NaN sort position, which is exactly how a pymc SMC cell (no n_particles recorded)
+    used to beat a real numpyro cell beside it.
+    """
+    by = [c for c in ("batch", "n_draws", "n_warmup", "_mtime") if c in sub]
+    return sub.sort_values(by, na_position="first").groupby(keys, dropna=False).tail(1)
 
 
 def _fmt(x, nd=3):
@@ -164,15 +237,31 @@ def _fmt(x, nd=3):
     return f"{v:.{nd}g}" if np.isfinite(v) else "--"
 
 
+def _fmt_rhat(x, nd=3):
+    r"""R-hat, distinguishing "not measured" from "diverged".
+
+    _fmt collapses NaN and inf to the same "--", but for R-hat they mean opposite
+    things: NaN is a single-population SMC cell that has no R-hat to report, while an
+    infinite R-hat is a chain that blew up. Printing the failure as "--" hides it behind
+    the caption's "not run" legend, so infinities are shown as such.
+    """
+    try:
+        v = float(x)
+    except Exception:
+        return "--"
+    if np.isnan(v):
+        return "--"
+    return f"{v:.{nd}g}" if np.isfinite(v) else r"$\infty$"
+
+
 def latex_benchmark_table(df, out_tex, G=0.2, label="tab:benchmark"):
     """Accuracy + performance at a chosen true G: representative (largest) batch per
     (sampler, platform, which_stat)."""
+    df = bench_subset(df)
     sub = df[np.isclose(df["G_true"].astype(float), G)] if "G_true" in df else df
     if sub.empty:
         sub = df
-    # pick the largest batch per group
-    sub = sub.sort_values("batch").groupby(
-        ["sampler", "platform", "which_stat"], dropna=False).tail(1)
+    sub = _latest_per_cell(sub, ["sampler", "platform", "which_stat"])
     sub = sub.sort_values(["sampler", "which_stat", "platform"])
     lines = [
         r"\begin{table}[t]\centering",
@@ -187,15 +276,68 @@ def latex_benchmark_table(df, out_tex, G=0.2, label="tab:benchmark"):
     ]
     for _, r in sub.iterrows():
         samp = r.get("sampler", "")
-        star = "$^{*}$" if (samp, r.get("platform")) in _PROVISIONAL else ""
+        star = "$^{*}$" if (samp, r.get("platform")) in _CAVEATS else ""
         lines.append(
             f"{_tt(samp)}{star} & {r.get('platform','')} & {r.get('which_stat','')} & "
             f"{_fmt(r.get('abs_err'))} & {_fmt(r.get('runtime_sec'),4)} & "
-            f"{_fmt(r.get('ess_per_sec'),3)} & {_fmt(r.get('max_r_hat'),3)} \\\\")
+            f"{_fmt(r.get('ess_per_sec'),3)} & {_fmt_rhat(r.get('max_r_hat'),3)} \\\\")
     lines += [r"\bottomrule"] + _provisional_note(sub) + [r"\end{tabular}", r"\end{table}"]
     with open(out_tex, "w") as fh:
         fh.write("\n".join(lines) + "\n")
     print(f"wrote {out_tex} ({len(sub)} rows)")
+
+
+def latex_full_grid_table(df, out_tex, label="tab:fullgrid"):
+    r"""Every cell we have: sampler x {FC,FCD} x {cpu,gpu} x every $G^\star$ tested.
+
+    tab:accuracy shows one $G^\star$ so it stays readable in the body; this is the
+    complete grid, one row per (sampler, backend, feature) and one column block per
+    $G^\star$, each holding the LATEST version of that cell (see _latest_per_cell).
+    A cell we never ran prints as "--", so gaps in the sweep are visible rather than
+    inferred from a missing row.
+    """
+    df = bench_subset(df)
+    Gs = sorted(df["G_true"].dropna().astype(float).unique())
+    sub = _latest_per_cell(df, ["sampler", "platform", "which_stat", "G_true"])
+    idx = sub.set_index(["sampler", "platform", "which_stat",
+                         sub["G_true"].astype(float).round(4)])
+    cells = sorted({(r.sampler, r.platform, r.which_stat) for r in sub.itertuples()})
+
+    lines = [
+        r"\begin{table*}[t]\centering",
+        r"\caption{Every measured cell, at the latest version of each. Rows are "
+        r"sampler $\times$ backend $\times$ feature; each $G^\star$ block gives "
+        r"$|\Delta G|=|\hat G-G^\star|$ and $\widehat{R}$ (``--'' = not run, or no "
+        r"$\widehat{R}$ for single-population SMC). Representative batch per cell: "
+        r"widest batch, longest budget, most recent run.}",
+        # 3 + 2*len(Gs) columns overflows a one-column elsarticle body at \small with
+        # default padding (~100pt too wide at four G values), so trim both.
+        rf"\label{{{label}}}\footnotesize\setlength{{\tabcolsep}}{{3.5pt}}",
+        r"\begin{tabular}{lll" + "rr" * len(Gs) + "}",
+        r"\toprule",
+        r"& & & " + " & ".join(rf"\multicolumn{{2}}{{c}}{{$G^\star={_fmt(G,2)}$}}"
+                               for G in Gs) + r" \\",
+        r"Sampler & Backend & Feat. & " +
+        " & ".join([r"$|\Delta G|$ & $\widehat{R}$"] * len(Gs)) + r" \\",
+        r"\midrule",
+    ]
+    for samp, plat, feat in cells:
+        star = "$^{*}$" if (samp, plat) in _CAVEATS else ""
+        vals = []
+        for G in Gs:
+            try:
+                r = idx.loc[(samp, plat, feat, round(float(G), 4))]
+                if isinstance(r, pd.DataFrame):
+                    r = r.iloc[-1]
+                vals += [_fmt(r.get("abs_err")), _fmt_rhat(r.get("max_r_hat"), 3)]
+            except KeyError:
+                vals += ["--", "--"]
+        lines.append(f"{_tt(samp)}{star} & {plat} & {feat} & " + " & ".join(vals) + r" \\")
+    lines += ([r"\bottomrule"] + _provisional_note(sub, ncols=3 + 2 * len(Gs))
+              + [r"\end{tabular}", r"\end{table*}"])
+    with open(out_tex, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    print(f"wrote {out_tex} ({len(cells)} rows x {len(Gs)} G values)")
 
 
 def latex_settings_table(config, out_tex):
@@ -373,6 +515,7 @@ def main():
 
     latex_benchmark_table(df, os.path.join(tables, "benchmark_table.tex"),
                           G=args.table_G, label=args.table_label)
+    latex_full_grid_table(df, os.path.join(tables, "full_grid_table.tex"))
     latex_settings_table(args.config, os.path.join(tables, "settings_table.tex"))
     fig_recovery_vs_G(df, os.path.join(figs, "recovery_vs_G.png"))
     fig_throughput(df, os.path.join(figs, "throughput_ess.png"))
