@@ -91,7 +91,12 @@ def parse_args():
     parser.add_argument("--fixed_step_size", type=float, default=None,
                     help="if set, use this fixed step size and DISABLE adaptation "
                          "(fixed-step HMC / floored NUTS -> avoids the collapse entirely).")
-    parser.add_argument("--scale", type=int, default=1, help="prior scale")
+    parser.add_argument("--scale", type=float, default=1.0,
+                        help="scale of the HalfNormal(scale) prior on G. Was type=int, "
+                             "which silently made every sub-unit prior unexpressible -- "
+                             "--scale 0.5 parsed as an error and 0.9 would truncate. "
+                             "G is a free multiplier on a max-normalised SC, so the prior "
+                             "has no physical ceiling; scale controls where its mass sits.")
     parser.add_argument("--sampler", type=str, default="pathfinder",
                     choices=["nuts", "hmc", "pathfinder", "blackjax", "smc_lik", "smc_abc",
                              "rwmh", "demc", "slice"],
