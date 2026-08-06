@@ -51,6 +51,13 @@ def parse_args():
     p.add_argument("--cut", type=int, default=10)
     p.add_argument("--fcd_band", type=int, default=0)
     p.add_argument("--python", default=sys.executable)
+    p.add_argument("--i_start", type=int, default=0,
+                   help="first replicate index to RUN (inclusive). Lets several "
+                        "instances split the work across GPUs. The prior draws are "
+                        "generated for the full --L before slicing, so replicate k is "
+                        "the same ground truth whichever instance runs it.")
+    p.add_argument("--i_end", type=int, default=None,
+                   help="last replicate index to run (exclusive); default --L.")
     p.add_argument("--dry_run", action="store_true",
                    help="print the replicate commands and the prior draws, run nothing")
     return p.parse_args()
@@ -137,10 +144,20 @@ def main():
     print(f"[sbc] ground truths: min={Gs.min():.3f} median={np.median(Gs):.3f} max={Gs.max():.3f}")
     print(f"[sbc] out_dir={a.out_dir}")
 
+    i_end = a.L if a.i_end is None else a.i_end
+    if (a.i_start, i_end) != (0, a.L):
+        print(f"[sbc] this instance runs replicates [{a.i_start}, {i_end})")
+
     ranks, sizes, used_G = [], [], []
     for i, G in enumerate(Gs):
         G = float(np.round(G, 6))
-        path = run_replicate(i, G, a)
+        if a.i_start <= i < i_end:
+            path = run_replicate(i, G, a)
+        else:
+            # outside this instance's range: do not run it, but still pick up its draws
+            # if a sibling instance has finished it, so a final full-range pass
+            # aggregates every replicate without recomputing anything.
+            path = draws_path(a.out_dir, G, 1000 + i, a)
         if a.dry_run or path is None:
             continue
         z = np.load(path)
@@ -155,6 +172,9 @@ def main():
         return
     if not ranks:
         raise SystemExit("[sbc] no replicates completed -- nothing to summarise")
+    if len(ranks) < a.L:
+        print(f"[sbc] NOTE: {len(ranks)}/{a.L} replicates present. Re-run with the full "
+              f"range once every instance has finished to aggregate them all.")
 
     ranks = np.asarray(ranks); sizes = np.asarray(sizes)
     out = os.path.join(a.out_dir, f"sbc_ranks_{a.sampler}_{a.which_stat}.npz")
