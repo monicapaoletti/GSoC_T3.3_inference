@@ -25,9 +25,17 @@ import utils
 from FCD_jax import extract_FCD
 
 
-def simulate(G, eta, t_end, seed=42):
-    """Run the MPR model at coupling G and excitability eta; return r, BOLD, time axes."""
+def simulate(G, eta, t_end, seed=42, sc_size=None):
+    """Run the MPR model at coupling G and excitability eta; return r, BOLD, time axes.
+
+    sc_size subsets the connectome to its first n nodes. The slice happens BEFORE the
+    max-normalisation, exactly as mpr_jax_numpyro does it -- normalising the full matrix
+    and then slicing would give a different effective coupling at the same G, so the
+    figure would not describe the network the inference actually runs on.
+    """
     weights = jnp.array(np.loadtxt(utils.DATA_ROOT + "/weights.txt"))
+    if sc_size:
+        weights = weights[:sc_size, :sc_size]
     params = {"G": float(G), "t_end": t_end, "weights": weights / jnp.max(weights),
               "dt": 0.01, "eta": jnp.array([float(eta)]), "rv_decimate": 10,
               "noise_amp": 0.037, "tr": 300.0, "seed": seed}
@@ -54,6 +62,9 @@ def main():
     ap.add_argument("--cut", type=int, default=50,
                     help="drop initial BOLD frames (transient + Balloon-Windkessel startup); "
                          "50 matches the mpr_jax.ipynb cells this script reproduces (t_end=300000 -> 1000 frames)")
+    ap.add_argument("--SC_size", type=int, default=None,
+                    help="use only the first N nodes (default: the full 88-node matrix). "
+                         "Pass 10 to match the benchmark's subnetwork.")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
     out = args.out or utils.results_folder()
@@ -85,7 +96,7 @@ def main():
     # the fixed one belongs in the caption.
 
     for row, (G, eta, rlabel) in enumerate(rows):
-        r, rv_t, bold, bold_t = simulate(G, eta, args.t_end)
+        r, rv_t, bold, bold_t = simulate(G, eta, args.t_end, sc_size=args.SC_size)
         # cut once, then feed the SAME trimmed series to both features.
         # extract_FCD expects (nodes, timepoints) -- pass b.T, not b (or set coldata=True).
         b = bold[args.cut:]
