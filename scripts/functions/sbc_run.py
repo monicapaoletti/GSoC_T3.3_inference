@@ -35,7 +35,7 @@ def parse_args():
     p.add_argument("--sampler", default="smc_lik")
     p.add_argument("--which_stat", default="FCD", choices=["FC", "FCD"])
     p.add_argument("--out_dir", default=os.path.join(HERE, "..", "..", "results", "sbc"))
-    p.add_argument("--scale", type=int, default=1,
+    p.add_argument("--scale", type=float, default=1.0,
                    help="prior scale; MUST match the inner run's --scale, since SBC "
                         "draws the ground truth from that same prior")
     p.add_argument("--sbc_seed", type=int, default=20260805,
