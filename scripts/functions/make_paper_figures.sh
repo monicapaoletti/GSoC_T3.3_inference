@@ -30,6 +30,13 @@ echo "== 1. benchmark figures (recovery, accuracy-vs-cost, calibration) + all ta
 # figures/calibration_sd_vs_err.png and every tables/*.tex, all from master_results.csv.
 "$PY" make_paper_assets.py --results "$REPO/results" --out "$PAPER" \
       --table_label tab:accuracy
+# make_paper_assets writes straight into the paper; mirror its outputs into the dated
+# results folder too, so every figure the manuscript uses also has a copy filed under
+# the day it was produced -- the same convention steps 2-4 follow.
+for f in recovery_vs_G accuracy_vs_cost calibration_sd_vs_err sbc_ranks throughput_ess; do
+  [ -f "$FIGS/$f.png" ] && cp "$FIGS/$f.png" "$TODAY/"
+done
+[ -f "$PAPER/tables/sbc_table.tex" ] && cp "$PAPER/tables/sbc_table.tex" "$TODAY/"
 
 echo "== 2. forward throughput (Fig. 2) + its companion table =="
 # Reads the stored measurement from the day it was MEASURED; writes into today's folder
