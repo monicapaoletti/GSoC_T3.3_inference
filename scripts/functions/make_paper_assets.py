@@ -16,7 +16,7 @@ Usage:
   # e.g. after pulling CSVs locally:
   python make_paper_assets.py --results ../../results --out ../../paper
 """
-import argparse, glob, os
+import argparse, glob, os, re
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -48,8 +48,30 @@ _SAMPLER_ALIASES = {
     "DE MetropolisZ": "demcz",
     "Slice Sampler": "slice",
     "SMC with Likelihood": "smc_lik",
-    r"SMC, $\epsilon$ = 10": "smc_abc",
+    # NB: epsilon-bearing ABC labels are handled by _canon_abc below, not here -- the
+    # literal key only ever matched epsilon=10.
 }
+
+
+def _canon_abc(name):
+    r"""Map pymc's ABC display label to a slug that ENCODES whether epsilon was calibrated.
+
+    pymc writes the sampler as "SMC, $\epsilon$ = <value>". Keying the alias table on the
+    literal "= 10" meant any other epsilon matched nothing and silently dropped out of
+    every table and figure -- so a calibrated re-run would have been invisible.
+
+    Calibrated and uncalibrated runs must NOT collapse to one slug: they are different
+    configurations of the same sampler and would then compete for the same cell, with the
+    winner decided by batch width rather than by which one the text is discussing. The
+    ABC kernel is -0.5*((obs-sim)/eps)^2, identical in form to a Gaussian log-likelihood
+    of sd eps, so eps == obs_err (here 1.0) is the calibrated choice and anything looser
+    is a distinct, weaker configuration.
+    """
+    m = re.match(r"^SMC,\s*\$?\\?epsilon\$?\s*=\s*([0-9.]+)$", str(name).strip())
+    if not m:
+        return None
+    eps = float(m.group(1))
+    return "smc_abc" if abs(eps - 1.0) < 1e-9 else f"smc_abc_eps{m.group(1).rstrip('.')}"
 
 
 def _normalize_provenance(df):
@@ -57,6 +79,9 @@ def _normalize_provenance(df):
     if "sampler" in df:
         df["sampler_raw"] = df["sampler"]
         df["sampler"] = df["sampler"].replace(_SAMPLER_ALIASES)
+        # epsilon-bearing ABC labels carry their calibration in the slug
+        _abc = df["sampler"].map(_canon_abc)
+        df["sampler"] = _abc.where(_abc.notna(), df["sampler"])
     # every pymc cell in this project ran on the ulysses CPU cluster; the JAX cells
     # always write their own platform, so a missing value identifies pymc unambiguously.
     if "framework" not in df:
@@ -569,13 +594,17 @@ def latex_config_subtables(df, out_tex, Gs, label_stem="tab:cells", intro=None):
 # Giving it a seventh hue would mean an unvalidated palette step; instead it shares the
 # ABC hue (same entity) and is separated by marker (different kernel), which is the
 # composite encoding a variant calls for.
-_VARIANT_OF = {"smc_abc_demc": "smc_abc"}
-_VARIANT_MARKER = "s"
+# Variants of a sampler share its hue and are separated by marker: they are the same
+# entity under a different setting, and inventing a hue per variant would mean palette
+# steps nobody validated. smc_abc_eps10 is the uncalibrated (epsilon=10) pymc ABC, kept
+# visible rather than folded into smc_abc so a reader can see it is a weaker setting.
+_VARIANT_OF = {"smc_abc_demc": "smc_abc", "smc_abc_eps10": "smc_abc"}
+_VARIANT_MARKER = {"smc_abc_demc": "s", "smc_abc_eps10": "^"}
 
 
 def _sampler_style(samp, colors):
     base = _VARIANT_OF.get(samp, samp)
-    return colors.get(base, "#777777"), (_VARIANT_MARKER if samp in _VARIANT_OF else "o")
+    return colors.get(base, "#777777"), _VARIANT_MARKER.get(samp, "o")
 
 
 def _samplers_present(d):
@@ -753,6 +782,103 @@ def fig_calibration(df, out_png):
     fig.savefig(out_png, dpi=300, bbox_inches="tight"); plt.close(fig)
     n_f = int(d["floored"].sum())
     print(f"wrote {out_png} ({len(d)} cells, {n_f} with sd below {_SD_FLOOR} drawn hollow)")
+
+
+def _sbc_files(results_dirs):
+    out = []
+    for d in results_dirs:
+        out += glob.glob(os.path.join(d, "**", "sbc_ranks_*.npz"), recursive=True)
+    return sorted(set(out))
+
+
+def fig_sbc(results_dirs, out_png, out_tex=None, conf=0.95):
+    r"""Simulation-based calibration: are the posterior ranks uniform?
+
+    SBC draws G* from the prior, fits the posterior to data simulated at that G*, and
+    records the rank of G* within the posterior draws. Under correct calibration those
+    ranks are Uniform(0,1) -- the one check that tests the whole pipeline (model, sampler,
+    tolerance) rather than any part of it.
+
+    Plotted as the ECDF DIFFERENCE rather than a rank histogram: with 100 replicates a
+    histogram's shape depends on an arbitrary bin count, while the ECDF uses every
+    replicate and its deviation is directly comparable to a band. The band is the
+    Kolmogorov-Smirnov critical value, so it is the same statistic as the KS test the
+    driver already reports -- a curve leaving the band is exactly a rejection at that
+    level, and the two cannot disagree.
+
+    Shape carries meaning: a systematic tilt is bias, a U (ends high) is an overconfident
+    posterior, an inverted U is an over-dispersed one.
+    """
+    files = _sbc_files(results_dirs)
+    if not files:
+        print("(SBC figure skipped: no sbc_ranks_*.npz found)"); return
+    try:
+        from scipy import stats as _st
+    except Exception:
+        _st = None
+
+    colors = {s: PALETTE[i % len(PALETTE)] for i, s in enumerate(SAMPLER_ORDER)}
+    # 1.358 is the 95% Kolmogorov quantile; 1.628 the 99%.
+    kq = {0.95: 1.358, 0.99: 1.628}.get(conf, 1.358)
+
+    fig, ax = plt.subplots(figsize=(6.4, 4.4))
+    rows, Ls = [], []
+    for f in files:
+        z = np.load(f)
+        r = np.asarray(z["ranks"], float); n = np.asarray(z["sizes"], float)
+        u = np.sort(r / np.maximum(n, 1.0))
+        L = u.size; Ls.append(L)
+        base = os.path.basename(f)[len("sbc_ranks_"):-len(".npz")]
+        samp = base.rsplit("_", 1)[0]; stat = base.rsplit("_", 1)[-1]
+        ecdf = np.arange(1, L + 1) / L
+        ax.step(u, ecdf - u, where="post", lw=2,
+                color=colors.get(samp, "#777777"), label=f"{samp} ({stat})", zorder=3)
+        d = p_ = float("nan")
+        if _st is not None:
+            ks = _st.kstest(u, "uniform"); d, p_ = float(ks.statistic), float(ks.pvalue)
+        rows.append({"sampler": samp, "which_stat": stat, "L": L, "ks_D": d, "ks_p": p_})
+
+    L = max(Ls)
+    band = kq / np.sqrt(L)
+    ax.axhspan(-band, band, color="#999999", alpha=0.18, zorder=1,
+               label=f"{int(conf*100)}% simultaneous band")
+    ax.axhline(0.0, color="#999999", lw=1.0, zorder=2)
+    ax.set_xlabel("normalised rank of $G^\\star$ in the posterior")
+    ax.set_ylabel("ECDF $-$ uniform")
+    ax.set_xlim(0, 1)
+    ax.grid(True, ls=":", alpha=0.4)
+    for sp in ("top", "right"):
+        ax.spines[sp].set_visible(False)
+    ax.legend(frameon=False, loc="upper right", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=300, bbox_inches="tight"); plt.close(fig)
+    print(f"wrote {out_png} ({len(rows)} samplers, L={L})")
+
+    if out_tex:
+        lines = [
+            r"\begin{table}[t]\centering",
+            rf"\caption{{Simulation-based calibration. {L} replicates per sampler: a "
+            rf"ground truth is drawn from the prior, data are simulated at it, and the "
+            rf"rank of that truth among the posterior draws is recorded. Correct "
+            rf"calibration makes the normalised ranks Uniform$(0,1)$; $D$ is the "
+            rf"Kolmogorov--Smirnov distance from uniformity and $p$ its $p$-value, so "
+            rf"large $p$ means no detectable miscalibration.}}",
+            r"\label{tab:sbc}\small",
+            r"\begin{tabular}{llrrr}",
+            r"\toprule",
+            r"Sampler & Feat. & replicates & KS $D$ & $p$ \\",
+            r"\midrule",
+        ]
+        for r_ in rows:
+            lines.append(f"{_tt(r_['sampler'])} & {r_['which_stat']} & {r_['L']} & "
+                         f"{_fmt(r_['ks_D'], 3)} & {_fmt(r_['ks_p'], 3)} \\\\")
+        lines += [r"\bottomrule", r"\end{tabular}", r"\end{table}"]
+        with open(out_tex, "w") as fh:
+            fh.write("\n".join(lines) + "\n")
+        print(f"wrote {out_tex}")
+    for r_ in rows:
+        print(f"   [sbc] {r_['sampler']}/{r_['which_stat']}: L={r_['L']} "
+              f"KS D={r_['ks_D']:.4f} p={r_['ks_p']:.4f}")
 
 
 def latex_settings_table(config, out_tex):
@@ -975,6 +1101,8 @@ def main():
     fig_recovery_vs_G(df, os.path.join(figs, "recovery_vs_G.png"))
     fig_accuracy_vs_cost(df, os.path.join(figs, "accuracy_vs_cost.png"))
     fig_calibration(df, os.path.join(figs, "calibration_sd_vs_err.png"))
+    fig_sbc(args.results, os.path.join(figs, "sbc_ranks.png"),
+            out_tex=os.path.join(tables, "sbc_table.tex"))
     fig_throughput(df, os.path.join(figs, "throughput_ess.png"))
     print("done.")
 
