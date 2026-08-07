@@ -51,6 +51,60 @@ def simulate(G, eta, t_end, seed=42, sc_size=None):
     return r, rv_t, bold, bold_t
 
 
+def _write_stats(stats, out, tag, sweep, fixed, args):
+    r"""Emit the figure's companion table as CSV and as a LaTeX fragment.
+
+    The figure shows regimes qualitatively -- "FCD gains structure around G=0.5" is a
+    claim about a picture. These are the same claims as numbers, from the same runs, so
+    a reader can check what they think they see. Kept beside the figure rather than in
+    make_paper_assets because it describes simulations, not benchmark cells: it has no
+    master_results.csv row to be derived from.
+    """
+    import csv
+    cols = ["G", "eta", "r_mean", "r_std", "bold_sd",
+            "fc_mean", "fc_sd", "fcd_mean", "fcd_sd"]
+    csv_path = os.path.join(out, f"model_dynamics_{tag}_stats.csv")
+    with open(csv_path, "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=cols)
+        w.writeheader()
+        for s in stats:
+            w.writerow({c: s[c] for c in cols})
+    print(f"wrote {csv_path}")
+
+    swept = "G" if sweep == "G" else r"$\eta$"
+    net = f"{args.SC_size}-node" if args.SC_size else "88-node"
+    hdr = (r"$G$" if sweep == "G" else r"$\eta$")
+    lines = [
+        r"\begin{table}[t]\centering",
+        rf"\caption{{Summary statistics for the regimes in the model-dynamics figure, "
+        rf"computed from the same simulations ({net} network, "
+        rf"$t_{{\mathrm{{end}}}}={args.t_end}$, {fixed}). $r$ is the firing rate; "
+        rf"BOLD sd is the temporal sd per region averaged over regions. FC mean is "
+        rf"overall synchrony and FC sd how differentiated the pairs are. The regime "
+        rf"structure is carried by the MEANS: FC mean and FCD mean both peak sharply at "
+        rf"the intermediate coupling and fall away on either side, while FCD sd stays "
+        rf"nearly constant across every regime and so does not discriminate them. Note "
+        rf"the ordering is not monotonic in $G$ -- the strongest coupling has the "
+        rf"highest firing rate but near-baseline FC and FCD.}}",
+        rf"\label{{tab:dynamics:{sweep}}}\small\setlength{{\tabcolsep}}{{5pt}}",
+        r"\begin{tabular}{lrrrrrrr}",
+        r"\toprule",
+        hdr + r" & $\bar r$ & sd$(r)$ & BOLD sd & FC mean & FC sd & FCD mean & FCD sd \\",
+        r"\midrule",
+    ]
+    for s in stats:
+        key = s["G"] if sweep == "G" else s["eta"]
+        lines.append(
+            f"{key:g} & {s['r_mean']:.3g} & {s['r_std']:.3g} & {s['bold_sd']:.3g} & "
+            f"{s['fc_mean']:.3g} & {s['fc_sd']:.3g} & {s['fcd_mean']:.3g} & "
+            f"{s['fcd_sd']:.3g} \\\\")
+    lines += [r"\bottomrule", r"\end{tabular}", r"\end{table}"]
+    tex_path = os.path.join(out, f"model_dynamics_{tag}_stats.tex")
+    with open(tex_path, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    print(f"wrote {tex_path}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--G", type=float, nargs="+", default=[0.2, 0.33, 0.5, 0.7],
@@ -67,7 +121,11 @@ def main():
                          "Pass 10 to match the benchmark's subnetwork.")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
+    # results_folder() creates today's dated folder; an explicit --out did not exist
+    # until the figure tried to save into it, which failed after the simulation had
+    # already run (minutes at t_end=300000).
     out = args.out or utils.results_folder()
+    os.makedirs(out, exist_ok=True)
 
     # sweep eta (at fixed G) if multiple eta given, else sweep G (at fixed eta)
     if len(args.eta) > 1:
@@ -83,6 +141,7 @@ def main():
     # [0, 1], every region drawn at lw=0.1, and time in SECONDS (the model integrates in
     # ms, so the axis is divided by 1000).
     nrow = len(rows)
+    stats = []                    # one entry per row; written out beside the figure
     step = 10                     # decimate traces for a legible line density
     fig = plt.figure(figsize=(13, 2.35 * nrow))
     # Column 0 is a narrow strip carrying the row label (the swept value). Putting it
@@ -155,13 +214,38 @@ def main():
         ax4.set_title("FCD"); ax4.set_xticks([]); ax4.set_yticks([])
         fig.colorbar(im2, ax=ax4, fraction=0.046, pad=0.04)
 
+        # --- companion statistics, from THIS run ---
+        # Computed inside the same loop, from the same arrays the panels are drawn from,
+        # so the table cannot drift from the figure. (Recomputing them in a second script
+        # is how make_paper_assets' recovery figure came to disagree with its own table.)
+        iu = np.triu_indices_from(FC, k=1)          # off-diagonal only: the unit diagonal
+        fc_off = FC[iu]                             # would inflate every FC summary
+        fcd_off = FCD[np.triu_indices_from(FCD, k=1)]
+        stats.append({
+            "G": float(G), "eta": float(eta),
+            # firing-rate level and its variability across time and regions
+            "r_mean": float(np.mean(r)), "r_std": float(np.std(r)),
+            # BOLD amplitude: temporal sd per region, averaged over regions
+            "bold_sd": float(np.mean(np.std(bold, axis=0))),
+            # FC: mean is overall synchrony, sd is how differentiated the pairs are.
+            # A saturated network has HIGH mean and LOW sd -- everything correlated with
+            # everything -- which is why both are needed to read the FC panel.
+            "fc_mean": float(np.mean(fc_off)), "fc_sd": float(np.std(fc_off)),
+            # FCD sd is the switching measure: a static regime gives a near-constant FCD
+            # (sd ~ 0) whatever its mean, while switching produces the off-diagonal
+            # blocks visible in the panel.
+            "fcd_mean": float(np.mean(fcd_off)), "fcd_sd": float(np.std(fcd_off)),
+        })
+
         print(f"G={G} eta={eta}: r{r.shape} bold{bold.shape} "
               f"FC{FC.shape} FCD{FCD.shape} ({r.shape[1]} regions plotted)")
 
     fig.tight_layout()
-    f = os.path.join(out, f"model_dynamics_sweep{sweep}_tend{args.t_end}.png")
+    tag = f"sweep{sweep}_tend{args.t_end}" + (f"_SC{args.SC_size}" if args.SC_size else "")
+    f = os.path.join(out, f"model_dynamics_{tag}.png")
     fig.savefig(f, dpi=300, bbox_inches="tight"); plt.close(fig)
     print(f"wrote {f}")
+    _write_stats(stats, out, tag, sweep, fixed, args)
 
 
 if __name__ == "__main__":
