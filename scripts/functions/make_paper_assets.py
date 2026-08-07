@@ -33,8 +33,12 @@ COLORS = {"gpu": "#295785", "cpu": "#B5651D"}
 
 # Validated categorical order, shared with plot_ess_scaling so a sampler keeps the same
 # hue across every figure in the paper. All six palette checks pass in light mode.
-PALETTE = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"]
-SAMPLER_ORDER = ["smc_abc", "smc_lik", "demc", "rwmh", "slice", "demcz"]
+# 7th slot (#7d4bc4) added for smc_abc_demc. Validated with the dataviz palette checker
+# at 7 slots, light surface: lightness band, chroma floor, CVD separation and
+# normal-vision floor all PASS, and the purple does not become the worst adjacent pair
+# (that remains the pre-existing #eda100/#1baf7a at dE 9.1 protan).
+PALETTE = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#7d4bc4"]
+SAMPLER_ORDER = ["smc_abc", "smc_lik", "demc", "rwmh", "slice", "demcz", "smc_abc_demc"]
 
 
 # mpr_jax_pymc.py records the sampler as a DISPLAY string (one even contains LaTeX),
@@ -594,17 +598,48 @@ def latex_config_subtables(df, out_tex, Gs, label_stem="tab:cells", intro=None):
 # Giving it a seventh hue would mean an unvalidated palette step; instead it shares the
 # ABC hue (same entity) and is separated by marker (different kernel), which is the
 # composite encoding a variant calls for.
-# Variants of a sampler share its hue and are separated by marker: they are the same
-# entity under a different setting, and inventing a hue per variant would mean palette
-# steps nobody validated. smc_abc_eps10 is the uncalibrated (epsilon=10) pymc ABC, kept
-# visible rather than folded into smc_abc so a reader can see it is a weaker setting.
-_VARIANT_OF = {"smc_abc_demc": "smc_abc", "smc_abc_eps10": "smc_abc"}
-_VARIANT_MARKER = {"smc_abc_demc": "s", "smc_abc_eps10": "^"}
+# Marker encodes BACKEND+FRAMEWORK, matching fig:smc_scaling, so the same visual channel
+# means the same thing in every figure. It previously encoded sampler variants here
+# (backend being the facet), which left a reader decoding two different grammars three
+# figures apart. Variants now get their own validated hue instead; and once JAX-on-CPU
+# cells exist, a CPU panel genuinely contains two frameworks, so this channel earns its
+# keep rather than being constant within a panel.
+#   filled circle = JAX on GPU
+#   open circle   = JAX on CPU  (same code, different device)
+#   cross         = PyMC on CPU (different framework entirely)
+def _backend_style(framework, platform):
+    fw, plat = str(framework), str(platform)
+    if fw.startswith("pymc"):
+        return dict(marker="X", markerfacecolor=None, markeredgecolor="white",
+                    markeredgewidth=0.6, ms=9)
+    if plat == "cpu":
+        return dict(marker="o", markerfacecolor="none", markeredgecolor=None,
+                    markeredgewidth=1.8, ms=8)
+    return dict(marker="o", markerfacecolor=None, markeredgecolor="white",
+                markeredgewidth=1.2, ms=8)
 
 
-def _sampler_style(samp, colors):
-    base = _VARIANT_OF.get(samp, samp)
-    return colors.get(base, "#777777"), _VARIANT_MARKER.get(samp, "o")
+def _backend_legend_handles():
+    mk = lambda **kw: plt.Line2D([], [], linestyle="none", color="#666666", **kw)
+    return [
+        (mk(marker="o", ms=8, markeredgecolor="white", markeredgewidth=1.2),
+         "JAX, GPU"),
+        (mk(marker="o", ms=8, markerfacecolor="none", markeredgecolor="#666666",
+            markeredgewidth=1.8), "JAX, CPU (same code)"),
+        (mk(marker="X", ms=9, markeredgecolor="white", markeredgewidth=0.6),
+         "PyMC, CPU (other framework)"),
+    ]
+
+
+# smc_abc_eps10 is the SAME sampler as smc_abc at a looser tolerance, so it takes the ABC
+# hue rather than a seventh-plus palette step or the grey fallback (grey reads as "other",
+# which it is not). The marker already separates it: every eps=10 cell is pymc, hence a
+# cross, while the calibrated cells are JAX circles.
+_HUE_ALIAS = {"smc_abc_eps10": "smc_abc"}
+
+
+def _hue(samp, colors):
+    return colors.get(_HUE_ALIAS.get(samp, samp), "#777777")
 
 
 def _samplers_present(d):
@@ -681,10 +716,12 @@ def fig_accuracy_vs_cost(df, out_png):
             g = sub[sub["sampler"] == samp]
             if g.empty:
                 continue
-            c, mk = _sampler_style(samp, colors)
-            ax.plot(g["runtime_sec"] / 1e3, g["abs_err"], mk, ms=8,
-                    color=c, alpha=0.9, markeredgecolor="white", markeredgewidth=1.2,
-                    zorder=3, label=samp)
+            c = _hue(samp, colors)
+            for (fw, plat), gg in g.groupby(["framework", "platform"], dropna=False):
+                st = _backend_style(fw, plat)
+                st = {k: (c if v is None else v) for k, v in st.items()}
+                ax.plot(gg["runtime_sec"] / 1e3, gg["abs_err"], linestyle="none",
+                        color=c, alpha=0.9, zorder=3, label=samp, **st)
         ax.set_xscale("log"); ax.set_yscale("log")
         ax.set_title(f"{stat}, {plat.upper()}", fontsize=10)
         ax.grid(True, which="both", ls=":", alpha=0.4)
@@ -703,8 +740,8 @@ def fig_accuracy_vs_cost(df, out_png):
         ax.set_ylabel(r"$|\Delta G|$")
     for ax in axes[:len(combos)]:
         ax.label_outer()
-    _shared_legend(fig, axes[:len(combos)])
-    fig.tight_layout(rect=(0, 0.05, 1, 1))
+    _shared_legend(fig, axes[:len(combos)], extra=_backend_legend_handles())
+    fig.tight_layout(rect=(0, 0.08, 1, 1))
     fig.savefig(out_png, dpi=300, bbox_inches="tight"); plt.close(fig)
     print(f"wrote {out_png} ({len(d)} cells)")
 
@@ -745,17 +782,21 @@ def fig_calibration(df, out_png):
             g = sub[sub["sampler"] == samp]
             if g.empty:
                 continue
-            _c, _mk = _sampler_style(samp, colors)
-            for floored, mk in ((False, _mk), (True, _mk)):
-                gg = g[g["floored"] == floored]
-                if gg.empty:
-                    continue
-                ax.plot(gg["abs_err"], gg["sd_plot"], mk, ms=8,
-                        color="none" if floored else _c,
-                        markerfacecolor="none" if floored else _c,
-                        markeredgecolor=_c if floored else "white",
-                        markeredgewidth=1.8 if floored else 1.2,
-                        alpha=0.9, zorder=3, label=samp if not floored else None)
+            _c = _hue(samp, colors)
+            for (fw, plat), gsub in g.groupby(["framework", "platform"], dropna=False):
+                st0 = _backend_style(fw, plat)
+                for floored in (False, True):
+                    gg = gsub[gsub["floored"] == floored]
+                    if gg.empty:
+                        continue
+                    st = {k: (_c if v is None else v) for k, v in st0.items()}
+                    if floored:      # sd below reporting precision: hollow + heavier ring
+                        st["markerfacecolor"] = "none"
+                        st["markeredgecolor"] = _c
+                        st["markeredgewidth"] = 1.8
+                    ax.plot(gg["abs_err"], gg["sd_plot"], linestyle="none", color=_c,
+                            alpha=0.9, zorder=3,
+                            label=samp if not floored else None, **st)
         ax.set_xscale("log"); ax.set_yscale("log")
         ax.set_xlim(lo, hi); ax.set_ylim(lo, hi)
         ax.set_aspect("equal", adjustable="box")
@@ -777,7 +818,8 @@ def fig_calibration(df, out_png):
                        markerfacecolor="none", markeredgecolor="#777777",
                        markeredgewidth=1.8)
     _shared_legend(fig, axes[:len(combos)],
-                   extra=[(proxy, "sd below reporting precision")])
+                   extra=_backend_legend_handles()
+                         + [(proxy, "sd below reporting precision")])
     fig.tight_layout(rect=(0, 0.05, 1, 1))
     fig.savefig(out_png, dpi=300, bbox_inches="tight"); plt.close(fig)
     n_f = int(d["floored"].sum())
@@ -789,6 +831,77 @@ def _sbc_files(results_dirs):
     for d in results_dirs:
         out += glob.glob(os.path.join(d, "**", "sbc_ranks_*.npz"), recursive=True)
     return sorted(set(out))
+
+
+def fig_sbc_recovery(results_dirs, out_png):
+    r"""Per-replicate recovery over the SBC prior draws: $\hat G$ against $G^\star$.
+
+    The rank ECDF (fig_sbc) compresses each replicate to a single number, which is what
+    makes the calibration test sharp but also hides what the posteriors actually did. This
+    shows the raw material: one point per replicate at its own prior-drawn ground truth,
+    with the central 94% of the posterior as a vertical bar.
+
+    It is a different picture from the benchmark recovery figure. There, four hand-picked
+    $G^\star$ are each run once; here 100 ground truths are DRAWN FROM THE PRIOR, so the
+    density of points along the axis is the prior itself and the coverage of the bars over
+    the identity line is what the SBC ranks formalise.
+    """
+    files = _sbc_files(results_dirs)
+    if not files:
+        print("(SBC recovery figure skipped: no sbc_ranks_*.npz found)"); return
+    colors = {s_: PALETTE[i % len(PALETTE)] for i, s_ in enumerate(SAMPLER_ORDER)}
+
+    panels = []
+    for f in files:
+        base = os.path.basename(f)[len("sbc_ranks_"):-len(".npz")]
+        samp = base.rsplit("_", 1)[0]; stat = base.rsplit("_", 1)[-1]
+        d = os.path.dirname(f)
+        rows = []
+        for g in sorted(glob.glob(os.path.join(d, "draws_*.npz"))):
+            if f"sampler_{samp}_" not in os.path.basename(g):
+                continue
+            if f"which_stat_{stat}_" not in os.path.basename(g):
+                continue
+            z = np.load(g)
+            v = np.asarray(z["G"], float).ravel()
+            v = v[np.isfinite(v)]
+            if v.size == 0:
+                continue
+            rows.append((float(z["G_true"]), float(v.mean()),
+                         float(np.percentile(v, 3)), float(np.percentile(v, 97))))
+        if rows:
+            panels.append((samp, stat, np.array(rows)))
+    if not panels:
+        print("(SBC recovery figure skipped: no matching draws_*.npz)"); return
+
+    fig, axes = plt.subplots(1, len(panels), figsize=(5.0 * len(panels), 4.6),
+                             sharex=True, sharey=True)
+    axes = np.atleast_1d(axes)
+    allv = np.concatenate([p_[2][:, :1].ravel() for p_ in panels]
+                          + [p_[2][:, 1:].ravel() for p_ in panels])
+    lim = (0.0, float(np.nanpercentile(allv, 99.5)) * 1.05)
+    for ax, (samp, stat, a) in zip(axes, panels):
+        c = _hue(samp, colors)
+        ax.plot(lim, lim, "-", color="#999999", lw=1.2, zorder=1)
+        # central 94% of the posterior; drawn first and thin so the means stay readable
+        ax.vlines(a[:, 0], a[:, 2], a[:, 3], color=c, lw=0.8, alpha=0.35, zorder=2)
+        ax.plot(a[:, 0], a[:, 1], "o", ms=4.5, color=c, alpha=0.95,
+                markeredgecolor="white", markeredgewidth=0.6, zorder=3)
+        cov = float(np.mean((a[:, 0] >= a[:, 2]) & (a[:, 0] <= a[:, 3])) * 100.0)
+        ax.set_title(f"{samp} ({stat})", fontsize=10)
+        ax.set_xlabel(r"prior-drawn truth $G^\star$")
+        ax.set_xlim(*lim); ax.set_ylim(*lim)
+        ax.set_aspect("equal", adjustable="box")
+        ax.grid(True, ls=":", alpha=0.4)
+        for sp in ("top", "right"):
+            ax.spines[sp].set_visible(False)
+        ax.annotate(f"{len(a)} replicates\n{cov:.0f}% of bars cover the truth",
+                    xy=(0.04, 0.88), xycoords="axes fraction", fontsize=8.5,
+                    color="#444444", va="top")
+    axes[0].set_ylabel(r"posterior mean $\hat G$")
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=300, bbox_inches="tight"); plt.close(fig)
+    print(f"wrote {out_png} ({', '.join(f'{s_}:{len(a)}' for s_, _, a in panels)})")
 
 
 def fig_sbc(results_dirs, out_png, out_tex=None, conf=0.95):
@@ -997,10 +1110,13 @@ def fig_recovery_vs_G(df, out_png):
         for i, samp in enumerate(present):
             g = series[samp]
             dx = (i - (len(present) - 1) / 2.0) * span
-            _c, _mk = _sampler_style(samp, colors)
+            _c = _hue(samp, colors)
+            _fw = str(g["framework"].iloc[0]) if "framework" in g else ""
+            st = _backend_style(_fw, plat)
+            st = {k: (_c if v is None else v) for k, v in st.items()}
+            st["ms"] = max(5.5, st.get("ms", 6) - 2)
             ax.plot(g["G_true"].astype(float) + dx, g[ycol].astype(float), ls,
-                    color=_c, marker=_mk, ms=5.5, lw=1.8,
-                    alpha=0.95, markeredgecolor="white", markeredgewidth=0.8, zorder=3)
+                    color=_c, lw=1.8, alpha=0.95, zorder=3, **st)
         ax.set_title(f"{stat}, {plat.upper()}", fontsize=10)
         ax.set_xlim(*lim); ax.set_ylim(*lim)
         ax.set_xticks(gs); ax.set_yticks(gs)
@@ -1101,6 +1217,7 @@ def main():
     fig_recovery_vs_G(df, os.path.join(figs, "recovery_vs_G.png"))
     fig_accuracy_vs_cost(df, os.path.join(figs, "accuracy_vs_cost.png"))
     fig_calibration(df, os.path.join(figs, "calibration_sd_vs_err.png"))
+    fig_sbc_recovery(args.results, os.path.join(figs, "sbc_recovery.png"))
     fig_sbc(args.results, os.path.join(figs, "sbc_ranks.png"),
             out_tex=os.path.join(tables, "sbc_table.tex"))
     fig_throughput(df, os.path.join(figs, "throughput_ess.png"))

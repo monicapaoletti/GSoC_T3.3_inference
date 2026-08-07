@@ -43,7 +43,7 @@ echo "== 1. benchmark figures (recovery, accuracy-vs-cost, calibration) + all ta
 # make_paper_assets writes straight into the paper; mirror its outputs into the dated
 # results folder too, so every figure the manuscript uses also has a copy filed under
 # the day it was produced -- the same convention steps 2-4 follow.
-for f in recovery_vs_G accuracy_vs_cost calibration_sd_vs_err sbc_ranks throughput_ess; do
+for f in recovery_vs_G accuracy_vs_cost calibration_sd_vs_err sbc_recovery sbc_ranks throughput_ess; do
   [ -f "$FIGS/$f.png" ] && cp "$FIGS/$f.png" "$TODAY/"
 done
 [ -f "$PAPER/tables/sbc_table.tex" ] && cp "$PAPER/tables/sbc_table.tex" "$TODAY/"
