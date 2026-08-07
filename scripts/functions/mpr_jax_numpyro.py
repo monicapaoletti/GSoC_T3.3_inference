@@ -464,6 +464,11 @@ def main():
     which_stat = args.which_stat.upper()
     resultspath = args.save_dir or utils.results_folder()
 
+    # Per-stage sampler diagnostics, bound by the sampler branches below. Initialised here
+    # so the save block can test it: the NUTS path never binds it (it reports through its
+    # own `infos`), and reading an unbound name there would be a NameError.
+    info = None
+
     print("Running inference with parameters:")
     print(f"G = {G}, t_end = {t_end}, tr = {tr}, cut = {cut}, wwidth = {wwidth}, "
           f"maxWindows = {maxWindows}, olap = {olap}")
@@ -917,6 +922,21 @@ def main():
     # draws compactly on request -- .npz of float32, not the full netcdf trace.
     if args.save_draws:
         fname_draws = os.path.join(resultspath, f"draws_{tag}.npz")
+        # Sampler-health diagnostics travel WITH the draws. Without them a non-uniform SBC
+        # histogram cannot be attributed: genuinely miscalibrated inference and a degenerate
+        # sampler look identical in the ranks. `diag_ess` is the per-stage importance-weight
+        # ESS (1/sum(w^2) from smc_jax) -- NOT the ess_bulk in the summary csv, which is
+        # ArviZ's autocorrelation ESS and is meaningless for an exchangeable particle cloud.
+        # `diag_accept` is the per-stage acceptance of the MH rejuvenation moves: near 0 means
+        # resampled duplicates never separated. `n_unique` measures the resulting
+        # impoverishment directly, and is the one diagnostic recoverable from draws alone.
+        _diag = {}
+        if info is not None:
+            for _k in ("ess", "accept"):
+                if _k in info:
+                    _diag[f"diag_{_k}"] = np.asarray(info[_k], dtype=np.float32)
+        _g = np.asarray(posterior_samples.posterior["G"].values).ravel()
+        _diag["n_unique"] = np.int64(np.unique(_g[np.isfinite(_g)]).size)
         np.savez_compressed(
             fname_draws,
             G=np.asarray(posterior_samples.posterior["G"].values, dtype=np.float32),
@@ -924,6 +944,7 @@ def main():
             seed=np.int64(seed),
             var_names=np.array(var_names),
             theta_true=np.asarray(theta_true, dtype=np.float32),
+            **_diag,
             **{nm: np.asarray(posterior_samples.posterior[nm].values, dtype=np.float32)
                for nm in var_names if nm != "G"},
         )

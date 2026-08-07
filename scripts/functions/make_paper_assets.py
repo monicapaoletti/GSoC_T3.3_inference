@@ -340,6 +340,421 @@ def latex_full_grid_table(df, out_tex, label="tab:fullgrid"):
     print(f"wrote {out_tex} ({len(cells)} rows x {len(Gs)} G values)")
 
 
+def latex_master_table(df, out_tex, cost_G=0.2, label="tab:accuracy"):
+    r"""THE benchmark table: accuracy across every $G^\star$ AND cost, in one place.
+
+    Supersedes the tab:accuracy / tab:fullgrid pair. Those had identical rows and split
+    the columns between them -- one showed cost at a single $G^\star$, the other showed
+    accuracy at all of them -- so every benchmark update meant regenerating two tables
+    and keeping two captions honest. Here each row is one (sampler, backend, feature)
+    cell, with a $|\Delta G|$/$\widehat{R}$ block per $G^\star$ followed by cost.
+
+    Cost is reported at ONE coupling (`cost_G`), because runtime and ESS/s are a property
+    of the budget, not of $G^\star$, and repeating them per block would quadruple the
+    width to restate the same number. The caption says which coupling, so this is a stated
+    convention rather than a silent one.
+
+    Runtime is in kiloseconds: `3.551e+04` is four characters wider than `35.5` in every
+    row, and at 13 columns that difference decides whether the table fits the page.
+    """
+    df = bench_subset(df)
+    Gs = sorted(df["G_true"].dropna().astype(float).unique())
+    sub = _latest_per_cell(df, ["sampler", "platform", "which_stat", "G_true"])
+    idx = sub.set_index(["sampler", "platform", "which_stat",
+                         sub["G_true"].astype(float).round(4)])
+    cells = sorted({(r.sampler, r.platform, r.which_stat) for r in sub.itertuples()})
+    ncols = 3 + 2 * len(Gs) + 2
+
+    lines = [
+        r"\begin{table*}[t]\centering",
+        r"\caption{Gradient-free benchmark: every measured cell, at the latest version "
+        r"of each. Rows are sampler $\times$ backend $\times$ feature; each $G^\star$ "
+        r"block gives $|\Delta G|=|\hat G-G^\star|$ and $\widehat{R}$. Cost (runtime, "
+        r"ESS/s) is reported at $G^\star=%s$, since it is set by the budget rather than "
+        r"by the coupling. ``--'' = not run, or no $\widehat{R}$ for single-population "
+        r"SMC. Representative run per cell: widest batch, longest budget, most recent.}"
+        % _fmt(cost_G, 2),
+        rf"\label{{{label}}}\footnotesize\setlength{{\tabcolsep}}{{3pt}}",
+        r"\begin{tabular}{lll" + "rr" * len(Gs) + "rr}",
+        r"\toprule",
+        r"& & & " + " & ".join(rf"\multicolumn{{2}}{{c}}{{$G^\star={_fmt(G,2)}$}}"
+                               for G in Gs)
+        + rf" & \multicolumn{{2}}{{c}}{{Cost at $G^\star={_fmt(cost_G,2)}$}} \\",
+        r"Sampler & Backend & Feat. & " +
+        " & ".join([r"$|\Delta G|$ & $\widehat{R}$"] * len(Gs)) +
+        r" & runtime (ks) & ESS/s \\",
+        r"\midrule",
+    ]
+    for samp, plat, feat in cells:
+        star = "$^{*}$" if (samp, plat) in _CAVEATS else ""
+        vals = []
+        for G in Gs:
+            try:
+                r = idx.loc[(samp, plat, feat, round(float(G), 4))]
+                if isinstance(r, pd.DataFrame):
+                    r = r.iloc[-1]
+                vals += [_fmt(r.get("abs_err")), _fmt_rhat(r.get("max_r_hat"), 3)]
+            except KeyError:
+                vals += ["--", "--"]
+        # cost block: same cell, at the reference coupling only
+        try:
+            rc = idx.loc[(samp, plat, feat, round(float(cost_G), 4))]
+            if isinstance(rc, pd.DataFrame):
+                rc = rc.iloc[-1]
+            rt = rc.get("runtime_sec")
+            rt_ks = float(rt) / 1000.0 if rt is not None and np.isfinite(
+                pd.to_numeric(rt, errors="coerce")) else np.nan
+            vals += [_fmt(rt_ks, 3), _fmt(rc.get("ess_per_sec"), 3)]
+        except KeyError:
+            vals += ["--", "--"]
+        lines.append(f"{_tt(samp)}{star} & {plat} & {feat} & " + " & ".join(vals) + r" \\")
+    lines += ([r"\bottomrule"] + _provisional_note(sub, ncols=ncols)
+              + [r"\end{tabular}", r"\end{table*}"])
+    with open(out_tex, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    print(f"wrote {out_tex} ({len(cells)} rows x {len(Gs)} G values + cost)")
+
+
+_METRICS = [
+    # (header, csv column, formatter). THE column list: add or remove a line and the
+    # subtables follow, no other edit needed.
+    #
+    # Selected 2026-08-06 from the full menu the runs record. Dropped, with reasons:
+    #   G_hat          -- near-derivable from G* and |dG|; only the SIGN of the bias is
+    #                     lost, and no claim currently rests on it. (Reporting a SIGNED
+    #                     dG instead of |dG| would carry both in one column, at the cost
+    #                     of changing a convention the caption and prose already fix.)
+    #   coverage_94hdi -- 259 of 263 benchmark cells identical (all check); with one run
+    #                     per cell it is a single yes/no, not a coverage RATE.
+    #   min_ess_bulk   -- Spearman 0.79 with ess_per_sec, which is the budget-normalised
+    #                     one the text actually argues from.
+    #
+    # HDI is kept DESPITE Spearman 0.88 with sd: the ratio HDI/sd has median 2.81 against
+    # the Gaussian 3.75, and 130 of 260 cells sit >25% off that, so these posteriors are
+    # not Gaussian and HDI is not a rescaled sd -- it reports shape.
+    # runtime is kept because ESS/s is a RATE and cannot reconstruct a duration; the
+    # paper's cost argument quotes durations ("31 h per cell", "0.75-2.1 ks vs 15-50 ks").
+    (r"$|\Delta G|$",          "abs_err",        lambda r: _fmt(r.get("abs_err"), 3)),
+    (r"sd",                    "G_sd",           lambda r: _fmt(r.get("G_sd"), 3)),
+    (r"HDI$_{94}$",            "G_lo",           lambda r: _hdi_width(r)),
+    (r"$\widehat{R}$",         "max_r_hat",      lambda r: _fmt_rhat(r.get("max_r_hat"), 3)),
+    (r"ESS/s",                 "ess_per_sec",    lambda r: _fmt(r.get("ess_per_sec"), 3)),
+    (r"time (ks)",             "runtime_sec",    lambda r: _ks(r.get("runtime_sec"))),
+    (r"batch",                 "batch",          lambda r: _fmt(r.get("batch"), 4)),
+]
+
+
+def _hdi_width(r):
+    try:
+        w = float(r.get("G_hi")) - float(r.get("G_lo"))
+        return f"{w:.3g}" if np.isfinite(w) else "--"
+    except Exception:
+        return "--"
+
+
+def _cov(r):
+    r"""94% HDI coverage as a check/cross. It is 0/1 per cell, not a rate: with one run
+    per cell there is nothing to average, so printing `0.0`/`1.0` invites reading it as a
+    frequency."""
+    try:
+        v = float(r.get("coverage_94hdi"))
+    except Exception:
+        return "--"
+    if not np.isfinite(v):
+        return "--"
+    return r"\checkmark" if v >= 0.5 else r"$\times$"
+
+
+def _ks(x):
+    """Runtime in kiloseconds -- see latex_master_table on why not seconds."""
+    try:
+        v = float(x)
+    except Exception:
+        return "--"
+    return f"{v/1000.0:.3g}" if np.isfinite(v) else "--"
+
+
+def _g_slug(G):
+    """G* as a label-safe slug: 0.33 -> 033. A '.' in a \label is legal but a menace to
+    grep for, and hyperref renders it inconsistently across backends."""
+    return _fmt(G, 2).replace(".", "").replace("-", "m")
+
+
+def latex_config_subtables(df, out_tex, Gs, label_stem="tab:cells", intro=None):
+    r"""Per-configuration metric tables: ONE numbered table per $G^\star$, with the four
+    {FC,FCD} x {cpu,gpu} configurations as parts (a)-(d).
+
+    Backend and feature are the identity of each part rather than columns, which frees the
+    width for the metrics. $G^\star$ is fixed per table, so each part is 6 sampler rows
+    instead of 24. Grouping the four into one float means the text cites a single table
+    number, and -- the bigger win -- the shared column conventions are stated ONCE in the
+    parent caption instead of being repeated four times with four chances to drift apart.
+
+    The G-dependence is not lost: `fig_recovery_vs_G` is faceted 2x2 over exactly this
+    configuration grid and shows every coupling, so the figure carries the regime story
+    and these tables carry the per-cell detail. Couplings not in the body get the identical
+    treatment in the supplement -- hence `Gs` is a list, called once per destination file.
+    """
+    df = bench_subset(df)
+    sub = _latest_per_cell(df, ["sampler", "platform", "which_stat", "G_true"])
+    out = list(intro) if intro else []
+
+    for G in Gs:
+        at_G = sub[np.isclose(sub["G_true"].astype(float), float(G))]
+        if at_G.empty:
+            continue
+        blocks, caveats = [], set()
+        for feat in ("FC", "FCD"):
+            for plat in ("cpu", "gpu"):
+                block = at_G[(at_G["which_stat"] == feat) & (at_G["platform"] == plat)]
+                if block.empty:
+                    continue
+                rows = []
+                for samp in sorted(block["sampler"].unique()):
+                    star = ""
+                    if (samp, plat) in _CAVEATS:
+                        star = "$^{*}$"
+                        caveats.add((samp, plat))
+                    r = block[block["sampler"] == samp].iloc[-1]
+                    rows.append(f"{_tt(samp)}{star} & "
+                                + " & ".join(f(r) for _, _, f in _METRICS) + r" \\")
+                blocks.append((feat, plat, rows))
+        if not blocks:
+            continue
+
+        out += [
+            r"\begin{table}[p]\centering",
+            rf"\caption{{Per-run metrics at $G^\star={_fmt(G,2)}$, one part per feature "
+            rf"and backend, at the latest version of each run. "
+            rf"$|\Delta G|=|\hat G-G^\star|$; sd and HDI$_{{94}}$ describe the posterior "
+            rf"width; ESS/s is budget-normalized throughput; batch is the parallel width "
+            rf"(chains or particles) the cell was run at. ``--'' = not run, or not defined "
+            rf"for that sampler (single-population SMC has no $\widehat{{R}}$).}}",
+            rf"\label{{{label_stem}:{_g_slug(G)}}}",
+        ]
+        for i, (feat, plat, rows) in enumerate(blocks):
+            out += [
+                r"\begin{subtable}{\linewidth}\centering",
+                rf"\caption{{{feat} on {plat.upper()}}}",
+                rf"\label{{{label_stem}:{_g_slug(G)}:{feat}:{plat}}}",
+                r"\footnotesize\setlength{\tabcolsep}{4pt}",
+                r"\begin{tabular}{l" + "r" * len(_METRICS) + "}",
+                r"\toprule",
+                r"Sampler & " + " & ".join(h for h, _, _ in _METRICS) + r" \\",
+                r"\midrule",
+            ] + rows + [r"\bottomrule", r"\end{tabular}", r"\end{subtable}"]
+            if i < len(blocks) - 1:
+                out.append(r"\vspace{7pt}")
+        # One caveat note for the whole table rather than one per part: the flagged cells
+        # recur across parts and repeating the footnote four times reads as four problems.
+        if caveats:
+            bits = "; ".join(f"{_tt(s)} ({p}): {_CAVEATS[(s, p)]}"
+                             for (s, p) in sorted(caveats))
+            out += [r"\vspace{4pt}",
+                    r"{\footnotesize $^{*}$Not to be read as a settled number. "
+                    + bits + r".}"]
+        out += [r"\end{table}", ""]
+
+    with open(out_tex, "w") as fh:
+        fh.write("\n".join(out) + "\n")
+    n = sum(1 for l in out if l.startswith(r"\begin{table}"))
+    m = sum(1 for l in out if l.startswith(r"\begin{subtable}"))
+    print(f"wrote {out_tex} ({n} tables x {m//max(n,1)} parts, "
+          f"G*={[_fmt(g,2) for g in Gs]}, {len(_METRICS)} metrics)")
+
+
+# smc_abc_demc is the DE-MC proposal VARIANT of smc_abc, not a seventh algorithm. It was
+# absent from every figure because they iterate SAMPLER_ORDER, which lists six entries --
+# while the tables include it, so figures and tables disagreed on which cells exist.
+# Giving it a seventh hue would mean an unvalidated palette step; instead it shares the
+# ABC hue (same entity) and is separated by marker (different kernel), which is the
+# composite encoding a variant calls for.
+_VARIANT_OF = {"smc_abc_demc": "smc_abc"}
+_VARIANT_MARKER = "s"
+
+
+def _sampler_style(samp, colors):
+    base = _VARIANT_OF.get(samp, samp)
+    return colors.get(base, "#777777"), (_VARIANT_MARKER if samp in _VARIANT_OF else "o")
+
+
+def _samplers_present(d):
+    """SAMPLER_ORDER first (fixed hue order), then any variant actually in the data."""
+    present = set(d["sampler"].dropna().unique())
+    return [s for s in SAMPLER_ORDER if s in present] + \
+           [s for s in sorted(present - set(SAMPLER_ORDER))]
+
+
+def _shared_legend(fig, axes, extra=None):
+    """Legend built from EVERY panel, ordered by SAMPLER_ORDER.
+
+    Taking handles from the first panel alone silently drops any series absent there --
+    demcz is CPU-only and smc_abc_demc GPU-only, so both were plotted with a colour and
+    no legend entry, which is identity-by-colour-alone with no key.
+    """
+    seen, handles, labels = {}, [], []
+    for ax in axes:
+        for h, l in zip(*ax.get_legend_handles_labels()):
+            if l and l not in seen:
+                seen[l] = h
+    for samp in SAMPLER_ORDER + sorted(set(seen) - set(SAMPLER_ORDER)):
+        if samp in seen:
+            handles.append(seen[samp]); labels.append(samp)
+    if extra:
+        for h, l in extra:
+            handles.append(h); labels.append(l)
+    fig.legend(handles, labels, loc="lower center", ncol=min(7, len(labels)),
+               frameon=False, bbox_to_anchor=(0.5, -0.02))
+
+
+def _facet_axes(nrow=2, ncol=2, size=(5.2, 4.1)):
+    fig, axes = plt.subplots(nrow, ncol, figsize=(size[0] * ncol, size[1] * nrow),
+                             sharex=True, sharey=True)
+    return fig, np.atleast_1d(axes).ravel()
+
+
+def _cells_by_config(df):
+    """One row per benchmark cell, on the SAME subset+pick as the tables and Fig. 5.
+
+    Every figure that shows benchmark cells must route through here. Fig. 5 previously
+    re-picked its own representative run and silently disagreed with the tables on 4 of
+    90 cells; sharing this function is what makes agreement structural rather than lucky.
+    """
+    return _latest_per_cell(bench_subset(df),
+                            ["sampler", "platform", "which_stat", "G_true"])
+
+
+def fig_accuracy_vs_cost(df, out_png):
+    r"""Accuracy against cost: the frontier the benchmark is actually about.
+
+    The manuscript argues accuracy (Fig. recovery) and cost (Fig. ess scaling) in two
+    separate figures that never share axes, so "GPU-batched SMC dominates" is something
+    the reader has to assemble. Here each cell is one point, |dG| against wall-clock, so
+    domination is visible as position: down-left is better on both.
+
+    Log-log because both spread over orders of magnitude (GPU: 386x in error, 159x in
+    runtime). One point per G* per sampler; since runtime is set by the budget rather
+    than the coupling, a sampler's four points stack near-vertically and the spread of
+    that stack IS its accuracy variability at fixed cost.
+    """
+    d = _cells_by_config(df).dropna(subset=["abs_err", "runtime_sec"])
+    d = d[(d["abs_err"] > 0) & (d["runtime_sec"] > 0)]
+    if d.empty:
+        print("(accuracy-vs-cost figure skipped: no data)"); return
+    colors = {s: PALETTE[i % len(PALETTE)] for i, s in enumerate(SAMPLER_ORDER)}
+    combos = [("FC", "gpu"), ("FCD", "gpu"), ("FC", "cpu"), ("FCD", "cpu")]
+    combos = [c for c in combos
+              if not d[(d["which_stat"] == c[0]) & (d["platform"] == c[1])].empty]
+    fig, axes = _facet_axes(2, 2)
+    for ax, (stat, plat) in zip(axes, combos):
+        sub = d[(d["which_stat"] == stat) & (d["platform"] == plat)]
+        for samp in _samplers_present(d):
+            g = sub[sub["sampler"] == samp]
+            if g.empty:
+                continue
+            c, mk = _sampler_style(samp, colors)
+            ax.plot(g["runtime_sec"] / 1e3, g["abs_err"], mk, ms=8,
+                    color=c, alpha=0.9, markeredgecolor="white", markeredgewidth=1.2,
+                    zorder=3, label=samp)
+        ax.set_xscale("log"); ax.set_yscale("log")
+        ax.set_title(f"{stat}, {plat.upper()}", fontsize=10)
+        ax.grid(True, which="both", ls=":", alpha=0.4)
+        for sp in ("top", "right"):
+            ax.spines[sp].set_visible(False)
+    # "better" arrow once, on the first panel: the reading direction is not obvious on a
+    # log-log scatter where both axes are costs to minimise.
+    axes[0].annotate("better", xy=(0.06, 0.10), xytext=(0.30, 0.30),
+                     xycoords="axes fraction", textcoords="axes fraction",
+                     arrowprops=dict(arrowstyle="->", color="#555555", lw=1.4),
+                     color="#555555", fontsize=9, ha="left", va="center")
+    for ax in axes[len(combos):]:
+        ax.set_visible(False)
+    for ax in axes[:len(combos)]:
+        ax.set_xlabel("wall-clock per cell (ks)")
+        ax.set_ylabel(r"$|\Delta G|$")
+    for ax in axes[:len(combos)]:
+        ax.label_outer()
+    _shared_legend(fig, axes[:len(combos)])
+    fig.tight_layout(rect=(0, 0.05, 1, 1))
+    fig.savefig(out_png, dpi=300, bbox_inches="tight"); plt.close(fig)
+    print(f"wrote {out_png} ({len(d)} cells)")
+
+
+# az.summary rounds sd to 3 decimals, so a reported 0.000 means sd < 5e-4, not zero.
+# Such cells cannot be drawn on a log axis and must not be silently dropped -- they are
+# the most alarming cells in the study. They are floored here and drawn hollow, with the
+# caption stating the convention.
+_SD_FLOOR = 5e-4
+
+
+def fig_calibration(df, out_png):
+    r"""Posterior width against actual error: is the reported uncertainty honest?
+
+    |dG| and sd sit in separate table columns, so "confidently wrong" -- small sd at
+    large error -- is invisible unless the reader divides one by the other. Plotting
+    them against each other with the sd=|dG| diagonal makes it positional: on or above
+    the line the posterior covers its own error; far below it the sampler is certain and
+    wrong, which is strictly worse than being uncertain and wrong.
+    """
+    d = _cells_by_config(df).dropna(subset=["abs_err", "G_sd"]).copy()
+    d = d[d["abs_err"] > 0]
+    if d.empty:
+        print("(calibration figure skipped: no data)"); return
+    d["sd_plot"] = d["G_sd"].clip(lower=_SD_FLOOR)
+    d["floored"] = d["G_sd"] < _SD_FLOOR
+    colors = {s: PALETTE[i % len(PALETTE)] for i, s in enumerate(SAMPLER_ORDER)}
+    combos = [("FC", "gpu"), ("FCD", "gpu"), ("FC", "cpu"), ("FCD", "cpu")]
+    combos = [c for c in combos
+              if not d[(d["which_stat"] == c[0]) & (d["platform"] == c[1])].empty]
+    lo = min(d["abs_err"].min(), d["sd_plot"].min()) * 0.5
+    hi = max(d["abs_err"].max(), d["sd_plot"].max()) * 2.0
+    fig, axes = _facet_axes(2, 2)
+    for ax, (stat, plat) in zip(axes, combos):
+        sub = d[(d["which_stat"] == stat) & (d["platform"] == plat)]
+        ax.plot([lo, hi], [lo, hi], "-", color="#999999", lw=1.2, zorder=1)
+        for samp in _samplers_present(d):
+            g = sub[sub["sampler"] == samp]
+            if g.empty:
+                continue
+            _c, _mk = _sampler_style(samp, colors)
+            for floored, mk in ((False, _mk), (True, _mk)):
+                gg = g[g["floored"] == floored]
+                if gg.empty:
+                    continue
+                ax.plot(gg["abs_err"], gg["sd_plot"], mk, ms=8,
+                        color="none" if floored else _c,
+                        markerfacecolor="none" if floored else _c,
+                        markeredgecolor=_c if floored else "white",
+                        markeredgewidth=1.8 if floored else 1.2,
+                        alpha=0.9, zorder=3, label=samp if not floored else None)
+        ax.set_xscale("log"); ax.set_yscale("log")
+        ax.set_xlim(lo, hi); ax.set_ylim(lo, hi)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_title(f"{stat}, {plat.upper()}", fontsize=10)
+        ax.grid(True, which="both", ls=":", alpha=0.4)
+        for sp in ("top", "right"):
+            ax.spines[sp].set_visible(False)
+    axes[0].annotate("posterior covers its error", xy=(0.05, 0.90),
+                     xycoords="axes fraction", fontsize=8, color="#555555")
+    axes[0].annotate("confidently wrong", xy=(0.42, 0.06),
+                     xycoords="axes fraction", fontsize=8, color="#555555")
+    for ax in axes[len(combos):]:
+        ax.set_visible(False)
+    for ax in axes[:len(combos)]:
+        ax.set_xlabel(r"$|\Delta G|$"); ax.set_ylabel("posterior sd")
+        ax.label_outer()
+    # the hollow marker is a second encoding and needs its own key, not just a caption
+    proxy = plt.Line2D([], [], marker="o", ms=8, linestyle="none", color="#777777",
+                       markerfacecolor="none", markeredgecolor="#777777",
+                       markeredgewidth=1.8)
+    _shared_legend(fig, axes[:len(combos)],
+                   extra=[(proxy, "sd below reporting precision")])
+    fig.tight_layout(rect=(0, 0.05, 1, 1))
+    fig.savefig(out_png, dpi=300, bbox_inches="tight"); plt.close(fig)
+    n_f = int(d["floored"].sum())
+    print(f"wrote {out_png} ({len(d)} cells, {n_f} with sd below {_SD_FLOOR} drawn hollow)")
+
+
 def latex_settings_table(config, out_tex):
     try:
         import yaml
@@ -389,9 +804,19 @@ def fig_recovery_vs_G(df, out_png):
     # from the identity line is directly interpretable, and the sign shows whether a
     # sampler over- or under-estimates the coupling.
     ycol = "G_hat" if ("G_hat" in df and df["G_hat"].notna().any()) else "abs_err"
-    d = df.dropna(subset=["G_true", ycol])
+    # Same subset and same per-cell pick as the tables. Both are mandatory, and for the
+    # same reasons the tables need them:
+    #   bench_subset  -- without it the 88-node and long-t_end runs, which share G*=0.2
+    #                    with the benchmark, join these lines while being excluded from
+    #                    the tables, so the two disagree the moment such a run lands.
+    #   _latest_per_cell -- sorting on `batch` alone leaves same-batch re-runs to glob
+    #                    order, which is how the figure came to plot the SUPERSEDED
+    #                    50/100 slice cells while the table showed the budget-matched
+    #                    1000/1000 re-run the text argues from (4 of 90 cells disagreed).
+    d = bench_subset(df).dropna(subset=["G_true", ycol])
     if d.empty:
         print("(recovery figure skipped: no data)"); return
+    d = _latest_per_cell(d, ["sampler", "platform", "which_stat", "G_true"])
 
     colors = {s: PALETTE[i % len(PALETTE)] for i, s in enumerate(SAMPLER_ORDER)}
     # (feature, platform) -> dash pattern. GPU heavier, CPU lighter.
@@ -420,13 +845,14 @@ def fig_recovery_vs_G(df, out_png):
         ax.plot(lim, lim, "-", color="#999999", lw=1.2, zorder=1)
         # one point per G: the widest batch available for that cell
         series = {}
-        for samp in SAMPLER_ORDER:
+        for samp in _samplers_present(d):
             g = d[(d["sampler"] == samp) & (d["which_stat"] == stat)
                   & (d["platform"] == plat)]
             if g.empty:
                 continue
-            series[samp] = (g.sort_values("batch").groupby("G_true").tail(1)
-                             .sort_values("G_true"))
+            # `d` is already one row per cell (see _latest_per_cell above), so this only
+            # orders the line; re-picking here is what previously diverged from the table.
+            series[samp] = g.sort_values("G_true")
 
         # No +/-1 sd shading. It was tried and removed: the poorly-converged cells have
         # posterior sd comparable to the prior width (GPU rwmh on FCD at G*=0.2: sd 0.82
@@ -445,8 +871,9 @@ def fig_recovery_vs_G(df, out_png):
         for i, samp in enumerate(present):
             g = series[samp]
             dx = (i - (len(present) - 1) / 2.0) * span
+            _c, _mk = _sampler_style(samp, colors)
             ax.plot(g["G_true"].astype(float) + dx, g[ycol].astype(float), ls,
-                    color=colors.get(samp, "#777777"), marker="o", ms=5.5, lw=1.8,
+                    color=_c, marker=_mk, ms=5.5, lw=1.8,
                     alpha=0.95, markeredgecolor="white", markeredgewidth=0.8, zorder=3)
         ax.set_title(f"{stat}, {plat.upper()}", fontsize=10)
         ax.set_xlim(*lim); ax.set_ylim(*lim)
@@ -499,10 +926,16 @@ def main():
     ap.add_argument("--config",
                     default=os.path.join(here, "..", "..", "config", "benchmark_config.yaml"))
     ap.add_argument("--out", default=os.path.join(here, "..", "..", "paper"))
-    ap.add_argument("--table_G", type=float, default=0.2)
-    ap.add_argument("--table_label", default="tab:benchmark",
+    ap.add_argument("--table_G", type=float, default=0.2,
+                    help="coupling whose runtime/ESS-per-second fill the cost columns "
+                         "of the master table; accuracy is shown at every G* regardless")
+    ap.add_argument("--table_label", default="tab:accuracy",
                     help="LaTeX label for the benchmark table; set to match the "
                          "\\ref already used in main.tex")
+    ap.add_argument("--legacy_tables", action="store_true",
+                    help="also emit the superseded benchmark_table.tex/full_grid_table.tex "
+                         "pair; main.tex inputs neither since they merged into the master "
+                         "table, so this exists only to reproduce an older draft")
     args = ap.parse_args()
 
     tables = os.path.join(args.out, "tables"); os.makedirs(tables, exist_ok=True)
@@ -513,11 +946,35 @@ def main():
     df.to_csv(master, index=False)
     print(f"wrote {master} ({len(df)} cells)")
 
-    latex_benchmark_table(df, os.path.join(tables, "benchmark_table.tex"),
-                          G=args.table_G, label=args.table_label)
-    latex_full_grid_table(df, os.path.join(tables, "full_grid_table.tex"))
+    # master_table (one wide table, all G* + cost) is SUPERSEDED by the per-configuration
+    # subtables below and is no longer input by main.tex; kept behind --legacy_tables.
+    if args.legacy_tables:
+        latex_master_table(df, os.path.join(tables, "master_table.tex"),
+                           cost_G=args.table_G, label=args.table_label)
+    # Per-config metric tables. The BODY carries one coupling (--table_G); the supplement
+    # repeats the identical four tables for every other coupling, so the main text stays
+    # readable while the full record is still on the page somewhere.
+    all_Gs = sorted(bench_subset(df)["G_true"].dropna().astype(float).unique())
+    supp_Gs = [g for g in all_Gs if not np.isclose(g, args.table_G)]
+    latex_config_subtables(df, os.path.join(tables, "config_subtables_main.tex"),
+                           Gs=[args.table_G])
+    latex_config_subtables(
+        df, os.path.join(tables, "config_subtables_supp.tex"), Gs=supp_Gs,
+        intro=[r"% Supplementary: the same four per-configuration tables as the body,",
+               r"% repeated for every coupling other than the one shown there.",
+               r"\clearpage", r"\section*{Supplementary tables}",
+               rf"\label{{sec:supp-tables}}",
+               r"Tables here repeat the per-configuration layout of the main text for the "
+               r"remaining ground-truth couplings. Columns and conventions are identical; "
+               r"see the body for their definitions.", ""])
+    if args.legacy_tables:
+        latex_benchmark_table(df, os.path.join(tables, "benchmark_table.tex"),
+                              G=args.table_G, label=args.table_label)
+        latex_full_grid_table(df, os.path.join(tables, "full_grid_table.tex"))
     latex_settings_table(args.config, os.path.join(tables, "settings_table.tex"))
     fig_recovery_vs_G(df, os.path.join(figs, "recovery_vs_G.png"))
+    fig_accuracy_vs_cost(df, os.path.join(figs, "accuracy_vs_cost.png"))
+    fig_calibration(df, os.path.join(figs, "calibration_sd_vs_err.png"))
     fig_throughput(df, os.path.join(figs, "throughput_ess.png"))
     print("done.")
 
