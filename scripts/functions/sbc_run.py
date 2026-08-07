@@ -58,6 +58,21 @@ def parse_args():
                         "the same ground truth whichever instance runs it.")
     p.add_argument("--i_end", type=int, default=None,
                    help="last replicate index to run (exclusive); default --L.")
+    p.add_argument("--infer_eta", action="store_true",
+                   help="2-D SBC: draw a (G, eta) PAIR per replicate and infer both. "
+                        "Ranks are recorded for each parameter separately -- a joint "
+                        "posterior can be well calibrated in one coordinate and not the "
+                        "other, and averaging them would hide exactly that.")
+    p.add_argument("--eta_prior_scale", type=float, default=0.1,
+                   help="sigma of LogNormal(log 4.6, sigma) on |eta|; a MULTIPLICATIVE "
+                        "spread, so 0.1 spans |eta| in about [3.8, 5.6] at 95%% while "
+                        "the package default 0.5 spans [1.7, 12.5]. Wide priors make an "
+                        "SBC pass VACUOUS here: most truths land where the data is "
+                        "uninformative, the posterior returns the prior, and the ranks "
+                        "are uniform by construction rather than by calibration.")
+    p.add_argument("--eta_center", type=float, default=4.6,
+                   help="median |eta| of that prior; must match ETA_MAG_DEFAULT in the "
+                        "inference or the SBC draws from a different prior than it fits.")
     p.add_argument("--dry_run", action="store_true",
                    help="print the replicate commands and the prior draws, run nothing")
     return p.parse_args()
@@ -73,10 +88,21 @@ def prior_draws(L, scale, seed):
     return np.abs(rng.normal(0.0, scale, size=L))
 
 
-def draws_path(out_dir, G, seed, a):
+def eta_prior_draws(L, center, sigma, seed):
+    """|eta| ~ LogNormal(log center, sigma), the SAME prior the inference uses when
+    --infer_eta is on. Drawing the truth from a different prior than the one being fitted
+    is not a stricter test, it is an invalid one: SBC's uniformity result assumes they
+    match."""
+    rng = np.random.default_rng(seed + 977)      # offset: independent of the G stream
+    return np.exp(rng.normal(np.log(center), sigma, size=L))
+
+
+def draws_path(out_dir, G, seed, a, eta=None):
     """Mirror the inner script's TAG so we can find what it wrote (and resume)."""
     backend = "gpu" if os.environ.get("JAX_PLATFORMS", "") != "cpu" else "cpu"
-    tag = (f"G{G}_cut{a.cut}_tr{a.tr}_seed{seed}_tend{a.t_end}_ns20_nc1_"
+    # mirrors the inference's tag: eta appears only when it differs from the default
+    _et = "" if (eta is None or abs(float(eta) - (-4.6)) < 1e-9) else f"_eta{eta}"
+    tag = (f"G{G}{_et}_cut{a.cut}_tr{a.tr}_seed{seed}_tend{a.t_end}_ns20_nc1_"
            f"SC_{a.SC_size}_sampler_{a.sampler}_which_stat_{a.which_stat}_"
            f"{backend}_cmvectorized_np{a.n_particles}")
     exact = os.path.join(out_dir, f"draws_{tag}.npz")
@@ -84,14 +110,18 @@ def draws_path(out_dir, G, seed, a):
         return exact
     # the tag embeds n_samples/backend, which we do not control precisely from here;
     # fall back to matching on the fields that uniquely identify this replicate.
-    hits = glob.glob(os.path.join(out_dir, f"draws_G{G}_*seed{seed}_*{a.sampler}_"
+    # The eta component must be part of the pattern, not left to the wildcard. Without
+    # it "draws_G0.2_*seed1000_*" matches BOTH the 1-D file and any 2-D file at the same
+    # G and seed, so a 2-D replicate would be reported "already done" and silently reuse
+    # a 1-D result -- and a 1-D re-run could pick up a 2-D one.
+    hits = glob.glob(os.path.join(out_dir, f"draws_G{G}{_et}_cut*seed{seed}_*{a.sampler}_"
                                            f"which_stat_{a.which_stat}_*.npz"))
     return hits[0] if hits else None
 
 
-def run_replicate(i, G, a):
+def run_replicate(i, G, a, eta=None):
     seed = 1000 + i
-    have = draws_path(a.out_dir, G, seed, a)
+    have = draws_path(a.out_dir, G, seed, a, eta=eta)
     if have:
         print(f"[sbc] {i+1}/{a.L} G={G:.4f} -- already done, skipping")
         return have
@@ -104,6 +134,9 @@ def run_replicate(i, G, a):
            "--SC_type", a.SC_type, "--SC_size", str(a.SC_size),
            "--t_end", str(a.t_end), "--tr", str(a.tr), "--cut", str(a.cut),
            "--scale", str(a.scale), "--fast_bold"]
+    if eta is not None:
+        cmd += ["--eta", str(eta), "--infer_eta",
+                "--eta_prior_scale", str(a.eta_prior_scale)]
     if a.fcd_band:
         cmd += ["--fcd_band", str(a.fcd_band)]
     if a.dry_run:
@@ -114,7 +147,7 @@ def run_replicate(i, G, a):
     if r.returncode != 0:
         print(f"[sbc] REPLICATE FAILED (rc={r.returncode})\n{r.stdout[-1500:]}\n{r.stderr[-1500:]}")
         return None
-    return draws_path(a.out_dir, G, seed, a)
+    return draws_path(a.out_dir, G, seed, a, eta=eta)
 
 
 def rank_of(true_value, draws):
@@ -148,16 +181,26 @@ def main():
     if (a.i_start, i_end) != (0, a.L):
         print(f"[sbc] this instance runs replicates [{a.i_start}, {i_end})")
 
+    Es = (eta_prior_draws(a.L, a.eta_center, a.eta_prior_scale, a.sbc_seed)
+          if a.infer_eta else None)
+    if Es is not None:
+        print(f"[sbc] 2-D: |eta| ~ LogNormal(log {a.eta_center}, {a.eta_prior_scale}) "
+              f"-> min={Es.min():.3f} median={np.median(Es):.3f} max={Es.max():.3f}")
+
+    # ranks are kept PER PARAMETER: a joint posterior can be calibrated in G and not in
+    # eta, and one pooled statistic would average that away.
     ranks, sizes, used_G = [], [], []
+    eta_ranks, eta_sizes, used_eta = [], [], []
     for i, G in enumerate(Gs):
         G = float(np.round(G, 6))
+        eta = float(np.round(-Es[i], 6)) if Es is not None else None
         if a.i_start <= i < i_end:
-            path = run_replicate(i, G, a)
+            path = run_replicate(i, G, a, eta=eta)
         else:
             # outside this instance's range: do not run it, but still pick up its draws
             # if a sibling instance has finished it, so a final full-range pass
             # aggregates every replicate without recomputing anything.
-            path = draws_path(a.out_dir, G, 1000 + i, a)
+            path = draws_path(a.out_dir, G, 1000 + i, a, eta=eta)
         if a.dry_run or path is None:
             continue
         z = np.load(path)
@@ -166,7 +209,14 @@ def main():
             print(f"[sbc] replicate {i+1} produced no finite draws; skipped")
             continue
         ranks.append(r); sizes.append(n); used_G.append(G)
-        print(f"[sbc]   rank {r}/{n}")
+        msg = f"[sbc]   rank {r}/{n}"
+        if Es is not None and "eta_mag" in getattr(z, "files", []):
+            # the inference samples the MAGNITUDE, so rank the truth as a magnitude too
+            er, en = rank_of(abs(float(eta)), z["eta_mag"])
+            if er is not None:
+                eta_ranks.append(er); eta_sizes.append(en); used_eta.append(abs(eta))
+                msg += f" | eta rank {er}/{en}"
+        print(msg)
 
     if a.dry_run:
         return
@@ -177,18 +227,29 @@ def main():
               f"range once every instance has finished to aggregate them all.")
 
     ranks = np.asarray(ranks); sizes = np.asarray(sizes)
-    out = os.path.join(a.out_dir, f"sbc_ranks_{a.sampler}_{a.which_stat}.npz")
-    np.savez(out, ranks=ranks, sizes=sizes, G_true=np.asarray(used_G))
+    suffix = "_2d" if a.infer_eta else ""
+    out = os.path.join(a.out_dir, f"sbc_ranks_{a.sampler}_{a.which_stat}{suffix}.npz")
+    payload = dict(ranks=ranks, sizes=sizes, G_true=np.asarray(used_G))
+    if eta_ranks:
+        payload.update(eta_ranks=np.asarray(eta_ranks), eta_sizes=np.asarray(eta_sizes),
+                       eta_true=np.asarray(used_eta))
+    np.savez(out, **payload)
     print(f"\n[sbc] {len(ranks)} replicates -> {out}")
+    # The 2-D file is named separately so it never overwrites the 1-D campaign's ranks
+    # for the same sampler and feature.
 
     # Normalised ranks should be Uniform(0,1) under correct calibration.
     u = ranks / np.maximum(sizes, 1)
     try:
         from scipy import stats
-        ks = stats.kstest(u, "uniform")
-        print(f"[sbc] KS test against Uniform(0,1): D={ks.statistic:.4f} p={ks.pvalue:.4f}")
-        print("[sbc] " + ("no evidence of miscalibration" if ks.pvalue > 0.05
-                          else "MISCALIBRATED at the 5% level -- inspect the rank histogram"))
+        for nm, uu in ([("G", u)] + ([("eta_mag",
+                        np.asarray(eta_ranks) / np.maximum(np.asarray(eta_sizes), 1))]
+                       if eta_ranks else [])):
+            ks = stats.kstest(uu, "uniform")
+            print(f"[sbc] {nm}: KS against Uniform(0,1) D={ks.statistic:.4f} "
+                  f"p={ks.pvalue:.4f} (n={len(uu)})")
+            print("[sbc]   " + ("no evidence of miscalibration" if ks.pvalue > 0.05
+                               else "MISCALIBRATED at the 5% level -- inspect the ranks"))
     except Exception as e:
         print(f"[sbc] scipy unavailable for the KS test ({e}); ranks saved regardless")
 
