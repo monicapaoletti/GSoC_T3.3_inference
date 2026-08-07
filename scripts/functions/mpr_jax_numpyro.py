@@ -161,6 +161,12 @@ def parse_args():
                              "MAGNITUDE eta_mag = -eta > 0; results are reported as "
                              "eta_mag. Supported for smc_lik/smc_abc/demc only -- slice "
                              "and the gradient-based samplers are still scalar-only.")
+    parser.add_argument("--eta", type=float, default=-4.6,
+                        help="GROUND-TRUTH excitability the synthetic data is generated "
+                             "at (the model stores eta negative). Distinct from "
+                             "--eta_prior_scale, which is the width of the PRIOR when "
+                             "eta is inferred. Needed for a 2-D SBC, where the truth "
+                             "varies per replicate.")
     parser.add_argument("--eta_prior_scale", type=float, default=0.5,
                         help="sigma of the LogNormal(log 4.6, sigma) prior on eta_mag. "
                              "LogNormal rather than HalfNormal: it is positive, centred "
@@ -486,7 +492,12 @@ def main():
     if args.smc_move == "demc" and sampler in ("smc_lik", "smc_abc"):
         sampler_label = f"{sampler}_demc"
 
-    tag = f"G{G}_cut{cut}_tr{tr}_seed{seed}_tend{t_end}_ns{n_samples}_nc{n_chains}_SC_{SC_size}_sampler_{sampler_label}_which_stat_{which_stat}_{backend}_cm{args.chain_method}_np{args.n_particles}"
+    # eta enters the tag ONLY when it differs from the historical default, so every
+    # filename produced before --eta existed stays byte-identical and sbc_run's resume
+    # keeps matching them. A 2-D SBC varies eta per replicate and needs it in the name or
+    # replicates would overwrite one another.
+    _eta_tag = "" if abs(float(args.eta) - (-4.6)) < 1e-9 else f"_eta{args.eta}"
+    tag = f"G{G}{_eta_tag}_cut{cut}_tr{tr}_seed{seed}_tend{t_end}_ns{n_samples}_nc{n_chains}_SC_{SC_size}_sampler_{sampler_label}_which_stat_{which_stat}_{backend}_cm{args.chain_method}_np{args.n_particles}"
     print(f"\nSaving all outputs with tag: {tag}\n")
 
     # --- file paths ---  # <<< added
@@ -514,7 +525,7 @@ def main():
         raise ValueError(f"Invalid SC_type '{SC_type}'. Must be 'sim' or 'data'.")
     params = {
         "G": G, "weights": SC, "t_end": t_end,
-        "dt": 0.01, "eta": jnp.array([-4.6]), "rv_decimate": 10,
+        "dt": 0.01, "eta": jnp.array([float(args.eta)]), "rv_decimate": 10,
         "noise_amp": 0.037, "tr": 300.0, "seed": seed,  # model BOLD TR; 300 (=ParMPR default,
         # matches pymc) -> ~90 BOLD frames. tr=1.0 gave 30000 frames -> FCD OOM & incomparable.
         "clip_mode": args.clip_mode,
