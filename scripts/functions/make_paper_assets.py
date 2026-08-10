@@ -525,7 +525,9 @@ def latex_config_subtables(df, out_tex, Gs, label_stem="tab:cells", intro=None):
     treatment in the supplement -- hence `Gs` is a list, called once per destination file.
     """
     df = bench_subset(df)
-    sub = _latest_per_cell(df, ["sampler", "platform", "which_stat", "G_true"])
+    # framework in the key: see the row loop below -- JAX-on-CPU and PyMC-on-CPU are
+    # distinct implementations and must not evict one another.
+    sub = _latest_per_cell(df, ["sampler", "framework", "platform", "which_stat", "G_true"])
     out = list(intro) if intro else []
 
     for G in Gs:
@@ -544,9 +546,23 @@ def latex_config_subtables(df, out_tex, Gs, label_stem="tab:cells", intro=None):
                     if (samp, plat) in _CAVEATS:
                         star = "$^{*}$"
                         caveats.add((samp, plat))
-                    r = block[block["sampler"] == samp].iloc[-1]
-                    rows.append(f"{_tt(samp)}{star} & "
-                                + " & ".join(f(r) for _, _, f in _METRICS) + r" \\")
+                    bs = block[block["sampler"] == samp]
+                    # A CPU block can hold the SAME sampler under two frameworks -- the
+                    # same-code JAX-on-CPU run and the PyMC one. Those are different
+                    # implementations, so `.iloc[-1]` silently dropped one of them at
+                    # whatever order the frame happened to be in; it hit exactly the three
+                    # G*=0.2 SMC cells the same-code CPU/GPU comparison is argued from.
+                    # Emit both, and name the framework only where both are present, so
+                    # the other blocks are untouched.
+                    fws = list(dict.fromkeys(bs["framework"].astype(str)))
+                    for fw in fws:
+                        r = bs[bs["framework"].astype(str) == fw].iloc[-1]
+                        tag = ""
+                        if len(fws) > 1:
+                            tag = r" \textsubscript{JAX}" if not fw.startswith("pymc") \
+                                  else r" \textsubscript{PyMC}"
+                        rows.append(f"{_tt(samp)}{tag}{star} & "
+                                    + " & ".join(f(r) for _, _, f in _METRICS) + r" \\")
                 blocks.append((feat, plat, rows))
         if not blocks:
             continue
@@ -609,12 +625,15 @@ def latex_config_subtables(df, out_tex, Gs, label_stem="tab:cells", intro=None):
 #   cross         = PyMC on CPU (different framework entirely)
 def _backend_style(framework, platform):
     fw, plat = str(framework), str(platform)
+    # Same marker vocabulary as Fig. 4 (plot_ess_scaling.py): lowercase "x" for PyMC and a
+    # heavy open circle for same-code JAX-on-CPU. The two figures had drifted -- "X" here,
+    # "x" there -- so a reader carrying the key across figures had to re-learn it.
     if fw.startswith("pymc"):
-        return dict(marker="X", markerfacecolor=None, markeredgecolor="white",
-                    markeredgewidth=0.6, ms=9)
+        return dict(marker="x", markerfacecolor=None, markeredgecolor=None,
+                    markeredgewidth=1.8, ms=7)
     if plat == "cpu":
         return dict(marker="o", markerfacecolor="none", markeredgecolor=None,
-                    markeredgewidth=1.8, ms=8)
+                    markeredgewidth=2.0, ms=9)
     return dict(marker="o", markerfacecolor=None, markeredgecolor="white",
                 markeredgewidth=1.2, ms=8)
 
@@ -624,9 +643,9 @@ def _backend_legend_handles():
     return [
         (mk(marker="o", ms=8, markeredgecolor="white", markeredgewidth=1.2),
          "JAX, GPU"),
-        (mk(marker="o", ms=8, markerfacecolor="none", markeredgecolor="#666666",
-            markeredgewidth=1.8), "JAX, CPU (same code)"),
-        (mk(marker="X", ms=9, markeredgecolor="white", markeredgewidth=0.6),
+        (mk(marker="o", ms=9, markerfacecolor="none", markeredgecolor="#666666",
+            markeredgewidth=2.0), "JAX, CPU (same code)"),
+        (mk(marker="x", ms=7, markeredgewidth=1.8),
          "PyMC, CPU (other framework)"),
     ]
 
@@ -640,6 +659,19 @@ _HUE_ALIAS = {"smc_abc_eps10": "smc_abc"}
 
 def _hue(samp, colors):
     return colors.get(_HUE_ALIAS.get(samp, samp), "#777777")
+
+
+# Aliased hues let a variant share its parent's colour, which is right -- it IS the same
+# algorithm -- but only if the legend then says which variant is which. Without this the
+# uncalibrated epsilon=10 ABC and the calibrated epsilon=1 ABC were drawn in one blue with
+# a single "smc_abc" key, so the flat prior-collapse line read as the algorithm failing
+# rather than as one tolerance setting failing.
+_SERIES_LABEL = {"smc_abc_eps10": r"smc_abc, $\epsilon$=10 (uncalibrated)",
+                 "smc_abc": r"smc_abc, $\epsilon$=1"}
+
+
+def _series_label(samp, framework=""):
+    return _SERIES_LABEL.get(samp, samp)
 
 
 def _samplers_present(d):
@@ -874,9 +906,13 @@ def fig_sbc_recovery(results_dirs, out_png):
     if not panels:
         print("(SBC recovery figure skipped: no matching draws_*.npz)"); return
 
-    fig, axes = plt.subplots(1, len(panels), figsize=(5.0 * len(panels), 4.6),
+    # Wrap to two rows beyond two panels: four side by side squeezes each below the width
+    # where the error bars are readable.
+    ncol = 2 if len(panels) > 2 else len(panels)
+    nrow = int(np.ceil(len(panels) / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(5.0 * ncol, 4.6 * nrow),
                              sharex=True, sharey=True)
-    axes = np.atleast_1d(axes)
+    axes = np.atleast_1d(axes).ravel()
     allv = np.concatenate([p_[2][:, :1].ravel() for p_ in panels]
                           + [p_[2][:, 1:].ravel() for p_ in panels])
     lim = (0.0, float(np.nanpercentile(allv, 99.5)) * 1.05)
@@ -934,7 +970,11 @@ def fig_sbc(results_dirs, out_png, out_tex=None, conf=0.95):
     # 1.358 is the 95% Kolmogorov quantile; 1.628 the 99%.
     kq = {0.95: 1.358, 0.99: 1.628}.get(conf, 1.358)
 
-    fig, ax = plt.subplots(figsize=(6.4, 4.4))
+    # Colour is the SAMPLER, as everywhere else, so the feature needs its own channel or
+    # smc_lik/FC and smc_lik/FCD render identically. Solid = FCD (the feature the paper
+    # argues from), dashed = FC.
+    _LS = {"FCD": "-", "FC": "--"}
+    fig, ax = plt.subplots(figsize=(7.0, 4.6))
     rows, Ls = [], []
     for f in files:
         z = np.load(f)
@@ -944,8 +984,8 @@ def fig_sbc(results_dirs, out_png, out_tex=None, conf=0.95):
         base = os.path.basename(f)[len("sbc_ranks_"):-len(".npz")]
         samp = base.rsplit("_", 1)[0]; stat = base.rsplit("_", 1)[-1]
         ecdf = np.arange(1, L + 1) / L
-        ax.step(u, ecdf - u, where="post", lw=2,
-                color=colors.get(samp, "#777777"), label=f"{samp} ({stat})", zorder=3)
+        ax.step(u, ecdf - u, where="post", lw=2, linestyle=_LS.get(stat, "-"),
+                color=_hue(samp, colors), label=f"{samp} ({stat})", zorder=3)
         d = p_ = float("nan")
         if _st is not None:
             ks = _st.kstest(u, "uniform"); d, p_ = float(ks.statistic), float(ks.pvalue)
@@ -992,6 +1032,145 @@ def fig_sbc(results_dirs, out_png, out_tex=None, conf=0.95):
     for r_ in rows:
         print(f"   [sbc] {r_['sampler']}/{r_['which_stat']}: L={r_['L']} "
               f"KS D={r_['ks_D']:.4f} p={r_['ks_p']:.4f}")
+
+
+def fig_sbc_2d(results_dirs, out_png, out_tex=None, conf=0.95):
+    r"""2-D SBC: rank ECDFs for G and for eta, side by side.
+
+    Kept as two panels rather than one pooled statistic because that is where the result
+    lives: the joint posterior is calibrated in G and not in eta, and pooling the ranks
+    would average exactly that away.
+    """
+    files = [f for f in _sbc_files(results_dirs) if f.endswith("_2d.npz")]
+    if not files:
+        print("(2-D SBC figure skipped: no *_2d.npz found)"); return
+    try:
+        from scipy import stats as _st
+    except Exception:
+        _st = None
+    colors = {s_: PALETTE[i % len(PALETTE)] for i, s_ in enumerate(SAMPLER_ORDER)}
+    _LS = {"FCD": "-", "FC": "--"}
+    kq = {0.95: 1.358, 0.99: 1.628}.get(conf, 1.358)
+
+    fig, axes = plt.subplots(1, 2, figsize=(11.6, 4.4), sharey=True)
+    rows, L = [], 0
+    for ax, (key, rk, sz, ttl) in zip(axes, [
+            ("G", "ranks", "sizes", r"$G$"),
+            ("eta_mag", "eta_ranks", "eta_sizes", r"$|\eta|$")]):
+        for f in sorted(files):
+            z = np.load(f)
+            if rk not in z:
+                continue
+            base = os.path.basename(f)[len("sbc_ranks_"):-len("_2d.npz")]
+            samp, stat = base.rsplit("_", 1)
+            u = np.sort(np.asarray(z[rk], float)
+                        / np.maximum(np.asarray(z[sz], float), 1.0))
+            n = u.size; L = max(L, n)
+            ax.step(u, np.arange(1, n + 1) / n - u, where="post", lw=2,
+                    linestyle=_LS.get(stat, "-"), color=_hue(samp, colors),
+                    label=f"{samp} ({stat})", zorder=3)
+            if _st is not None:
+                ks = _st.kstest(u, "uniform")
+                rows.append({"param": key, "sampler": samp, "which_stat": stat,
+                             "L": n, "ks_D": float(ks.statistic),
+                             "ks_p": float(ks.pvalue)})
+        ax.set_title(ttl, fontsize=11)
+        ax.set_xlabel("normalised rank of the truth")
+        ax.set_xlim(0, 1); ax.grid(True, ls=":", alpha=0.4)
+        for sp in ("top", "right"):
+            ax.spines[sp].set_visible(False)
+    band = kq / np.sqrt(max(L, 1))
+    for ax in axes:
+        ax.axhspan(-band, band, color="#999999", alpha=0.18, zorder=1)
+        ax.axhline(0.0, color="#999999", lw=1.0, zorder=2)
+    axes[0].set_ylabel("ECDF $-$ uniform")
+    axes[1].legend(frameon=False, fontsize=8.5, loc="lower right")
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=300, bbox_inches="tight"); plt.close(fig)
+    print(f"wrote {out_png} ({len(rows)} series, L={L}, band=+/-{band:.3f})")
+
+    if out_tex and rows:
+        lines = [r"\begin{table}[t]\centering",
+                 rf"\caption{{Two-dimensional simulation-based calibration. $L={L}$ "
+                 rf"replicates per sampler and feature, with BOTH $G^\star$ and "
+                 rf"$|\eta^\star|$ drawn from the priors the inference fits. Ranks are "
+                 rf"recorded per parameter: the joint posterior is calibrated in $G$ "
+                 rf"throughout, while $|\eta|$ is rejected in three of the four "
+                 rf"combinations.}}",
+                 r"\label{tab:sbc2d}\small", r"\begin{tabular}{llrrr}", r"\toprule",
+                 r"Parameter & Sampler (feature) & $L$ & KS $D$ & $p$ \\", r"\midrule"]
+        for key, ttl in (("G", r"$G$"), ("eta_mag", r"$|\eta|$")):
+            for r_ in [x for x in rows if x["param"] == key]:
+                flag = "" if r_["ks_p"] > 0.05 else r"$^{\dagger}$"
+                lines.append(f"{ttl} & {_tt(r_['sampler'])} ({r_['which_stat']}){flag} & "
+                             f"{r_['L']} & {_fmt(r_['ks_D'],3)} & {_fmt(r_['ks_p'],3)} \\\\")
+        lines += [r"\bottomrule", r"\\[2pt]",
+                  r"\multicolumn{5}{l}{\footnotesize $^{\dagger}$rejected at the 5\% "
+                  r"level. Eight tests at $\alpha=0.05$ would give $\approx0.4$ false "
+                  r"rejections by chance; all three fall on the same parameter.}\\",
+                  r"\end{tabular}", r"\end{table}"]
+        with open(out_tex, "w") as fh:
+            fh.write("\n".join(lines) + "\n")
+        print(f"wrote {out_tex}")
+    for r_ in rows:
+        print(f"   [sbc2d] {r_['param']:8s} {r_['sampler']}/{r_['which_stat']}: "
+              f"D={r_['ks_D']:.4f} p={r_['ks_p']:.4f}")
+
+
+def fig_joint_posterior(results_dirs, out_png, n_show=3):
+    r"""Joint $(G, |\eta|)$ posteriors for a few 2-D replicates.
+
+    The marginal rank tests say WHETHER each coordinate is calibrated; this says why. If
+    the two parameters trade off, the joint posterior is a ridge and the eta marginal is
+    a projection of it -- which is the mechanism a reader will ask about the moment they
+    see eta rejected and G not.
+    """
+    files = []
+    for d in results_dirs:
+        files += glob.glob(os.path.join(d, "**", "draws_*_eta*.npz"), recursive=True)
+    files = sorted(set(files))
+    if not files:
+        print("(joint posterior figure skipped: no 2-D draws found)"); return
+    picked = []
+    for f in files:
+        if "sampler_smc_lik_" not in os.path.basename(f):
+            continue
+        if "which_stat_FCD_" not in os.path.basename(f):
+            continue
+        z = np.load(f)
+        if "eta_mag" not in z:
+            continue
+        picked.append((float(z["G_true"]), f))
+    if not picked:
+        print("(joint posterior figure skipped: no smc_lik/FCD 2-D draws)"); return
+    picked.sort()
+    idx = np.linspace(0, len(picked) - 1, min(n_show, len(picked))).astype(int)
+    sel = [picked[i] for i in idx]
+
+    fig, axes = plt.subplots(1, len(sel), figsize=(4.6 * len(sel), 4.4))
+    axes = np.atleast_1d(axes)
+    for ax, (gt, f) in zip(axes, sel):
+        z = np.load(f)
+        G = np.asarray(z["G"], float).ravel()
+        E = np.asarray(z["eta_mag"], float).ravel()
+        m = np.isfinite(G) & np.isfinite(E)
+        G, E = G[m], E[m]
+        et = float(np.abs(np.asarray(z["theta_true"], float).ravel()[1]))
+        r = float(np.corrcoef(G, E)[0, 1]) if G.size > 2 else float("nan")
+        ax.plot(G, E, ".", ms=2.0, alpha=0.25, color=PALETTE[1], zorder=2)
+        ax.axvline(gt, color="#555555", lw=1.1, ls="--", zorder=3)
+        ax.axhline(et, color="#555555", lw=1.1, ls="--", zorder=3)
+        ax.plot([gt], [et], "*", ms=13, color="#111111", zorder=4)
+        ax.set_title(rf"$G^\star={gt:.3f}$, $|\eta^\star|={et:.2f}$" "\n"
+                     rf"posterior corr $={r:+.2f}$", fontsize=9.5)
+        ax.set_xlabel(r"$G$")
+        ax.grid(True, ls=":", alpha=0.4)
+        for sp in ("top", "right"):
+            ax.spines[sp].set_visible(False)
+    axes[0].set_ylabel(r"$|\eta|$")
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=300, bbox_inches="tight"); plt.close(fig)
+    print(f"wrote {out_png} ({len(sel)} replicates)")
 
 
 def latex_settings_table(config, out_tex):
@@ -1055,12 +1234,20 @@ def fig_recovery_vs_G(df, out_png):
     d = bench_subset(df).dropna(subset=["G_true", ycol])
     if d.empty:
         print("(recovery figure skipped: no data)"); return
-    d = _latest_per_cell(d, ["sampler", "platform", "which_stat", "G_true"])
+    # `framework` MUST be part of the cell key. Without it JAX-on-CPU and PyMC-on-CPU are
+    # the same cell and one silently evicts the other: smc_abc/FC/cpu/G*=0.2 resolved to
+    # the PyMC run (0.169) while the other three G came from JAX, so a single line mixed
+    # two backends -- and, because the style was taken from row 0, wore PyMC's marker for
+    # all four points. Fig. 4 has always split on framework; this is the same split.
+    d = _latest_per_cell(d, ["sampler", "framework", "platform", "which_stat", "G_true"])
 
     colors = {s: PALETTE[i % len(PALETTE)] for i, s in enumerate(SAMPLER_ORDER)}
-    # (feature, platform) -> dash pattern. GPU heavier, CPU lighter.
-    STYLES = {("FCD", "gpu"): "-", ("FC", "gpu"): "--",
-              ("FCD", "cpu"): "-.", ("FC", "cpu"): ":"}
+    # NO (feature, backend) dash encoding. It was redundant -- every panel is titled with
+    # its own feature and backend -- and worse, it collided with Fig. 4, where a dashed,
+    # faded series means "a configuration shown for contrast that is NOT the one the paper
+    # argues from". Dashing is now reserved for exactly that meaning in both figures, and
+    # here it marks the uncalibrated epsilon=10 ABC.
+    FADED = {"smc_abc_eps10"}
 
     # FACETED 2x2. On a single axes this is 6 algorithms x 4 (feature,backend) variants
     # = up to 24 crossing lines: the encoding is unambiguous but unreadable. One panel
@@ -1079,19 +1266,22 @@ def fig_recovery_vs_G(df, out_png):
     gs = sorted(d["G_true"].dropna().astype(float).unique())
     lim = (min(gs) - 0.08, max(gs) + 0.12)
     for ax, (stat, plat) in zip(axes, combos):
-        ls = STYLES[(stat, plat)]
         # identity: perfect recovery. Distance from it IS the error, to scale.
         ax.plot(lim, lim, "-", color="#999999", lw=1.2, zorder=1)
-        # one point per G: the widest batch available for that cell
+        # One line per (algorithm, framework): on CPU the same algorithm can appear under
+        # both JAX and PyMC, and those are different implementations, not two points on
+        # one curve. Keying the series on the sampler alone joined them.
         series = {}
         for samp in _samplers_present(d):
-            g = d[(d["sampler"] == samp) & (d["which_stat"] == stat)
-                  & (d["platform"] == plat)]
-            if g.empty:
+            g0 = d[(d["sampler"] == samp) & (d["which_stat"] == stat)
+                   & (d["platform"] == plat)]
+            if g0.empty:
                 continue
-            # `d` is already one row per cell (see _latest_per_cell above), so this only
-            # orders the line; re-picking here is what previously diverged from the table.
-            series[samp] = g.sort_values("G_true")
+            for fw, g in g0.groupby(g0["framework"].astype(str)):
+                # `d` is already one row per cell (see _latest_per_cell above), so this
+                # only orders the line; re-picking here is what previously diverged from
+                # the table.
+                series[(samp, fw)] = g.sort_values("G_true")
 
         # No +/-1 sd shading. It was tried and removed: the poorly-converged cells have
         # posterior sd comparable to the prior width (GPU rwmh on FCD at G*=0.2: sd 0.82
@@ -1107,16 +1297,20 @@ def fig_recovery_vs_G(df, out_png):
         # their own G. Stated in the caption.
         present = list(series)
         span = 0.008
-        for i, samp in enumerate(present):
-            g = series[samp]
+        for i, (samp, fw) in enumerate(present):
+            g = series[(samp, fw)]
             dx = (i - (len(present) - 1) / 2.0) * span
             _c = _hue(samp, colors)
-            _fw = str(g["framework"].iloc[0]) if "framework" in g else ""
-            st = _backend_style(_fw, plat)
+            st = _backend_style(fw, plat)
             st = {k: (_c if v is None else v) for k, v in st.items()}
             st["ms"] = max(5.5, st.get("ms", 6) - 2)
-            ax.plot(g["G_true"].astype(float) + dx, g[ycol].astype(float), ls,
-                    color=_c, lw=1.8, alpha=0.95, zorder=3, **st)
+            faded = samp in FADED
+            ax.plot(g["G_true"].astype(float) + dx, g[ycol].astype(float),
+                    "--" if faded else "-",
+                    color=_c, lw=1.6 if faded else 1.8,
+                    alpha=0.45 if faded else 0.95,
+                    zorder=2 if faded else 3,
+                    label=_series_label(samp, fw), **st)
         ax.set_title(f"{stat}, {plat.upper()}", fontsize=10)
         ax.set_xlim(*lim); ax.set_ylim(*lim)
         ax.set_xticks(gs); ax.set_yticks(gs)
@@ -1133,13 +1327,37 @@ def fig_recovery_vs_G(df, out_png):
     for i in range(0, len(combos), ncol):
         axes[i].set_ylabel(ylab)
 
+    # Two keys, as in Fig. 4: hue = algorithm, marker = backend. The marker key is not
+    # optional here even though the panels are already split by platform, because a CPU
+    # panel carries BOTH the same-code JAX run and the PyMC one and they mean different
+    # things. The faded dashed entry is listed with the algorithms, since it is a variant
+    # of one, not a backend.
     from matplotlib.lines import Line2D
-    alg = [Line2D([], [], color=colors[s], lw=2, marker="o", ms=5, label=s)
-           for s in SAMPLER_ORDER if (d["sampler"] == s).any()]
-    fig.legend(handles=alg, frameon=False, fontsize=9, ncol=len(alg),
-               loc="lower center", bbox_to_anchor=(0.5, -0.02))
-    fig.tight_layout()
-    fig.savefig(out_png, dpi=300, bbox_inches="tight"); plt.close(fig)
+    alg = [Line2D([], [], color=colors[s], lw=2, marker="o", ms=5,
+                  markeredgecolor="white", label=_series_label(s))
+           for s in _samplers_present(d) if s not in FADED]
+    alg += [Line2D([], [], color=_hue(s, colors), lw=1.6, ls="--", alpha=0.45,
+                   marker="o", ms=5, label=_series_label(s))
+            for s in _samplers_present(d) if s in FADED]
+    # tight_layout first, then place both legends against the finished geometry: called
+    # the other way round the algorithm key lands on top of the "true G*" x-label.
+    fig.tight_layout(rect=(0, 0.07, 1, 1))
+    leg = fig.legend(handles=alg, frameon=False, fontsize=9,
+                     ncol=min(4, len(alg)), loc="lower center",
+                     bbox_to_anchor=(0.5, -0.055), title="algorithm",
+                     alignment="left")
+    leg.get_title().set_fontsize(9)
+    bh = _backend_legend_handles()
+    # Upper left of the last panel: the recovery curves all run bottom-left to top-right,
+    # so that corner is the one region guaranteed to be empty in every panel.
+    axes[len(combos) - 1].legend(handles=[h for h, _ in bh],
+                                 labels=[l for _, l in bh],
+                                 frameon=False, fontsize=8, loc="upper left",
+                                 title="backend", alignment="left",
+                                 handletextpad=0.6, borderpad=0.2)
+    # No second tight_layout: it would undo the rect reserved for the algorithm key.
+    fig.savefig(out_png, dpi=300, bbox_inches="tight",
+                bbox_extra_artists=[leg]); plt.close(fig)
     print(f"wrote {out_png}")
 
 
@@ -1220,6 +1438,9 @@ def main():
     fig_sbc_recovery(args.results, os.path.join(figs, "sbc_recovery.png"))
     fig_sbc(args.results, os.path.join(figs, "sbc_ranks.png"),
             out_tex=os.path.join(tables, "sbc_table.tex"))
+    fig_sbc_2d(args.results, os.path.join(figs, "sbc_ranks_2d.png"),
+               out_tex=os.path.join(tables, "sbc_2d_table.tex"))
+    fig_joint_posterior(args.results, os.path.join(figs, "joint_posterior.png"))
     fig_throughput(df, os.path.join(figs, "throughput_ess.png"))
     print("done.")
 
