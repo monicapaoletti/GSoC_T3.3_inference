@@ -53,7 +53,9 @@ done
 # show all four couplings on one panel in the main text. They are kept in the dated folder
 # (mirrored just above) but must not linger in the paper repo, where an unreferenced
 # figure is dead weight that still gets pushed to Overleaf.
-rm -f "$FIGS"/accuracy_vs_cost_G*.png "$FIGS"/ess_scaling_pooled.png
+# accuracy_vs_cost_G*.png and calibration_sd_vs_err_G*.png ARE used now -- the supplement
+# gives each coupling a page. Only the unadopted pooled variant is dropped.
+rm -f "$FIGS"/ess_scaling_pooled.png
 [ -f "$PAPER/tables/sbc_table.tex" ] && cp "$PAPER/tables/sbc_table.tex" "$TODAY/"
 
 echo "== 2. forward throughput (Fig. 2) + its companion table =="

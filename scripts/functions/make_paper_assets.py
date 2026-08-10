@@ -686,7 +686,7 @@ def _samplers_present(d):
            [s for s in sorted(present - set(SAMPLER_ORDER))]
 
 
-def _shared_legend(fig, axes, extra=None):
+def _shared_legend(fig, axes, extra=None, ncol=None, fontsize=None):
     """Legend built from EVERY panel, ordered by SAMPLER_ORDER.
 
     Taking handles from the first panel alone silently drops any series absent there --
@@ -721,8 +721,13 @@ def _shared_legend(fig, axes, extra=None):
     if extra:
         for h, l in extra:
             handles.append(h); labels.append(l)
-    fig.legend(handles, labels, loc="lower center", ncol=min(7, len(labels)),
-               frameon=False, bbox_to_anchor=(0.5, -0.02))
+    # ncol matters more than it looks. The legend is laid out INSIDE the saved bounding
+    # box, so a single wide row makes the image wide, and scaling that to a fixed column
+    # width shrinks the panels. On the compact per-coupling copies the caller passes a
+    # small ncol so the key wraps and the data keeps the width.
+    fig.legend(handles, labels, loc="lower center",
+               ncol=min(ncol or 7, len(labels)),
+               fontsize=fontsize, frameon=False, bbox_to_anchor=(0.5, -0.02))
 
 
 def _facet_axes(nrow=2, ncol=2, size=(5.2, 4.1)):
@@ -776,16 +781,29 @@ def fig_accuracy_vs_cost(df, out_png, G=None):
     """
     d = _cells_by_config(df).dropna(subset=["abs_err", "runtime_sec"])
     d = d[(d["abs_err"] > 0) & (d["runtime_sec"] > 0)]
-    if G is not None:
-        d = d[np.isclose(d["G_true"].astype(float), float(G))]
     if d.empty:
         print("(accuracy-vs-cost figure skipped: no data)"); return
+    # Frame fixed on the POOLED data, so every per-coupling copy shares one set of axes
+    # with the main-text figure. Left to autoscale, each page would rescale to its own
+    # cells and a reader paging through the supplement would compare positions that are
+    # not comparable -- the whole point of this figure being positional.
+    xlim = (float(d["runtime_sec"].min()) / 1e3 * 0.6,
+            float(d["runtime_sec"].max()) / 1e3 * 1.7)
+    ylim = (float(d["abs_err"].min()) * 0.5, float(d["abs_err"].max()) * 2.0)
+    if G is not None:
+        d = d[np.isclose(d["G_true"].astype(float), float(G))]
+        if d.empty:
+            print(f"(accuracy-vs-cost figure skipped: no data at G*={G})"); return
     n_G = d["G_true"].dropna().nunique()
     colors = {s: PALETTE[i % len(PALETTE)] for i, s in enumerate(SAMPLER_ORDER)}
     combos = [("FC", "gpu"), ("FCD", "gpu"), ("FC", "cpu"), ("FCD", "cpu")]
     combos = [c for c in combos
               if not d[(d["which_stat"] == c[0]) & (d["platform"] == c[1])].empty]
-    fig, axes = _facet_axes(2, 2)
+    # A smaller CANVAS for the per-coupling copies. Matplotlib font sizes are absolute
+    # points, so shrinking the figure and printing it at the same width makes the text
+    # relatively LARGER -- which is what these need, since the supplement prints two of
+    # them side by side at half the text width.
+    fig, axes = _facet_axes(2, 2, size=(4.1, 3.5) if G is not None else (5.2, 4.1))
     for ax, (stat, plat) in zip(axes, combos):
         sub = d[(d["which_stat"] == stat) & (d["platform"] == plat)]
         # Samplers whose cost is set by the same budget land on the SAME wall-clock: on
@@ -812,6 +830,7 @@ def fig_accuracy_vs_cost(df, out_png, G=None):
                         alpha=0.45 if faded else 0.9,
                         zorder=2 if faded else 3, label=lab, **st)
         ax.set_xscale("log"); ax.set_yscale("log")
+        ax.set_xlim(*xlim); ax.set_ylim(*ylim)
         ax.set_title(f"{stat}, {plat.upper()}", fontsize=10)
         ax.grid(True, which="both", ls=":", alpha=0.4)
         for sp in ("top", "right"):
@@ -839,7 +858,9 @@ def fig_accuracy_vs_cost(df, out_png, G=None):
     if note:
         axes[0].text(0.02, 0.98, note, transform=axes[0].transAxes, fontsize=8.5,
                      color="#555555", va="top", ha="left")
-    _shared_legend(fig, axes[:len(combos)], extra=_backend_legend_handles())
+    _shared_legend(fig, axes[:len(combos)], extra=_backend_legend_handles(),
+                   ncol=3 if G is not None else None,
+                   fontsize=8 if G is not None else None)
     fig.tight_layout(rect=(0, 0.08, 1, 1))
     fig.savefig(out_png, dpi=300, bbox_inches="tight"); plt.close(fig)
     print(f"wrote {out_png} ({len(d)} cells"
@@ -853,7 +874,7 @@ def fig_accuracy_vs_cost(df, out_png, G=None):
 _SD_FLOOR = 5e-4
 
 
-def fig_calibration(df, out_png):
+def fig_calibration(df, out_png, G=None):
     r"""Posterior width against actual error: is the reported uncertainty honest?
 
     |dG| and sd sit in separate table columns, so "confidently wrong" -- small sd at
@@ -861,6 +882,11 @@ def fig_calibration(df, out_png):
     them against each other with the sd=|dG| diagonal makes it positional: on or above
     the line the posterior covers its own error; far below it the sampler is certain and
     wrong, which is strictly worse than being uncertain and wrong.
+
+    G=<val> restricts to one coupling for the supplement. The AXIS LIMITS are computed
+    from the pooled data either way, so every per-coupling copy shares one frame with the
+    main-text figure -- otherwise each page would silently rescale and a reader paging
+    through them would compare positions that are not comparable.
     """
     d = _cells_by_config(df).dropna(subset=["abs_err", "G_sd"]).copy()
     d = d[d["abs_err"] > 0]
@@ -868,13 +894,18 @@ def fig_calibration(df, out_png):
         print("(calibration figure skipped: no data)"); return
     d["sd_plot"] = d["G_sd"].clip(lower=_SD_FLOOR)
     d["floored"] = d["G_sd"] < _SD_FLOOR
+    lo = min(d["abs_err"].min(), d["sd_plot"].min()) * 0.5
+    hi = max(d["abs_err"].max(), d["sd_plot"].max()) * 2.0
+    if G is not None:
+        d = d[np.isclose(d["G_true"].astype(float), float(G))]
+        if d.empty:
+            print(f"(calibration figure skipped: no data at G*={G})"); return
     colors = {s: PALETTE[i % len(PALETTE)] for i, s in enumerate(SAMPLER_ORDER)}
     combos = [("FC", "gpu"), ("FCD", "gpu"), ("FC", "cpu"), ("FCD", "cpu")]
     combos = [c for c in combos
               if not d[(d["which_stat"] == c[0]) & (d["platform"] == c[1])].empty]
-    lo = min(d["abs_err"].min(), d["sd_plot"].min()) * 0.5
-    hi = max(d["abs_err"].max(), d["sd_plot"].max()) * 2.0
-    fig, axes = _facet_axes(2, 2)
+    # Compact canvas for the per-coupling copies -- see fig_accuracy_vs_cost.
+    fig, axes = _facet_axes(2, 2, size=(4.1, 3.5) if G is not None else (5.2, 4.1))
     for ax, (stat, plat) in zip(axes, combos):
         sub = d[(d["which_stat"] == stat) & (d["platform"] == plat)]
         ax.plot([lo, hi], [lo, hi], "-", color="#999999", lw=1.2, zorder=1)
@@ -919,11 +950,18 @@ def fig_calibration(df, out_png):
                        markeredgewidth=1.8)
     _shared_legend(fig, axes[:len(combos)],
                    extra=_backend_legend_handles()
-                         + [(proxy, "sd below reporting precision")])
+                         + [(proxy, "sd below reporting precision")],
+                   ncol=3 if G is not None else None,
+                   fontsize=8 if G is not None else None)
+    if G is not None:
+        axes[0].text(0.02, 0.98, rf"$G^\star={_fmt(float(G), 2)}$",
+                     transform=axes[0].transAxes, fontsize=8.5, color="#555555",
+                     va="top", ha="left")
     fig.tight_layout(rect=(0, 0.05, 1, 1))
     fig.savefig(out_png, dpi=300, bbox_inches="tight"); plt.close(fig)
     n_f = int(d["floored"].sum())
-    print(f"wrote {out_png} ({len(d)} cells, {n_f} with sd below {_SD_FLOOR} drawn hollow)")
+    print(f"wrote {out_png} ({len(d)} cells, {n_f} with sd below {_SD_FLOOR} drawn hollow"
+          + (f", G*={_fmt(float(G), 2)}" if G is not None else "") + ")")
 
 
 def _sbc_files(results_dirs):
@@ -1484,15 +1522,16 @@ def main():
     supp_Gs = [g for g in all_Gs if not np.isclose(g, args.table_G)]
     latex_config_subtables(df, os.path.join(tables, "config_subtables_main.tex"),
                            Gs=[args.table_G])
+    # ONE FILE PER COUPLING. The supplement interleaves table and figures per G* -- table
+    # page, then a page carrying that coupling's Figs. 4, 6 and 7 -- so main.tex has to be
+    # able to place them individually. A single file holding all three couplings' tables
+    # could only be dropped in as one block.
+    for _g in supp_Gs:
+        latex_config_subtables(
+            df, os.path.join(tables, f"config_subtables_G{_g_slug(_g)}.tex"), Gs=[_g])
+    # Kept for backward compatibility: main.tex no longer inputs this.
     latex_config_subtables(
-        df, os.path.join(tables, "config_subtables_supp.tex"), Gs=supp_Gs,
-        intro=[r"% Supplementary: the same four per-configuration tables as the body,",
-               r"% repeated for every coupling other than the one shown there.",
-               r"\clearpage", r"\section*{Supplementary tables}",
-               rf"\label{{sec:supp-tables}}",
-               r"Tables here repeat the per-configuration layout of the main text for the "
-               r"remaining ground-truth couplings. Columns and conventions are identical; "
-               r"see the body for their definitions.", ""])
+        df, os.path.join(tables, "config_subtables_supp.tex"), Gs=supp_Gs)
     if args.legacy_tables:
         latex_benchmark_table(df, os.path.join(tables, "benchmark_table.tex"),
                               G=args.table_G, label=args.table_label)
@@ -1502,10 +1541,14 @@ def main():
     fig_accuracy_vs_cost(df, os.path.join(figs, "accuracy_vs_cost.png"))
     # One per coupling for the supplement, so every supplementary table has a figure that
     # shows the same cells. The main-text figure pools them with range bars.
-    for _g in sorted(bench_subset(df)["G_true"].dropna().astype(float).unique()):
+    fig_calibration(df, os.path.join(figs, "calibration_sd_vs_err.png"))
+    # One copy of each per coupling: the supplement gives every G* a page carrying its own
+    # cost/accuracy and calibration views next to its table.
+    for _g in all_Gs:
         fig_accuracy_vs_cost(df, os.path.join(
             figs, f"accuracy_vs_cost_G{_g_slug(_g)}.png"), G=_g)
-    fig_calibration(df, os.path.join(figs, "calibration_sd_vs_err.png"))
+        fig_calibration(df, os.path.join(
+            figs, f"calibration_sd_vs_err_G{_g_slug(_g)}.png"), G=_g)
     fig_sbc_recovery(args.results, os.path.join(figs, "sbc_recovery.png"))
     fig_sbc(args.results, os.path.join(figs, "sbc_ranks.png"),
             out_tex=os.path.join(tables, "sbc_table.tex"))
