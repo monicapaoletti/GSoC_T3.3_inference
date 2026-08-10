@@ -965,11 +965,40 @@ def fig_calibration(df, out_png, G=None):
           + (f", G*={_fmt(float(G), 2)}" if G is not None else "") + ")")
 
 
-def _sbc_files(results_dirs):
+def _sbc_files(results_dirs, two_d=False):
+    """SBC rank files for ONE campaign: the 1-D G-only sweep, or the 2-D (G, eta) one.
+
+    The 2-D campaign writes sbc_ranks_<sampler>_<feat>_2d.npz beside the 1-D files, and a
+    plain glob matched both. The name splitter then read "smc_abc_FC_2d" as sampler
+    "smc_abc_FC" with feature "2d", so the 2-D curves entered Fig. 9 in fallback grey
+    under a sampler name that does not exist, and the SBC table gained rows to match.
+    Callers must now say which campaign they mean.
+    """
     out = []
     for d in results_dirs:
         out += glob.glob(os.path.join(d, "**", "sbc_ranks_*.npz"), recursive=True)
-    return sorted(set(out))
+    return [f for f in sorted(set(out)) if f.endswith("_2d.npz") == two_d]
+
+
+def _sbc_key(path):
+    """(sampler, feature) from an SBC rank filename, with any _2d suffix stripped."""
+    base = os.path.basename(path)[len("sbc_ranks_"):-len(".npz")]
+    if base.endswith("_2d"):
+        base = base[:-len("_2d")]
+    samp, _, stat = base.rpartition("_")
+    return samp, stat
+
+
+def _draw_is_2d(path):
+    """True for a per-replicate draws file from the 2-D campaign.
+
+    The 2-D runs tag the ground-truth eta into the filename; the 1-D runs have no eta
+    tag. Nothing else distinguishes them -- both carry sampler_<s>_ and which_stat_<f>_ --
+    which is why Fig. 8 was silently averaging the two campaigns together and reporting
+    200 replicates per panel where each campaign ran 100.
+    """
+    return "_eta-" in os.path.basename(path) or "_eta" in os.path.basename(path).split(
+        "_cut")[0].replace("draws_", "", 1)
 
 
 def fig_sbc_recovery(results_dirs, out_png):
@@ -985,21 +1014,22 @@ def fig_sbc_recovery(results_dirs, out_png):
     density of points along the axis is the prior itself and the coverage of the bars over
     the identity line is what the SBC ranks formalise.
     """
-    files = _sbc_files(results_dirs)
+    files = _sbc_files(results_dirs, two_d=False)
     if not files:
         print("(SBC recovery figure skipped: no sbc_ranks_*.npz found)"); return
     colors = {s_: PALETTE[i % len(PALETTE)] for i, s_ in enumerate(SAMPLER_ORDER)}
 
     panels = []
     for f in files:
-        base = os.path.basename(f)[len("sbc_ranks_"):-len(".npz")]
-        samp = base.rsplit("_", 1)[0]; stat = base.rsplit("_", 1)[-1]
+        samp, stat = _sbc_key(f)
         d = os.path.dirname(f)
         rows = []
         for g in sorted(glob.glob(os.path.join(d, "draws_*.npz"))):
             if f"sampler_{samp}_" not in os.path.basename(g):
                 continue
             if f"which_stat_{stat}_" not in os.path.basename(g):
+                continue
+            if _draw_is_2d(g):        # 2-D replicates match both tags; exclude them
                 continue
             z = np.load(g)
             v = np.asarray(z["G"], float).ravel()
@@ -1047,6 +1077,108 @@ def fig_sbc_recovery(results_dirs, out_png):
     print(f"wrote {out_png} ({', '.join(f'{s_}:{len(a)}' for s_, _, a in panels)})")
 
 
+def fig_sbc_recovery_2d(results_dirs, out_png):
+    r"""Per-replicate recovery for the JOINT (G, eta) campaign: the 2-D analogue of
+    fig_sbc_recovery.
+
+    The 2-D rank ECDFs say that G comes out calibrated while eta does not, but a rank is
+    one number per replicate and cannot say WHAT the eta posteriors did -- whether they
+    are biased, over-confident, or simply returning the prior. This shows the raw
+    material for both parameters on the same replicates: truth on the x-axis, posterior
+    mean on the y, central 94% as a bar.
+
+    Rows are the parameter and columns the (sampler, feature) cell, so a column is one
+    inference run read for both of its parameters at once: that vertical pairing is the
+    point, since G and eta are inferred JOINTLY and their errors are correlated (the
+    posteriors are ridges, not blobs).
+
+    Limits are shared within a row and not across rows -- G and |eta| have unrelated
+    scales -- and each row keeps a square aspect so distance from the identity line is
+    readable as error.
+    """
+    files = _sbc_files(results_dirs, two_d=True)
+    if not files:
+        print("(2-D SBC recovery figure skipped: no sbc_ranks_*_2d.npz found)"); return
+    colors = {s_: PALETTE[i % len(PALETTE)] for i, s_ in enumerate(SAMPLER_ORDER)}
+
+    # (param key in the npz, index into theta_true, axis label)
+    PARAMS = [("G", 0, r"$G$"), ("eta_mag", 1, r"$|\eta|$")]
+
+    cols = []
+    for f in files:
+        samp, stat = _sbc_key(f)
+        d = os.path.dirname(f)
+        rows = {k: [] for k, _, _ in PARAMS}
+        for g in sorted(glob.glob(os.path.join(d, "draws_*.npz"))):
+            b = os.path.basename(g)
+            if f"sampler_{samp}_" not in b or f"which_stat_{stat}_" not in b:
+                continue
+            if not _draw_is_2d(g):
+                continue
+            z = np.load(g)
+            if "theta_true" not in z.files:
+                continue
+            th = np.asarray(z["theta_true"], float).ravel()
+            for key, idx, _ in PARAMS:
+                if key not in z.files or idx >= th.size:
+                    continue
+                v = np.asarray(z[key], float).ravel()
+                v = v[np.isfinite(v)]
+                if v.size == 0:
+                    continue
+                rows[key].append((float(th[idx]), float(v.mean()),
+                                  float(np.percentile(v, 3)),
+                                  float(np.percentile(v, 97))))
+        if any(rows[k] for k, _, _ in PARAMS):
+            cols.append((samp, stat, {k: np.array(v) for k, v in rows.items() if v}))
+    if not cols:
+        print("(2-D SBC recovery figure skipped: no matching draws_*.npz)"); return
+
+    # Stable column order: sampler first (fixed hue order), then feature.
+    cols.sort(key=lambda c: (SAMPLER_ORDER.index(c[0])
+                             if c[0] in SAMPLER_ORDER else 99, c[1]))
+    nrow, ncol = len(PARAMS), len(cols)
+    fig, axes = plt.subplots(nrow, ncol, figsize=(3.5 * ncol, 3.6 * nrow))
+    axes = np.atleast_2d(axes)
+
+    for i, (key, _idx, plab) in enumerate(PARAMS):
+        have = [c for c in cols if key in c[2]]
+        if not have:
+            continue
+        allv = np.concatenate([c[2][key][:, :4].ravel() for c in have])
+        allv = allv[np.isfinite(allv)]
+        pad = 0.05 * (allv.max() - allv.min())
+        lim = (float(allv.min()) - pad, float(allv.max()) + pad)
+        for j, (samp, stat, dat) in enumerate(cols):
+            ax = axes[i, j]
+            if key not in dat:
+                ax.set_visible(False); continue
+            a = dat[key]
+            c = _hue(samp, colors)
+            ax.plot(lim, lim, "-", color="#999999", lw=1.2, zorder=1)
+            ax.vlines(a[:, 0], a[:, 2], a[:, 3], color=c, lw=0.8, alpha=0.35, zorder=2)
+            ax.plot(a[:, 0], a[:, 1], "o", ms=4.0, color=c, alpha=0.95,
+                    markeredgecolor="white", markeredgewidth=0.5, zorder=3)
+            cov = float(np.mean((a[:, 0] >= a[:, 2]) & (a[:, 0] <= a[:, 3])) * 100.0)
+            ax.set_xlim(*lim); ax.set_ylim(*lim)
+            ax.set_aspect("equal", adjustable="box")
+            ax.grid(True, ls=":", alpha=0.4)
+            for sp in ("top", "right"):
+                ax.spines[sp].set_visible(False)
+            if i == 0:
+                ax.set_title(f"{samp} ({stat})", fontsize=10)
+            ax.set_xlabel(rf"prior-drawn truth {plab}", fontsize=9)
+            if j == 0:
+                ax.set_ylabel(rf"posterior mean {plab}", fontsize=9)
+            ax.annotate(f"{len(a)} rep.\n{cov:.0f}% cover", xy=(0.04, 0.95),
+                        xycoords="axes fraction", fontsize=8, color="#444444", va="top")
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=300, bbox_inches="tight"); plt.close(fig)
+    print(f"wrote {out_png} ("
+          + ", ".join(f"{s_}/{f_}:{len(next(iter(d_.values())))}" for s_, f_, d_ in cols)
+          + ")")
+
+
 def fig_sbc(results_dirs, out_png, out_tex=None, conf=0.95):
     r"""Simulation-based calibration: are the posterior ranks uniform?
 
@@ -1065,7 +1197,9 @@ def fig_sbc(results_dirs, out_png, out_tex=None, conf=0.95):
     Shape carries meaning: a systematic tilt is bias, a U (ends high) is an overconfident
     posterior, an inverted U is an over-dispersed one.
     """
-    files = _sbc_files(results_dirs)
+    # 1-D ONLY. The 2-D campaign's G ranks are the left panel of the 2-D SBC figure, so
+    # drawing them here too put the same four curves in two figures.
+    files = _sbc_files(results_dirs, two_d=False)
     if not files:
         print("(SBC figure skipped: no sbc_ranks_*.npz found)"); return
     try:
@@ -1088,8 +1222,7 @@ def fig_sbc(results_dirs, out_png, out_tex=None, conf=0.95):
         r = np.asarray(z["ranks"], float); n = np.asarray(z["sizes"], float)
         u = np.sort(r / np.maximum(n, 1.0))
         L = u.size; Ls.append(L)
-        base = os.path.basename(f)[len("sbc_ranks_"):-len(".npz")]
-        samp = base.rsplit("_", 1)[0]; stat = base.rsplit("_", 1)[-1]
+        samp, stat = _sbc_key(f)
         ecdf = np.arange(1, L + 1) / L
         ax.step(u, ecdf - u, where="post", lw=2, linestyle=_LS.get(stat, "-"),
                 color=_hue(samp, colors), label=f"{samp} ({stat})", zorder=3)
@@ -1555,6 +1688,7 @@ def main():
             out_tex=os.path.join(tables, "sbc_table.tex"))
     fig_sbc_2d(args.results, os.path.join(figs, "sbc_ranks_2d.png"),
                out_tex=os.path.join(tables, "sbc_2d_table.tex"))
+    fig_sbc_recovery_2d(args.results, os.path.join(figs, "sbc_recovery_2d.png"))
     fig_joint_posterior(args.results, os.path.join(figs, "joint_posterior.png"))
     fig_throughput(df, os.path.join(figs, "throughput_ess.png"))
     print("done.")
