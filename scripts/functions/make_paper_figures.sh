@@ -43,8 +43,11 @@ echo "== 1. benchmark figures (recovery, accuracy-vs-cost, calibration) + all ta
 # make_paper_assets writes straight into the paper; mirror its outputs into the dated
 # results folder too, so every figure the manuscript uses also has a copy filed under
 # the day it was produced -- the same convention steps 2-4 follow.
-for f in recovery_vs_G accuracy_vs_cost calibration_sd_vs_err sbc_recovery sbc_ranks throughput_ess; do
-  [ -f "$FIGS/$f.png" ] && cp "$FIGS/$f.png" "$TODAY/"
+# Glob, not a hand-kept list: the list silently missed every asset added after it was
+# written (the per-coupling accuracy_vs_cost_G*.png went to paper/figures and never
+# reached the dated folder). Anything make_paper_assets emits is mirrored.
+for f in "$FIGS"/*.png; do
+  [ -f "$f" ] && cp "$f" "$TODAY/"
 done
 [ -f "$PAPER/tables/sbc_table.tex" ] && cp "$PAPER/tables/sbc_table.tex" "$TODAY/"
 
@@ -56,9 +59,21 @@ cp "$TODAY/forward_throughput.png" "$FIGS/"
 cp "$TODAY/forward_throughput_table.tex" "$PAPER/tables/"
 
 echo "== 3. ESS scaling (Fig. 4) =="
+# The one the paper inputs: a single coupling, so every widest-batch point equals its
+# cell in Table 4a exactly.
 "$PY" plot_ess_scaling.py --master "$PAPER/master_results.csv" --out "$TODAY" \
       --name ess_scaling.png
 cp "$TODAY/ess_scaling.png" "$FIGS/"
+# Variants for review, written to today's folder ONLY -- not copied into paper/figures,
+# so nothing the manuscript inputs changes until one is chosen deliberately.
+#   _pooled : all four couplings at once, median + min-max bars
+#   _G<val> : one per coupling, matching the per-coupling tables one-for-one
+"$PY" plot_ess_scaling.py --master "$PAPER/master_results.csv" --out "$TODAY" \
+      --name ess_scaling_pooled.png --pool_G
+for g in 0.2 0.33 0.5 0.7; do
+  "$PY" plot_ess_scaling.py --master "$PAPER/master_results.csv" --out "$TODAY" \
+        --name "ess_scaling_G${g/./}.png" --G "$g"
+done
 
 echo "== 4. simulation runtime (Fig. 3) =="
 "$PY" plot_sim_runtime.py --npz "$REPO/results/2026-07-31/sim_benchmark/benchmarking_GPU_tend30000.png.npz" \
