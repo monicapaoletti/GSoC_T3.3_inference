@@ -669,6 +669,11 @@ def _hue(samp, colors):
 _SERIES_LABEL = {"smc_abc_eps10": r"smc_abc, $\epsilon$=10 (uncalibrated)",
                  "smc_abc": r"smc_abc, $\epsilon$=1"}
 
+# Series drawn faded + dashed: shown for CONTRAST, not part of the claim. Fig. 4 uses the
+# same code for the off-budget slice points. Module scope because Figs. 5, 6 and 7 must
+# agree on which series that is.
+FADED = {"smc_abc_eps10"}
+
 
 def _series_label(samp, framework=""):
     return _SERIES_LABEL.get(samp, samp)
@@ -693,9 +698,26 @@ def _shared_legend(fig, axes, extra=None):
         for h, l in zip(*ax.get_legend_handles_labels()):
             if l and l not in seen:
                 seen[l] = h
-    for samp in SAMPLER_ORDER + sorted(set(seen) - set(SAMPLER_ORDER)):
-        if samp in seen:
-            handles.append(seen[samp]); labels.append(samp)
+    # Order by SAMPLER_ORDER, matched through _series_label: the plotted labels are the
+    # display names ("smc_abc, eps=1"), so comparing them to the raw sampler keys sent
+    # every renamed series to the unordered tail.
+    order = [_series_label(s) for s in SAMPLER_ORDER] + \
+            sorted(set(seen) - {_series_label(s) for s in SAMPLER_ORDER})
+    for lab in order:
+        if lab not in seen:
+            continue
+        h = seen[lab]
+        # Normalise the marker. These handles are lifted from the plot, so each entry
+        # wore whichever backend it happened to be drawn with -- demcz showed a PyMC
+        # cross while its neighbours showed discs, which reads as a backend claim. The
+        # backend key alongside carries that channel; here only hue (and the faded/dashed
+        # "for contrast" flag) is meaningful.
+        handles.append(plt.Line2D([], [], color=h.get_color(), marker="o", ms=6,
+                                  markeredgecolor="white",
+                                  linestyle=h.get_linestyle() if h.get_linestyle() != "None"
+                                            else "-",
+                                  lw=1.8, alpha=h.get_alpha() or 1.0))
+        labels.append(lab)
     if extra:
         for h, l in extra:
             handles.append(h); labels.append(l)
@@ -715,12 +737,18 @@ def _cells_by_config(df):
     Every figure that shows benchmark cells must route through here. Fig. 5 previously
     re-picked its own representative run and silently disagreed with the tables on 4 of
     90 cells; sharing this function is what makes agreement structural rather than lucky.
+
+    `framework` belongs in the key: JAX-on-CPU and PyMC-on-CPU are different
+    implementations, and without it one evicted the other in the three G*=0.2 SMC cells
+    the same-code CPU/GPU comparison is argued from. Figs. 6 and 7 then grouped by
+    framework for styling, but on data one framework had already been dropped from -- so
+    the grouping could not put back what the pick had removed.
     """
     return _latest_per_cell(bench_subset(df),
-                            ["sampler", "platform", "which_stat", "G_true"])
+                            ["sampler", "framework", "platform", "which_stat", "G_true"])
 
 
-def fig_accuracy_vs_cost(df, out_png):
+def fig_accuracy_vs_cost(df, out_png, G=None):
     r"""Accuracy against cost: the frontier the benchmark is actually about.
 
     The manuscript argues accuracy (Fig. recovery) and cost (Fig. ess scaling) in two
@@ -729,14 +757,30 @@ def fig_accuracy_vs_cost(df, out_png):
     domination is visible as position: down-left is better on both.
 
     Log-log because both spread over orders of magnitude (GPU: 386x in error, 159x in
-    runtime). One point per G* per sampler; since runtime is set by the budget rather
-    than the coupling, a sampler's four points stack near-vertically and the spread of
-    that stack IS its accuracy variability at fixed cost.
+    runtime).
+
+    Two modes:
+
+      G=None  : every coupling drawn, so a sampler contributes one point per G*. Since
+                runtime is set by the budget and not by the coupling, those points stack
+                near-vertically and the height of the stack IS the sampler's accuracy
+                variability across regimes at fixed cost. An on-figure note says so --
+                that reading was previously left to the caption.
+      G=<val> : a single coupling. Called once per G* so each per-coupling table has a
+                figure showing exactly its cells.
+
+    Aggregating the four couplings into a median with range bars was tried and reverted:
+    it compressed the very spread this figure exists to show, and the error-bar treatment
+    belongs in Fig. 4, where the batch sweep is the x-axis and G* is genuinely a nuisance
+    dimension.
     """
     d = _cells_by_config(df).dropna(subset=["abs_err", "runtime_sec"])
     d = d[(d["abs_err"] > 0) & (d["runtime_sec"] > 0)]
+    if G is not None:
+        d = d[np.isclose(d["G_true"].astype(float), float(G))]
     if d.empty:
         print("(accuracy-vs-cost figure skipped: no data)"); return
+    n_G = d["G_true"].dropna().nunique()
     colors = {s: PALETTE[i % len(PALETTE)] for i, s in enumerate(SAMPLER_ORDER)}
     combos = [("FC", "gpu"), ("FCD", "gpu"), ("FC", "cpu"), ("FCD", "cpu")]
     combos = [c for c in combos
@@ -744,16 +788,29 @@ def fig_accuracy_vs_cost(df, out_png):
     fig, axes = _facet_axes(2, 2)
     for ax, (stat, plat) in zip(axes, combos):
         sub = d[(d["which_stat"] == stat) & (d["platform"] == plat)]
-        for samp in _samplers_present(d):
+        # Samplers whose cost is set by the same budget land on the SAME wall-clock: on
+        # FC/GPU smc_abc, smc_lik and smc_abc_demc all sit at ~0.7 ks and three of them
+        # vanished under the fourth. Nudge each by a fixed multiplicative step -- the axis
+        # is log, so a multiplicative offset is the constant-width one. ~3% is far below
+        # any cost difference being claimed (the panels span two orders of magnitude), and
+        # the error bars still start at the true value. Stated in the caption.
+        pres = _samplers_present(sub)
+        for i, samp in enumerate(pres):
             g = sub[sub["sampler"] == samp]
             if g.empty:
                 continue
+            fac = 1.03 ** (i - (len(pres) - 1) / 2.0)
             c = _hue(samp, colors)
-            for (fw, plat), gg in g.groupby(["framework", "platform"], dropna=False):
+            faded = samp in FADED
+            for (fw, _p), gg in g.groupby(["framework", "platform"], dropna=False):
                 st = _backend_style(fw, plat)
                 st = {k: (c if v is None else v) for k, v in st.items()}
-                ax.plot(gg["runtime_sec"] / 1e3, gg["abs_err"], linestyle="none",
-                        color=c, alpha=0.9, zorder=3, label=samp, **st)
+                lab = _series_label(samp, fw)
+                x = gg["runtime_sec"].astype(float) / 1e3 * fac
+                y = gg["abs_err"].astype(float)
+                ax.plot(x, y, linestyle="none", color=c,
+                        alpha=0.45 if faded else 0.9,
+                        zorder=2 if faded else 3, label=lab, **st)
         ax.set_xscale("log"); ax.set_yscale("log")
         ax.set_title(f"{stat}, {plat.upper()}", fontsize=10)
         ax.grid(True, which="both", ls=":", alpha=0.4)
@@ -761,7 +818,7 @@ def fig_accuracy_vs_cost(df, out_png):
             ax.spines[sp].set_visible(False)
     # "better" arrow once, on the first panel: the reading direction is not obvious on a
     # log-log scatter where both axes are costs to minimise.
-    axes[0].annotate("better", xy=(0.06, 0.10), xytext=(0.30, 0.30),
+    axes[0].annotate("better", xy=(0.04, 0.06), xytext=(0.055, 0.26),
                      xycoords="axes fraction", textcoords="axes fraction",
                      arrowprops=dict(arrowstyle="->", color="#555555", lw=1.4),
                      color="#555555", fontsize=9, ha="left", va="center")
@@ -772,10 +829,19 @@ def fig_accuracy_vs_cost(df, out_png):
         ax.set_ylabel(r"$|\Delta G|$")
     for ax in axes[:len(combos)]:
         ax.label_outer()
+    # Say what the point and the bar ARE, in the figure, so it survives being read apart
+    # from its caption.
+    note = (rf"one point per coupling: {n_G} values of $G^\star$ per sampler"
+            if G is None and n_G > 1 else rf"$G^\star={_fmt(float(G), 2)}$"
+            if G is not None else "")
+    if note:
+        axes[0].text(0.02, 0.98, note, transform=axes[0].transAxes, fontsize=8.5,
+                     color="#555555", va="top", ha="left")
     _shared_legend(fig, axes[:len(combos)], extra=_backend_legend_handles())
     fig.tight_layout(rect=(0, 0.08, 1, 1))
     fig.savefig(out_png, dpi=300, bbox_inches="tight"); plt.close(fig)
-    print(f"wrote {out_png} ({len(d)} cells)")
+    print(f"wrote {out_png} ({len(d)} cells"
+          + (f", G*={_fmt(float(G), 2)}" if G is not None else f", {n_G} G* pooled") + ")")
 
 
 # az.summary rounds sd to 3 decimals, so a reported 0.000 means sd < 5e-4, not zero.
@@ -1231,23 +1297,21 @@ def fig_recovery_vs_G(df, out_png):
     #                    order, which is how the figure came to plot the SUPERSEDED
     #                    50/100 slice cells while the table showed the budget-matched
     #                    1000/1000 re-run the text argues from (4 of 90 cells disagreed).
-    d = bench_subset(df).dropna(subset=["G_true", ycol])
+    # Route through the shared selector rather than re-picking here -- that duplication is
+    # exactly how this figure drifted from the tables before. `framework` is part of that
+    # key: without it JAX-on-CPU and PyMC-on-CPU are the same cell and one silently evicts
+    # the other, which made smc_abc/FC/cpu/G*=0.2 resolve to the PyMC run (0.169) while the
+    # other three G came from JAX, all drawn with PyMC's marker.
+    d = _cells_by_config(df).dropna(subset=["G_true", ycol])
     if d.empty:
         print("(recovery figure skipped: no data)"); return
-    # `framework` MUST be part of the cell key. Without it JAX-on-CPU and PyMC-on-CPU are
-    # the same cell and one silently evicts the other: smc_abc/FC/cpu/G*=0.2 resolved to
-    # the PyMC run (0.169) while the other three G came from JAX, so a single line mixed
-    # two backends -- and, because the style was taken from row 0, wore PyMC's marker for
-    # all four points. Fig. 4 has always split on framework; this is the same split.
-    d = _latest_per_cell(d, ["sampler", "framework", "platform", "which_stat", "G_true"])
 
     colors = {s: PALETTE[i % len(PALETTE)] for i, s in enumerate(SAMPLER_ORDER)}
     # NO (feature, backend) dash encoding. It was redundant -- every panel is titled with
     # its own feature and backend -- and worse, it collided with Fig. 4, where a dashed,
     # faded series means "a configuration shown for contrast that is NOT the one the paper
     # argues from". Dashing is now reserved for exactly that meaning in both figures, and
-    # here it marks the uncalibrated epsilon=10 ABC.
-    FADED = {"smc_abc_eps10"}
+    # here it marks the uncalibrated epsilon=10 ABC (module-level FADED).
 
     # FACETED 2x2. On a single axes this is 6 algorithms x 4 (feature,backend) variants
     # = up to 24 crossing lines: the encoding is unambiguous but unreadable. One panel
@@ -1434,6 +1498,11 @@ def main():
     latex_settings_table(args.config, os.path.join(tables, "settings_table.tex"))
     fig_recovery_vs_G(df, os.path.join(figs, "recovery_vs_G.png"))
     fig_accuracy_vs_cost(df, os.path.join(figs, "accuracy_vs_cost.png"))
+    # One per coupling for the supplement, so every supplementary table has a figure that
+    # shows the same cells. The main-text figure pools them with range bars.
+    for _g in sorted(bench_subset(df)["G_true"].dropna().astype(float).unique()):
+        fig_accuracy_vs_cost(df, os.path.join(
+            figs, f"accuracy_vs_cost_G{_g_slug(_g)}.png"), G=_g)
     fig_calibration(df, os.path.join(figs, "calibration_sd_vs_err.png"))
     fig_sbc_recovery(args.results, os.path.join(figs, "sbc_recovery.png"))
     fig_sbc(args.results, os.path.join(figs, "sbc_ranks.png"),
