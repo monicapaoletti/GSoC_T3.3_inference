@@ -70,6 +70,7 @@ cp "$TODAY/ess_scaling.png" "$FIGS/"
 #   _G<val> : one per coupling, matching the per-coupling tables one-for-one
 "$PY" plot_ess_scaling.py --master "$PAPER/master_results.csv" --out "$TODAY" \
       --name ess_scaling_pooled.png --pool_G
+cp "$TODAY/ess_scaling_pooled.png" "$FIGS/"   # supplementary Fig., see \ref{fig:smc_scaling_pooled}
 for g in 0.2 0.33 0.5 0.7; do
   "$PY" plot_ess_scaling.py --master "$PAPER/master_results.csv" --out "$TODAY" \
         --name "ess_scaling_G${g/./}.png" --G "$g"
