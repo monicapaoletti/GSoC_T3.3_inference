@@ -49,6 +49,11 @@ echo "== 1. benchmark figures (recovery, accuracy-vs-cost, calibration) + all ta
 for f in "$FIGS"/*.png; do
   [ -f "$f" ] && cp "$f" "$TODAY/"
 done
+# The per-coupling accuracy_vs_cost copies were reviewed and NOT adopted: Figs. 5 and 6
+# show all four couplings on one panel in the main text. They are kept in the dated folder
+# (mirrored just above) but must not linger in the paper repo, where an unreferenced
+# figure is dead weight that still gets pushed to Overleaf.
+rm -f "$FIGS"/accuracy_vs_cost_G*.png "$FIGS"/ess_scaling_pooled.png
 [ -f "$PAPER/tables/sbc_table.tex" ] && cp "$PAPER/tables/sbc_table.tex" "$TODAY/"
 
 echo "== 2. forward throughput (Fig. 2) + its companion table =="
@@ -64,17 +69,20 @@ echo "== 3. ESS scaling (Fig. 4) =="
 "$PY" plot_ess_scaling.py --master "$PAPER/master_results.csv" --out "$TODAY" \
       --name ess_scaling.png
 cp "$TODAY/ess_scaling.png" "$FIGS/"
-# Variants for review, written to today's folder ONLY -- not copied into paper/figures,
-# so nothing the manuscript inputs changes until one is chosen deliberately.
-#   _pooled : all four couplings at once, median + min-max bars
-#   _G<val> : one per coupling, matching the per-coupling tables one-for-one
-"$PY" plot_ess_scaling.py --master "$PAPER/master_results.csv" --out "$TODAY" \
-      --name ess_scaling_pooled.png --pool_G
-cp "$TODAY/ess_scaling_pooled.png" "$FIGS/"   # supplementary Fig., see \ref{fig:smc_scaling_pooled}
-for g in 0.2 0.33 0.5 0.7; do
+# One copy per coupling. 0.33/0.5/0.7 are the SUPPLEMENTARY figures (one per
+# supplementary table); 0.2 duplicates the main-text figure and stays in the dated folder
+# for reference only.
+for g in 0.33 0.5 0.7; do
   "$PY" plot_ess_scaling.py --master "$PAPER/master_results.csv" --out "$TODAY" \
         --name "ess_scaling_G${g/./}.png" --G "$g"
+  cp "$TODAY/ess_scaling_G${g/./}.png" "$FIGS/"
 done
+"$PY" plot_ess_scaling.py --master "$PAPER/master_results.csv" --out "$TODAY" \
+      --name ess_scaling_G02.png --G 0.2
+# Pooled variant (all couplings, median + min-max bars): reviewed and not adopted -- the
+# per-coupling copies were preferred. Still generated, dated folder only.
+"$PY" plot_ess_scaling.py --master "$PAPER/master_results.csv" --out "$TODAY" \
+      --name ess_scaling_pooled.png --pool_G
 
 echo "== 4. simulation runtime (Fig. 3) =="
 "$PY" plot_sim_runtime.py --npz "$REPO/results/2026-07-31/sim_benchmark/benchmarking_GPU_tend30000.png.npz" \

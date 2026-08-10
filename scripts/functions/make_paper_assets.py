@@ -816,12 +816,12 @@ def fig_accuracy_vs_cost(df, out_png, G=None):
         ax.grid(True, which="both", ls=":", alpha=0.4)
         for sp in ("top", "right"):
             ax.spines[sp].set_visible(False)
-    # "better" arrow once, on the first panel: the reading direction is not obvious on a
-    # log-log scatter where both axes are costs to minimise.
-    axes[0].annotate("better", xy=(0.04, 0.06), xytext=(0.055, 0.26),
-                     xycoords="axes fraction", textcoords="axes fraction",
-                     arrowprops=dict(arrowstyle="->", color="#555555", lw=1.4),
-                     color="#555555", fontsize=9, ha="left", va="center")
+    # NO "better" arrow. It was meant to give the reading direction of a log-log scatter
+    # where both axes are costs to minimise, but placed at fixed axes-fraction coordinates
+    # it landed on top of whichever run happened to occupy that corner -- in the FC/GPU
+    # panel, the single smc_abc cell at G*=0.33. An annotation pointing at one data point
+    # reads as a claim about that point, not about the axes. The caption states the
+    # direction instead, where it cannot collide with anything.
     for ax in axes[len(combos):]:
         ax.set_visible(False)
     for ax in axes[:len(combos)]:
@@ -831,9 +831,11 @@ def fig_accuracy_vs_cost(df, out_png, G=None):
         ax.label_outer()
     # Say what the point and the bar ARE, in the figure, so it survives being read apart
     # from its caption.
-    note = (rf"one point per coupling: {n_G} values of $G^\star$ per sampler"
-            if G is None and n_G > 1 else rf"$G^\star={_fmt(float(G), 2)}$"
-            if G is not None else "")
+    # Only the single-coupling copies are stamped, and only so the file identifies itself
+    # in the dated results folder. The pooled version carries no on-figure note: "one
+    # point per coupling" is caption material, and printed inside the axes it competed
+    # with the data for the one empty corner of the panel.
+    note = rf"$G^\star={_fmt(float(G), 2)}$" if G is not None else ""
     if note:
         axes[0].text(0.02, 0.98, note, transform=axes[0].transAxes, fontsize=8.5,
                      color="#555555", va="top", ha="left")
