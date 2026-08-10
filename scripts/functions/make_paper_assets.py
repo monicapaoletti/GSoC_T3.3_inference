@@ -1281,7 +1281,9 @@ def fig_sbc_2d(results_dirs, out_png, out_tex=None, conf=0.95):
     lives: the joint posterior is calibrated in G and not in eta, and pooling the ranks
     would average exactly that away.
     """
-    files = [f for f in _sbc_files(results_dirs) if f.endswith("_2d.npz")]
+    # two_d=True, not a post-filter: _sbc_files now excludes the 2-D files by default, so
+    # filtering its result for "_2d.npz" matched nothing and this figure silently skipped.
+    files = _sbc_files(results_dirs, two_d=True)
     if not files:
         print("(2-D SBC figure skipped: no *_2d.npz found)"); return
     try:
@@ -1344,10 +1346,15 @@ def fig_sbc_2d(results_dirs, out_png, out_tex=None, conf=0.95):
                 flag = "" if r_["ks_p"] > 0.05 else r"$^{\dagger}$"
                 lines.append(f"{ttl} & {_tt(r_['sampler'])} ({r_['which_stat']}){flag} & "
                              f"{r_['L']} & {_fmt(r_['ks_D'],3)} & {_fmt(r_['ks_p'],3)} \\\\")
+        # p{...}, NOT l. A left-aligned \multicolumn cannot line-break, so this note set
+        # itself on one line and stretched the tabular past the right margin -- and did it
+        # silently, because the tabular simply grows rather than overfilling an hbox.
+        # _provisional_note already had it right; this one did not.
         lines += [r"\bottomrule", r"\\[2pt]",
-                  r"\multicolumn{5}{l}{\footnotesize $^{\dagger}$rejected at the 5\% "
-                  r"level. Eight tests at $\alpha=0.05$ would give $\approx0.4$ false "
-                  r"rejections by chance; all three fall on the same parameter.}\\",
+                  r"\multicolumn{5}{p{0.95\linewidth}}{\footnotesize $^{\dagger}$rejected "
+                  r"at the 5\% level. Eight tests at $\alpha=0.05$ would give "
+                  r"$\approx0.4$ false rejections by chance; all three fall on the same "
+                  r"parameter.}\\",
                   r"\end{tabular}", r"\end{table}"]
         with open(out_tex, "w") as fh:
             fh.write("\n".join(lines) + "\n")
