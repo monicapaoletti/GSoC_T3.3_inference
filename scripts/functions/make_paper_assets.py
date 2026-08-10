@@ -926,8 +926,9 @@ def fig_calibration(df, out_png, G=None):
                         st["markeredgecolor"] = _c
                         st["markeredgewidth"] = 1.8
                     ax.plot(gg["abs_err"], gg["sd_plot"], linestyle="none", color=_c,
-                            alpha=0.9, zorder=3,
-                            label=samp if not floored else None, **st)
+                            alpha=0.45 if samp in FADED else 0.9,
+                            zorder=2 if samp in FADED else 3,
+                            label=_series_label(samp, fw) if not floored else None, **st)
         ax.set_xscale("log"); ax.set_yscale("log")
         ax.set_xlim(lo, hi); ax.set_ylim(lo, hi)
         ax.set_aspect("equal", adjustable="box")
