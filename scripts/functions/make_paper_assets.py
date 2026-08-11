@@ -869,8 +869,8 @@ def fig_accuracy_vs_cost(df, out_png, G=None):
 
 # az.summary rounds sd to 3 decimals, so a reported 0.000 means sd < 5e-4, not zero.
 # Such cells cannot be drawn on a log axis and must not be silently dropped -- they are
-# the most alarming cells in the study. They are floored here and drawn hollow, with the
-# caption stating the convention.
+# the most alarming cells in the study. They are floored here and marked with a downward
+# caret (an upper limit), with the caption stating the convention.
 _SD_FLOOR = 5e-4
 
 
@@ -921,10 +921,22 @@ def fig_calibration(df, out_png, G=None):
                     if gg.empty:
                         continue
                     st = {k: (_c if v is None else v) for k, v in st0.items()}
-                    if floored:      # sd below reporting precision: hollow + heavier ring
-                        st["markerfacecolor"] = "none"
-                        st["markeredgecolor"] = _c
-                        st["markeredgewidth"] = 1.8
+                    if floored:
+                        # UPPER-LIMIT CARET, not a hollow marker. Hollowing the marker was
+                        # wrong twice over: every floored cell so far is PyMC, drawn as a
+                        # cross, which has no face for "hollow" to affect -- so the cue was
+                        # invisible on exactly the cells it described -- and had a floored
+                        # cell been JAX-on-GPU, blanking its face would have produced a
+                        # hollow circle, which the backend key already spends on
+                        # JAX-on-CPU. A downward caret is marker-agnostic, cannot collide
+                        # with the backend channel, and is the conventional way to say
+                        # "the true value lies below this point".
+                        _x = gg["abs_err"].to_numpy(float)
+                        _y = gg["sd_plot"].to_numpy(float)
+                        ax.errorbar(_x, _y,
+                                    yerr=np.vstack([_y * 0.55, np.zeros(len(_y))]),
+                                    uplims=True, fmt="none", ecolor=_c,
+                                    elinewidth=1.2, capsize=0, zorder=4)
                     ax.plot(gg["abs_err"], gg["sd_plot"], linestyle="none", color=_c,
                             alpha=0.45 if samp in FADED else 0.9,
                             zorder=2 if samp in FADED else 3,
@@ -946,12 +958,11 @@ def fig_calibration(df, out_png, G=None):
         ax.set_xlabel(r"$|\Delta G|$"); ax.set_ylabel("posterior sd")
         ax.label_outer()
     # the hollow marker is a second encoding and needs its own key, not just a caption
-    proxy = plt.Line2D([], [], marker="o", ms=8, linestyle="none", color="#777777",
-                       markerfacecolor="none", markeredgecolor="#777777",
-                       markeredgewidth=1.8)
+    proxy = plt.Line2D([], [], marker="v", ms=7, linestyle="none", color="#777777",
+                       markerfacecolor="#777777", markeredgecolor="#777777")
     _shared_legend(fig, axes[:len(combos)],
                    extra=_backend_legend_handles()
-                         + [(proxy, "sd below reporting precision")],
+                         + [(proxy, "sd below reporting precision (drawn at floor)")],
                    ncol=3 if G is not None else None,
                    fontsize=8 if G is not None else None)
     if G is not None:
@@ -961,7 +972,7 @@ def fig_calibration(df, out_png, G=None):
     fig.tight_layout(rect=(0, 0.05, 1, 1))
     fig.savefig(out_png, dpi=300, bbox_inches="tight"); plt.close(fig)
     n_f = int(d["floored"].sum())
-    print(f"wrote {out_png} ({len(d)} cells, {n_f} with sd below {_SD_FLOOR} drawn hollow"
+    print(f"wrote {out_png} ({len(d)} cells, {n_f} with sd below {_SD_FLOOR} marked as upper limits"
           + (f", G*={_fmt(float(G), 2)}" if G is not None else "") + ")")
 
 
