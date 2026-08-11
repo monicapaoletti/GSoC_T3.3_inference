@@ -1337,7 +1337,10 @@ def fig_sbc_2d(results_dirs, out_png, out_tex=None, conf=0.95):
         ax.axhspan(-band, band, color="#999999", alpha=0.18, zorder=1)
         ax.axhline(0.0, color="#999999", lw=1.0, zorder=2)
     axes[0].set_ylabel("ECDF $-$ uniform")
-    axes[1].legend(frameon=False, fontsize=8.5, loc="lower right")
+    # Lower LEFT of the G panel. At lower right of the |eta| panel the box sat directly on
+    # the smc_lik/FCD excursion below the band near rank 0.9 -- the clearest instance of the
+    # very thing the figure is reporting. The G panel's lower-left corner is empty in both.
+    axes[0].legend(frameon=False, fontsize=8.5, loc="lower left")
     fig.tight_layout()
     fig.savefig(out_png, dpi=300, bbox_inches="tight"); plt.close(fig)
     print(f"wrote {out_png} ({len(rows)} series, L={L}, band=+/-{band:.3f})")
