@@ -1434,37 +1434,73 @@ def fig_joint_posterior(results_dirs, out_png, n_show=3):
     print(f"wrote {out_png} ({len(sel)} replicates)")
 
 
-def latex_settings_table(config, out_tex):
-    try:
-        import yaml
-        with open(config) as fh:
-            cfg = yaml.safe_load(fh)
-    except Exception as e:
-        print(f"(settings table skipped: {e})")
-        return
+def latex_settings_table(df, out_tex, config=None):
+    r"""Per-sampler budgets, read from the RUNS rather than from the config file.
+
+    The previous version rendered benchmark_config.yaml. Two things were wrong with that,
+    and both are why this table was generated but never included in the manuscript.
+
+    It was stale: the config still listed rwmh/demc at 200/500 and slice at 15/30, while
+    every cell the paper reports was re-run at 1000/1000 (and slice swept at 50/100). A
+    budget table that disagrees with the budgets in the results table is worse than none.
+
+    And it could not compile: sampler slugs and keys were emitted bare, so `smc_lik` and
+    `n_particles` put an underscore in text mode -- "Missing $ inserted". Everything is
+    \texttt{}-wrapped and escaped here.
+
+    Taking it from master_results.csv means it cannot drift from the cells it describes.
+    """
+    d = bench_subset(df)
+    d = d[d["platform"] == "gpu"] if (d["platform"] == "gpu").any() else d
+    if d.empty:
+        print("(settings table skipped: no cells)"); return
+    # Short family labels: the long forms pushed the tabular past the right margin, and a
+    # tabular that grows does not raise an overfull hbox, so it went unnoticed.
+    FAMILY = {
+        "smc_lik": "SMC (likelihood)", "smc_abc": "SMC (ABC)",
+        "smc_abc_demc": "SMC (ABC, DE-MC kernel)", "rwmh": "Random-walk Metropolis",
+        "demc": "DE-MC", "demcz": "DE-MC-Z (archive)", "slice": "Slice",
+    }
+    AXIS = {"smc_lik": "particles", "smc_abc": "particles", "smc_abc_demc": "particles",
+            "smc_abc_eps10": "particles"}
     lines = [
         r"\begin{table}[t]\centering",
-        r"\caption{Per-sampler budgets. The batched axis is the on-device \texttt{vmap} "
-        r"dimension; comparison uses ESS/s since budgets differ.}",
-        r"\label{tab:settings}\small",
+        r"\caption{Per-sampler budgets, as run. The batched axis is the on-device "
+        r"\texttt{vmap} dimension --- particles for the SMC family, chains for the "
+        r"Metropolis family --- and is what Fig.~\ref{fig:smc_scaling} sweeps. Budgets "
+        r"differ between samplers by design, since each is run at a setting where it is "
+        r"usable rather than at an artificially common one; that is why every comparison "
+        r"in this paper is made per unit time (\ess/s) rather than per draw. Where a "
+        r"sampler appears at more than one budget, the widest-batch cell reported in "
+        r"Table~\ref{tab:cells:02} uses the last listed.}",
+        r"\label{tab:settings}\footnotesize\setlength{\tabcolsep}{4pt}",
         r"\begin{tabular}{llll}",
         r"\toprule",
-        r"Sampler & Family & Batched axis (values) & Budget \\",
+        r"Sampler & Family & Batched axis (widths run) & Warm-up\,/\,draws \\",
         r"\midrule",
     ]
-    for name, s in cfg.get("samplers", {}).items():
-        axis = s.get("batched_axis", "--")
-        vals = s.get(axis, "")
-        budget = []
-        for k in ("n_stages", "n_mcmc", "n_warmup", "n_samples"):
-            if k in s:
-                budget.append(f"{k}={s[k]}")
-        lines.append(
-            f"{name} & {s.get('family','')} & {axis} {vals} & {', '.join(budget)} \\\\")
+    for samp in _samplers_present(d):
+        g = d[d["sampler"] == samp]
+        widths = sorted({int(b) for b in g["batch"].dropna()})
+        pairs = sorted({(int(w), int(n), int(b)) for w, n, b in
+                        zip(g["n_warmup"].fillna(-1), g["n_draws"].fillna(-1),
+                            g["batch"].fillna(-1)) if w >= 0})
+        # For the SMC family the draw count IS the particle count, so spelling out one
+        # pair per width repeated the batch column four times over and was what made the
+        # table too wide. Collapse it to the rule instead.
+        if pairs and all(n == b for _, n, b in pairs) and len({w for w, _, _ in pairs}) == 1:
+            bud = f"{pairs[0][0]} stages, draws $=$ batch"
+        else:
+            bud = ", ".join(f"{w}\\,/\\,{n}" for w, n in
+                            sorted({(w, n) for w, n, _ in pairs})) or "--"
+        rng = (f"${widths[0]}$--${widths[-1]}$"
+               if len(widths) > 2 else ", ".join(f"${w}$" for w in widths))
+        axis = AXIS.get(samp, "chains")
+        lines.append(f"{_tt(samp)} & {FAMILY.get(samp, '')} & {axis}, {rng} & {bud} \\\\")
     lines += [r"\bottomrule", r"\end{tabular}", r"\end{table}"]
     with open(out_tex, "w") as fh:
         fh.write("\n".join(lines) + "\n")
-    print(f"wrote {out_tex}")
+    print(f"wrote {out_tex} ({len(_samplers_present(d))} samplers, from the runs)")
 
 
 def fig_recovery_vs_G(df, out_png):
@@ -1691,7 +1727,7 @@ def main():
         latex_benchmark_table(df, os.path.join(tables, "benchmark_table.tex"),
                               G=args.table_G, label=args.table_label)
         latex_full_grid_table(df, os.path.join(tables, "full_grid_table.tex"))
-    latex_settings_table(args.config, os.path.join(tables, "settings_table.tex"))
+    latex_settings_table(df, os.path.join(tables, "settings_table.tex"))
     fig_recovery_vs_G(df, os.path.join(figs, "recovery_vs_G.png"))
     fig_accuracy_vs_cost(df, os.path.join(figs, "accuracy_vs_cost.png"))
     # One per coupling for the supplement, so every supplementary table has a figure that
