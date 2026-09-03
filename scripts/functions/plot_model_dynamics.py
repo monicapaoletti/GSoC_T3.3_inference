@@ -19,6 +19,7 @@ import jax.numpy as jnp
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import paper_style
 
 import mpr_jax
 import utils
@@ -76,16 +77,21 @@ def _write_stats(stats, out, tag, sweep, fixed, args):
     hdr = (r"$G$" if sweep == "G" else r"$\eta$")
     lines = [
         r"\begin{table}[t]\centering",
-        rf"\caption{{Summary statistics for the regimes in the model-dynamics figure, "
-        rf"computed from the same simulations ({net} network, "
-        rf"$t_{{\mathrm{{end}}}}={args.t_end}$, {fixed}). $r$ is the firing rate; "
-        rf"BOLD sd is the temporal sd per region averaged over regions. FC mean is "
-        rf"overall synchrony and FC sd how differentiated the pairs are. The regime "
-        rf"structure is carried by the MEANS: FC mean and FCD mean both peak sharply at "
-        rf"the intermediate coupling and fall away on either side, while FCD sd stays "
-        rf"nearly constant across every regime and so does not discriminate them. Note "
-        rf"the ordering is not monotonic in $G$ -- the strongest coupling has the "
-        rf"highest firing rate but near-baseline FC and FCD.}}",
+        rf"\caption{{Summary statistics for the dynamical regimes shown in "
+        rf"Figure~\ref{{fig:model_dynamics}} ({net} network, "
+        rf"$t_{{\mathrm{{end}}}}={args.t_end}$, {fixed}). Here, $r$ denotes the firing "
+        rf"rate, and BOLD sd is the temporal standard deviation computed per region and "
+        rf"then averaged across regions. FC mean reflects the overall level of functional "
+        rf"synchrony, whereas FC sd quantifies the heterogeneity of pairwise functional "
+        rf"connectivity. The FCD statistics are computed over window pairs separated by "
+        rf"at least $k={args.fcd_lag_cut}$ windows: because successive windows overlap, "
+        rf"entries near the diagonal are correlated by construction at a level "
+        rf"independent of the dynamics, and retaining them would hold FCD sd nearly "
+        rf"constant across all regimes. With this cut, both the mean and the standard "
+        rf"deviation of FCD peak sharply at intermediate coupling and decrease on either "
+        rf"side, as do the FC statistics. Notably, these statistics vary "
+        rf"non-monotonically with $G$: the strongest coupling produces the highest firing "
+        rf"rate but near-baseline FC and FCD.}}",
         rf"\label{{tab:dynamics:{sweep}}}\small\setlength{{\tabcolsep}}{{5pt}}",
         r"\begin{tabular}{lrrrrrrr}",
         r"\toprule",
@@ -116,6 +122,13 @@ def main():
     ap.add_argument("--cut", type=int, default=50,
                     help="drop initial BOLD frames (transient + Balloon-Windkessel startup); "
                          "50 matches the mpr_jax.ipynb cells this script reproduces (t_end=300000 -> 1000 frames)")
+    ap.add_argument("--fcd_lag_cut", type=int, default=30,
+                    help="summarise only FCD pairs at least K windows apart. Successive "
+                         "windows overlap, so near-diagonal entries are correlated by "
+                         "construction independently of the dynamics; K=1 (the old "
+                         "behaviour) holds fcd_sd near-constant across regimes. K=30 "
+                         "matches the cut the inference applies (_fcd_indices in "
+                         "mpr_jax_numpyro.py). Saturates for K >~ 10.")
     ap.add_argument("--SC_size", type=int, default=None,
                     help="use only the first N nodes (default: the full 88-node matrix). "
                          "Pass 10 to match the benchmark's subnetwork.")
@@ -143,13 +156,19 @@ def main():
     nrow = len(rows)
     stats = []                    # one entry per row; written out beside the figure
     step = 10                     # decimate traces for a legible line density
-    fig = plt.figure(figsize=(13, 2.35 * nrow))
+    # Was 13in wide against a 6.5in text block: everything rendered at half size,
+    # which put the tick labels near 4 pt. Authored at the on-page width instead.
+    paper_style.use()
+    # Width is pinned to the text block so nothing is rescaled; HEIGHT is free, and this
+    # figure stacks two sub-panels (r and BOLD) per coupling, so it needs the room --
+    # at 1.2in per row the labels of one row collided with the panel below.
+    fig = plt.figure(figsize=(paper_style.TEXT_WIDTH_IN, 1.95 * nrow))
     # Column 0 is a narrow strip carrying the row label (the swept value). Putting it
     # there rather than as a title over the traces stops it colliding with the previous
     # row's "Time (s)" label, and makes it read as labelling the WHOLE row -- traces,
     # FC and FCD -- which is what it does.
-    gs = fig.add_gridspec(2 * nrow, 6, width_ratios=[0.13, 1, 1, 1, 1.05, 1.05],
-                          hspace=0.45, wspace=0.5)
+    gs = fig.add_gridspec(2 * nrow, 6, width_ratios=[0.85, 1, 1, 1, 1.05, 1.05],
+                          hspace=0.55, wspace=0.55)
     # No suptitle: the manuscript gives every figure a caption, so a title inside the
     # image duplicates it and eats vertical space. The swept value is on each row and
     # the fixed one belongs in the caption.
@@ -181,7 +200,7 @@ def main():
 
         ax0 = fig.add_subplot(gs[2 * row:2 * row + 2, 0])
         ax0.axis("off")
-        ax0.text(0.5, 0.5, rlabel, rotation=90, ha="center", va="center", fontsize=14)
+        ax0.text(0.0, 0.5, rlabel, rotation=90, ha="left", va="center", fontsize=10.5)
 
         ax1 = fig.add_subplot(gs[2 * row, 1:4])
         ax1.plot(t_s, r[::step, :], lw=0.1)
@@ -220,7 +239,7 @@ def main():
         # is how make_paper_assets' recovery figure came to disagree with its own table.)
         iu = np.triu_indices_from(FC, k=1)          # off-diagonal only: the unit diagonal
         fc_off = FC[iu]                             # would inflate every FC summary
-        fcd_off = FCD[np.triu_indices_from(FCD, k=1)]
+        fcd_off = FCD[np.triu_indices_from(FCD, k=args.fcd_lag_cut)]
         stats.append({
             "G": float(G), "eta": float(eta),
             # firing-rate level and its variability across time and regions
@@ -233,7 +252,13 @@ def main():
             "fc_mean": float(np.mean(fc_off)), "fc_sd": float(np.std(fc_off)),
             # FCD sd is the switching measure: a static regime gives a near-constant FCD
             # (sd ~ 0) whatever its mean, while switching produces the off-diagonal
-            # blocks visible in the panel.
+            # blocks visible in the panel. Only pairs at least --fcd_lag_cut windows
+            # apart are summarised: successive windows overlap by 94%, so entries near
+            # the diagonal are correlated by construction at a level the dynamics do not
+            # affect. At k=1 they dominate and hold fcd_sd at 0.128-0.138 in EVERY
+            # regime; at k=30 it is 0.017-0.020 off the working point against 0.087 at
+            # G=0.5. The flat column was an artefact of the overlap, not a property of
+            # FCD.
             "fcd_mean": float(np.mean(fcd_off)), "fcd_sd": float(np.std(fcd_off)),
         })
 

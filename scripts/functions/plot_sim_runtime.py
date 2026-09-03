@@ -19,6 +19,7 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import paper_style
 
 # Chart-surface identity, shared with make_paper_assets. The blue is #1F5FA8 rather
 # than the paper's original #295785: that one fails the chroma floor (0.091, reads
@@ -48,7 +49,8 @@ def main():
     Ns, t_jax, t_numba = load(args.npz)
     name = args.name or f"sim_runtime_tend{args.t_end}.png"
 
-    fig, ax = plt.subplots(figsize=(6.4, 4.6))
+    paper_style.use()
+    fig, ax = plt.subplots(figsize=paper_style.figsize(0.68, aspect=0.72))
     # 2px lines, >=8px markers, recessive grid; 2 series -> legend always present.
     ax.plot(Ns, t_numba, "-o", color=C_CPU, lw=2, ms=8, label="Numba (CPU, all cores)",
             zorder=3, markeredgecolor="white", markeredgewidth=1.2)
@@ -73,7 +75,7 @@ def main():
         ax.annotate(f"{speedup:.0f}$\\times$ faster",
                     xy=(Ns[i], np.sqrt(t_jax[i] * t_numba[i])),
                     xytext=(-12, 0), textcoords="offset points",
-                    ha="right", va="center", fontsize=11, color="#333333")
+                    ha="right", va="center", fontsize=9, color="#333333")
         ax.annotate("", xy=(Ns[i], t_jax[i]), xytext=(Ns[i], t_numba[i]),
                     arrowprops=dict(arrowstyle="<->", color="#666666", lw=1.2))
 

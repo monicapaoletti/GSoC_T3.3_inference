@@ -12,7 +12,9 @@ from datetime import date
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
+import matplotlib.ticker
 import matplotlib.pyplot as plt
+import paper_style
 
 
 def load(outdir, platform):
@@ -91,14 +93,28 @@ def _write_table(gpu, cpu, out, xover):
 
 
 def crossover(gpu, cpu):
-    """Geometric-mean batch of the first interval where GPU throughput >= CPU."""
+    """Batch at which GPU throughput overtakes CPU, by log-log interpolation.
+
+    The geometric mean of the bracketing batches used to be returned here, which
+    ignores HOW CLOSE the curves are at each end: on the measured sweep the CPU leads
+    by only 7% at B=16 but the GPU leads by 2.1x at B=64, so the crossing sits near 18
+    while the geometric mean reports 32 -- most of an octave to the right of where the
+    lines visibly meet. Interpolating log2(GPU/CPU) against log2(B) puts the marker
+    where the curves actually cross.
+    """
     gm = {int(b): t for b, t in zip(gpu["batch"], gpu["evals_per_s"])}
     cm = {int(b): t for b, t in zip(cpu["batch"], cpu["evals_per_s"])}
     common = sorted(set(gm) & set(cm))
     prev = None
     for b in common:
         if gm[b] >= cm[b]:
-            return b if prev is None else float(np.sqrt(prev * b))
+            if prev is None:
+                return float(b)
+            lr0, lr1 = np.log2(gm[prev] / cm[prev]), np.log2(gm[b] / cm[b])
+            if lr1 == lr0:
+                return float(np.sqrt(prev * b))
+            f = -lr0 / (lr1 - lr0)                       # fraction of the octave to travel
+            return float(2.0 ** (np.log2(prev) + f * (np.log2(b) - np.log2(prev))))
         prev = b
     return None
 
@@ -122,16 +138,34 @@ def main():
     if gpu is None and cpu is None:
         raise SystemExit(f"no forward_throughput_*.csv in {args.outdir}")
 
-    fig, ax = plt.subplots(figsize=(7, 5))
+    # Authored at the size it is INCLUDED at (0.8\linewidth), so nothing is rescaled by
+    # \includegraphics and the point sizes below are the point sizes on the page.
+    paper_style.use()
+    fig, ax = plt.subplots(figsize=paper_style.figsize(0.8, aspect=0.70))
     if gpu is not None:
         ax.plot(gpu["batch"], gpu["evals_per_s"], "o-", color="#295785",
-                lw=2, ms=7, label="GPU (L4)")
+                lw=1.8, ms=5.5, label="GPU (L4)")
     if cpu is not None:
         ax.plot(cpu["batch"], cpu["evals_per_s"], "s-", color="#B5651D",
-                lw=2, ms=7, label="CPU (64-core)")
+                lw=1.8, ms=5.5, label="CPU (64-core)")
 
     ax.set_xscale("log", base=2)
     ax.set_yscale("log")
+
+    # Tick where we actually measured. The sweep samples EVEN powers of two
+    # (1, 4, 16, ... = 2^0, 2^2, ...), while matplotlib's default base-2 LogLocator
+    # thins 2^0..2^14 with a stride of 2 starting at 2^1 -- the odd powers. The two
+    # interleave exactly, so every marker landed midway between two labels and the
+    # plot read as if the points were off the grid.
+    batches = sorted({int(b) for src in (gpu, cpu) if src is not None
+                      for b in src["batch"]})
+    # TICK the exact powers of two only. Every measured batch is still plotted; the
+    # sweep now includes non-powers (96, 192) to resolve the CPU plateau, and labelling
+    # those crowds them into their neighbours -- 96 collided with 2^7, 192 with 2^8.
+    powers = [b for b in batches if float(np.log2(b)).is_integer()]
+    ax.set_xticks(powers)
+    ax.set_xticklabels([rf"$2^{{{int(np.log2(b))}}}$" for b in powers])
+    ax.xaxis.set_minor_locator(matplotlib.ticker.NullLocator())
 
     xc = None                       # also reported in the companion table below
     if gpu is not None and cpu is not None:
@@ -143,8 +177,8 @@ def main():
                     color="gray", fontsize=9,
                     transform=ax.get_xaxis_transform())
 
-    ax.set_xlabel("batch size  (G-values evaluated together via vmap)")
-    ax.set_ylabel("throughput  (forward evals / s)")
+    ax.set_xlabel("batch size $B$")
+    ax.set_ylabel("throughput (forward evals/s)")
     ax.grid(True, which="both", ls=":", alpha=0.4)
     ax.legend(frameon=False)
     fig.tight_layout()

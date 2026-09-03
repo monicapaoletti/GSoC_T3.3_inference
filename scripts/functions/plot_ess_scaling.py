@@ -32,6 +32,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import paper_style
 
 # Validated categorical order (all six checks pass in light mode; the contrast WARN on
 # the lighter hues is discharged by the legend + end-of-line direct labels).
@@ -125,7 +126,10 @@ def main():
     order = [s for s in SAMPLER_ORDER if s in present] + \
             [s for s in sorted(present - set(SAMPLER_ORDER)) if s in colors]
     stats = [s for s in ("FC", "FCD") if (df["which_stat"] == s).any()]
-    fig, axes = plt.subplots(1, len(stats), figsize=(5.6 * len(stats), 4.8), sharey=True)
+    paper_style.use()
+    fig, axes = plt.subplots(1, len(stats),
+                             figsize=paper_style.grid_figsize(1, len(stats), 1.0, 1.15),
+                             sharey=True)
     axes = np.atleast_1d(axes)
 
     for ax, stat in zip(axes, stats):
@@ -201,9 +205,9 @@ def main():
             if placed and y_lab - placed[-1] < min_gap:
                 y_lab = placed[-1] + min_gap
             placed.append(y_lab)
-            ax.annotate(samp, xy=(x_e, 10 ** y_lab), xytext=(7, 0),
-                        textcoords="offset points", va="center", fontsize=9,
-                        color=colors[samp])
+            # Direct labels removed: with eight series they overlap at the authored
+            # size, and the shared legend below already carries identity.
+            _ = (x_e, y_lab, samp)
 
         # CPU cells as markers only -- never joined into a line (see module docstring).
         # Same hue as the algorithm's GPU line, so like can be read against like.
@@ -242,7 +246,7 @@ def main():
         nG = df["G_true"].dropna().nunique() if "G_true" in df else 1
         ax.set_title(stat if not args.pool_G
                      else f"{stat}   (median over {nG} $G^\\star$, bars = range)",
-                     fontsize=11 if not args.pool_G else 10)
+                     fontsize=11.5 if not args.pool_G else 10.5)
         ax.grid(True, which="major", ls="--", alpha=0.3, zorder=0)
         for s in ("top", "right"):
             ax.spines[s].set_visible(False)
@@ -263,13 +267,14 @@ def main():
         Line2D([], [], color="#555555", lw=0, marker="x", ms=7, mew=1.8,
                label="PyMC, CPU (other framework)"),
     ]
-    l1 = axes[0].legend(handles=alg, frameon=False, fontsize=9, loc="upper left",
-                        title="algorithm", alignment="left")
-    l1.get_title().set_fontsize(9)
-    axes[0].add_artist(l1)
-    axes[-1].legend(handles=plat, frameon=False, fontsize=9, loc="lower right",
-                    title="backend", alignment="left")
-    fig.tight_layout()
+    # One key below the panels rather than two inside them. The bottom strip is reserved
+    # by tight_layout's `rect` BEFORE the legend is placed -- calling subplots_adjust
+    # afterwards fights tight_layout and the key lands on top of the x labels. Three
+    # columns keep the row inside the text width, so bbox_inches="tight" does not widen
+    # the saved image and the figure is never rescaled.
+    fig.tight_layout(rect=(0, 0.26, 1, 1))
+    fig.legend(handles=alg + plat, frameon=False, fontsize=9.5, loc="lower center",
+               ncol=3, bbox_to_anchor=(0.5, 0.0))
 
     for d_ in args.out:
         os.makedirs(d_, exist_ok=True)

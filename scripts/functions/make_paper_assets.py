@@ -22,6 +22,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import paper_style
 
 # columns we try to read from the run-row benchmark CSVs (missing ones are tolerated)
 _COLS = ["sampler", "sampler_raw", "framework", "platform", "which_stat", "G_true",
@@ -383,8 +384,11 @@ def latex_master_table(df, out_tex, cost_G=0.2, label="tab:accuracy"):
     width to restate the same number. The caption says which coupling, so this is a stated
     convention rather than a silent one.
 
-    Runtime is in kiloseconds: `3.551e+04` is four characters wider than `35.5` in every
-    row, and at 13 columns that difference decides whether the table fits the page.
+    Runtime is in MINUTES. Seconds are far too wide (`3.551e+04`), and kiloseconds --
+    the previous choice -- forced the captions to translate the unit for the reader.
+    Measured over all 291 cells the rendered widths are: minutes 4 chars, ks 5, hours 6
+    (hours loses because 150 of the cells are under an hour and render as `0.0247`), so
+    minutes is both the most readable and the narrowest at 13 columns.
     """
     df = bench_subset(df)
     Gs = sorted(df["G_true"].dropna().astype(float).unique())
@@ -411,7 +415,7 @@ def latex_master_table(df, out_tex, cost_G=0.2, label="tab:accuracy"):
         + rf" & \multicolumn{{2}}{{c}}{{Cost at $G^\star={_fmt(cost_G,2)}$}} \\",
         r"Sampler & Backend & Feat. & " +
         " & ".join([r"$|\Delta G|$ & $\widehat{R}$"] * len(Gs)) +
-        r" & runtime (ks) & ESS/s \\",
+        r" & runtime (min) & ESS/s \\",
         r"\midrule",
     ]
     for samp, plat, feat in cells:
@@ -431,9 +435,9 @@ def latex_master_table(df, out_tex, cost_G=0.2, label="tab:accuracy"):
             if isinstance(rc, pd.DataFrame):
                 rc = rc.iloc[-1]
             rt = rc.get("runtime_sec")
-            rt_ks = float(rt) / 1000.0 if rt is not None and np.isfinite(
+            rt_min = float(rt) / 60.0 if rt is not None and np.isfinite(
                 pd.to_numeric(rt, errors="coerce")) else np.nan
-            vals += [_fmt(rt_ks, 3), _fmt(rc.get("ess_per_sec"), 3)]
+            vals += [_fmt(rt_min, 3), _fmt(rc.get("ess_per_sec"), 3)]
         except KeyError:
             vals += ["--", "--"]
         lines.append(f"{_tt(samp)}{star} & {plat} & {feat} & " + " & ".join(vals) + r" \\")
@@ -468,7 +472,7 @@ _METRICS = [
     (r"HDI$_{94}$",            "G_lo",           lambda r: _hdi_width(r)),
     (r"$\widehat{R}$",         "max_r_hat",      lambda r: _fmt_rhat(r.get("max_r_hat"), 3)),
     (r"ESS/s",                 "ess_per_sec",    lambda r: _fmt(r.get("ess_per_sec"), 3)),
-    (r"time (ks)",             "runtime_sec",    lambda r: _ks(r.get("runtime_sec"))),
+    (r"time (min)",            "runtime_sec",    lambda r: _minutes(r.get("runtime_sec"))),
     (r"batch",                 "batch",          lambda r: _fmt(r.get("batch"), 4)),
 ]
 
@@ -494,13 +498,13 @@ def _cov(r):
     return r"\checkmark" if v >= 0.5 else r"$\times$"
 
 
-def _ks(x):
-    """Runtime in kiloseconds -- see latex_master_table on why not seconds."""
+def _minutes(x):
+    """Runtime in MINUTES -- see latex_master_table on why not seconds or kiloseconds."""
     try:
         v = float(x)
     except Exception:
         return "--"
-    return f"{v/1000.0:.3g}" if np.isfinite(v) else "--"
+    return f"{v/60.0:.3g}" if np.isfinite(v) else "--"
 
 
 def _g_slug(G):
@@ -725,13 +729,22 @@ def _shared_legend(fig, axes, extra=None, ncol=None, fontsize=None):
     # box, so a single wide row makes the image wide, and scaling that to a fixed column
     # width shrinks the panels. On the compact per-coupling copies the caller passes a
     # small ncol so the key wraps and the data keeps the width.
+    # Default was 7, which at the authored (on-page) width cannot fit: the row overflowed
+    # the canvas, bbox_inches="tight" grew the image to 12.8in, and \includegraphics then
+    # scaled the whole figure -- panels and fonts alike -- back down by half. Four columns
+    # wrap inside the text width, so the saved image stays the size it was authored at.
     fig.legend(handles, labels, loc="lower center",
-               ncol=min(ncol or 7, len(labels)),
+               ncol=min(ncol or 3, len(labels)),
                fontsize=fontsize, frameon=False, bbox_to_anchor=(0.5, -0.02))
 
 
-def _facet_axes(nrow=2, ncol=2, size=(5.2, 4.1)):
-    fig, axes = plt.subplots(nrow, ncol, figsize=(size[0] * ncol, size[1] * nrow),
+def _facet_axes(nrow=2, ncol=2, size=None):
+    # Authored at the on-page width (see paper_style): the panels are smaller in inches
+    # than before but identical on the page, and the fonts are now chosen at the size
+    # they are actually seen rather than being shrunk by \includegraphics.
+    paper_style.use()
+    fig, axes = plt.subplots(nrow, ncol,
+                             figsize=paper_style.grid_figsize(nrow, ncol, 1.0, 0.82),
                              sharex=True, sharey=True)
     return fig, np.atleast_1d(axes).ravel()
 
@@ -831,7 +844,7 @@ def fig_accuracy_vs_cost(df, out_png, G=None):
                         zorder=2 if faded else 3, label=lab, **st)
         ax.set_xscale("log"); ax.set_yscale("log")
         ax.set_xlim(*xlim); ax.set_ylim(*ylim)
-        ax.set_title(f"{stat}, {plat.upper()}", fontsize=10)
+        ax.set_title(f"{stat}, {plat.upper()}", fontsize=10.5)
         ax.grid(True, which="both", ls=":", alpha=0.4)
         for sp in ("top", "right"):
             ax.spines[sp].set_visible(False)
@@ -844,7 +857,7 @@ def fig_accuracy_vs_cost(df, out_png, G=None):
     for ax in axes[len(combos):]:
         ax.set_visible(False)
     for ax in axes[:len(combos)]:
-        ax.set_xlabel("wall-clock per cell (ks)")
+        ax.set_xlabel("wall-clock per cell (min)")
         ax.set_ylabel(r"$|\Delta G|$")
     for ax in axes[:len(combos)]:
         ax.label_outer()
@@ -856,12 +869,12 @@ def fig_accuracy_vs_cost(df, out_png, G=None):
     # with the data for the one empty corner of the panel.
     note = rf"$G^\star={_fmt(float(G), 2)}$" if G is not None else ""
     if note:
-        axes[0].text(0.02, 0.98, note, transform=axes[0].transAxes, fontsize=8.5,
+        axes[0].text(0.02, 0.98, note, transform=axes[0].transAxes, fontsize=9.5,
                      color="#555555", va="top", ha="left")
     _shared_legend(fig, axes[:len(combos)], extra=_backend_legend_handles(),
                    ncol=3 if G is not None else None,
-                   fontsize=8 if G is not None else None)
-    fig.tight_layout(rect=(0, 0.08, 1, 1))
+                   fontsize=9 if G is not None else None)
+    fig.tight_layout(rect=(0, 0.21, 1, 1))
     fig.savefig(out_png, dpi=300, bbox_inches="tight"); plt.close(fig)
     print(f"wrote {out_png} ({len(d)} cells"
           + (f", G*={_fmt(float(G), 2)}" if G is not None else f", {n_G} G* pooled") + ")")
@@ -944,14 +957,14 @@ def fig_calibration(df, out_png, G=None):
         ax.set_xscale("log"); ax.set_yscale("log")
         ax.set_xlim(lo, hi); ax.set_ylim(lo, hi)
         ax.set_aspect("equal", adjustable="box")
-        ax.set_title(f"{stat}, {plat.upper()}", fontsize=10)
+        ax.set_title(f"{stat}, {plat.upper()}", fontsize=10.5)
         ax.grid(True, which="both", ls=":", alpha=0.4)
         for sp in ("top", "right"):
             ax.spines[sp].set_visible(False)
     axes[0].annotate("posterior covers its error", xy=(0.05, 0.90),
-                     xycoords="axes fraction", fontsize=8, color="#555555")
+                     xycoords="axes fraction", fontsize=9, color="#555555")
     axes[0].annotate("confidently wrong", xy=(0.42, 0.06),
-                     xycoords="axes fraction", fontsize=8, color="#555555")
+                     xycoords="axes fraction", fontsize=9, color="#555555")
     for ax in axes[len(combos):]:
         ax.set_visible(False)
     for ax in axes[:len(combos)]:
@@ -962,14 +975,14 @@ def fig_calibration(df, out_png, G=None):
                        markerfacecolor="#777777", markeredgecolor="#777777")
     _shared_legend(fig, axes[:len(combos)],
                    extra=_backend_legend_handles()
-                         + [(proxy, "sd below reporting precision (drawn at floor)")],
-                   ncol=3 if G is not None else None,
-                   fontsize=8 if G is not None else None)
+                         + [(proxy, "sd below reporting precision")],
+                   ncol=3,
+                   fontsize=9 if G is not None else None)
     if G is not None:
         axes[0].text(0.02, 0.98, rf"$G^\star={_fmt(float(G), 2)}$",
-                     transform=axes[0].transAxes, fontsize=8.5, color="#555555",
+                     transform=axes[0].transAxes, fontsize=9.5, color="#555555",
                      va="top", ha="left")
-    fig.tight_layout(rect=(0, 0.05, 1, 1))
+    fig.tight_layout(rect=(0, 0.21, 1, 1))
     fig.savefig(out_png, dpi=300, bbox_inches="tight"); plt.close(fig)
     n_f = int(d["floored"].sum())
     print(f"wrote {out_png} ({len(d)} cells, {n_f} with sd below {_SD_FLOOR} marked as upper limits"
@@ -1058,7 +1071,9 @@ def fig_sbc_recovery(results_dirs, out_png):
     # where the error bars are readable.
     ncol = 2 if len(panels) > 2 else len(panels)
     nrow = int(np.ceil(len(panels) / ncol))
-    fig, axes = plt.subplots(nrow, ncol, figsize=(5.0 * ncol, 4.6 * nrow),
+    paper_style.use()
+    fig, axes = plt.subplots(nrow, ncol,
+                             figsize=paper_style.grid_figsize(nrow, ncol, 1.0, 0.92),
                              sharex=True, sharey=True)
     axes = np.atleast_1d(axes).ravel()
     allv = np.concatenate([p_[2][:, :1].ravel() for p_ in panels]
@@ -1072,7 +1087,7 @@ def fig_sbc_recovery(results_dirs, out_png):
         ax.plot(a[:, 0], a[:, 1], "o", ms=4.5, color=c, alpha=0.95,
                 markeredgecolor="white", markeredgewidth=0.6, zorder=3)
         cov = float(np.mean((a[:, 0] >= a[:, 2]) & (a[:, 0] <= a[:, 3])) * 100.0)
-        ax.set_title(f"{samp} ({stat})", fontsize=10)
+        ax.set_title(f"{samp} ({stat})", fontsize=10.5)
         ax.set_xlabel(r"prior-drawn truth $G^\star$")
         ax.set_xlim(*lim); ax.set_ylim(*lim)
         ax.set_aspect("equal", adjustable="box")
@@ -1080,7 +1095,7 @@ def fig_sbc_recovery(results_dirs, out_png):
         for sp in ("top", "right"):
             ax.spines[sp].set_visible(False)
         ax.annotate(f"{len(a)} replicates\n{cov:.0f}% of bars cover the truth",
-                    xy=(0.04, 0.88), xycoords="axes fraction", fontsize=8.5,
+                    xy=(0.04, 0.88), xycoords="axes fraction", fontsize=9.5,
                     color="#444444", va="top")
     axes[0].set_ylabel(r"posterior mean $\hat G$")
     fig.tight_layout()
@@ -1149,7 +1164,9 @@ def fig_sbc_recovery_2d(results_dirs, out_png):
     cols.sort(key=lambda c: (SAMPLER_ORDER.index(c[0])
                              if c[0] in SAMPLER_ORDER else 99, c[1]))
     nrow, ncol = len(PARAMS), len(cols)
-    fig, axes = plt.subplots(nrow, ncol, figsize=(3.5 * ncol, 3.6 * nrow))
+    paper_style.use()
+    fig, axes = plt.subplots(nrow, ncol,
+                             figsize=paper_style.grid_figsize(nrow, ncol, 1.0, 1.03))
     axes = np.atleast_2d(axes)
 
     for i, (key, _idx, plab) in enumerate(PARAMS):
@@ -1177,12 +1194,12 @@ def fig_sbc_recovery_2d(results_dirs, out_png):
             for sp in ("top", "right"):
                 ax.spines[sp].set_visible(False)
             if i == 0:
-                ax.set_title(f"{samp} ({stat})", fontsize=10)
-            ax.set_xlabel(rf"prior-drawn truth {plab}", fontsize=9)
+                ax.set_title(f"{samp} ({stat})", fontsize=10.5)
+            ax.set_xlabel(rf"prior-drawn truth {plab}", fontsize=10)
             if j == 0:
-                ax.set_ylabel(rf"posterior mean {plab}", fontsize=9)
+                ax.set_ylabel(rf"posterior mean {plab}", fontsize=10)
             ax.annotate(f"{len(a)} rep.\n{cov:.0f}% cover", xy=(0.04, 0.95),
-                        xycoords="axes fraction", fontsize=8, color="#444444", va="top")
+                        xycoords="axes fraction", fontsize=9, color="#444444", va="top")
     fig.tight_layout()
     fig.savefig(out_png, dpi=300, bbox_inches="tight"); plt.close(fig)
     print(f"wrote {out_png} ("
@@ -1226,7 +1243,8 @@ def fig_sbc(results_dirs, out_png, out_tex=None, conf=0.95):
     # smc_lik/FC and smc_lik/FCD render identically. Solid = FCD (the feature the paper
     # argues from), dashed = FC.
     _LS = {"FCD": "-", "FC": "--"}
-    fig, ax = plt.subplots(figsize=(7.0, 4.6))
+    paper_style.use()
+    fig, ax = plt.subplots(figsize=paper_style.figsize(0.78, aspect=0.66))
     rows, Ls = [], []
     for f in files:
         z = np.load(f)
@@ -1253,7 +1271,7 @@ def fig_sbc(results_dirs, out_png, out_tex=None, conf=0.95):
     ax.grid(True, ls=":", alpha=0.4)
     for sp in ("top", "right"):
         ax.spines[sp].set_visible(False)
-    ax.legend(frameon=False, loc="upper right", fontsize=9)
+    ax.legend(frameon=False, loc="upper right", fontsize=10)
     fig.tight_layout()
     fig.savefig(out_png, dpi=300, bbox_inches="tight"); plt.close(fig)
     print(f"wrote {out_png} ({len(rows)} samplers, L={L})")
@@ -1305,7 +1323,9 @@ def fig_sbc_2d(results_dirs, out_png, out_tex=None, conf=0.95):
     _LS = {"FCD": "-", "FC": "--"}
     kq = {0.95: 1.358, 0.99: 1.628}.get(conf, 1.358)
 
-    fig, axes = plt.subplots(1, 2, figsize=(11.6, 4.4), sharey=True)
+    paper_style.use()
+    fig, axes = plt.subplots(1, 2, figsize=paper_style.grid_figsize(1, 2, 1.0, 0.80),
+                             sharey=True)
     rows, L = [], 0
     for ax, (key, rk, sz, ttl) in zip(axes, [
             ("G", "ranks", "sizes", r"$G$"),
@@ -1327,7 +1347,7 @@ def fig_sbc_2d(results_dirs, out_png, out_tex=None, conf=0.95):
                 rows.append({"param": key, "sampler": samp, "which_stat": stat,
                              "L": n, "ks_D": float(ks.statistic),
                              "ks_p": float(ks.pvalue)})
-        ax.set_title(ttl, fontsize=11)
+        ax.set_title(ttl, fontsize=11.5)
         ax.set_xlabel("normalised rank of the truth")
         ax.set_xlim(0, 1); ax.grid(True, ls=":", alpha=0.4)
         for sp in ("top", "right"):
@@ -1340,7 +1360,7 @@ def fig_sbc_2d(results_dirs, out_png, out_tex=None, conf=0.95):
     # Lower LEFT of the G panel. At lower right of the |eta| panel the box sat directly on
     # the smc_lik/FCD excursion below the band near rank 0.9 -- the clearest instance of the
     # very thing the figure is reporting. The G panel's lower-left corner is empty in both.
-    axes[0].legend(frameon=False, fontsize=8.5, loc="lower left")
+    axes[0].legend(frameon=False, fontsize=9.5, loc="lower left")
     fig.tight_layout()
     fig.savefig(out_png, dpi=300, bbox_inches="tight"); plt.close(fig)
     print(f"wrote {out_png} ({len(rows)} series, L={L}, band=+/-{band:.3f})")
@@ -1348,7 +1368,7 @@ def fig_sbc_2d(results_dirs, out_png, out_tex=None, conf=0.95):
     if out_tex and rows:
         lines = [r"\begin{table}[t]\centering",
                  rf"\caption{{Two-dimensional simulation-based calibration. $L={L}$ "
-                 rf"replicates per sampler and feature, with BOTH $G^\star$ and "
+                 rf"replicates per sampler and feature, with both $G^\star$ and "
                  rf"$|\eta^\star|$ drawn from the priors the inference fits. Ranks are "
                  rf"recorded per parameter: the joint posterior is calibrated in $G$ "
                  rf"throughout, while $|\eta|$ is rejected in three of the four "
@@ -1408,7 +1428,9 @@ def fig_joint_posterior(results_dirs, out_png, n_show=3):
     idx = np.linspace(0, len(picked) - 1, min(n_show, len(picked))).astype(int)
     sel = [picked[i] for i in idx]
 
-    fig, axes = plt.subplots(1, len(sel), figsize=(4.6 * len(sel), 4.4))
+    paper_style.use()
+    fig, axes = plt.subplots(1, len(sel),
+                             figsize=paper_style.grid_figsize(1, len(sel), 1.0, 0.98))
     axes = np.atleast_1d(axes)
     for ax, (gt, f) in zip(axes, sel):
         z = np.load(f)
@@ -1423,7 +1445,7 @@ def fig_joint_posterior(results_dirs, out_png, n_show=3):
         ax.axhline(et, color="#555555", lw=1.1, ls="--", zorder=3)
         ax.plot([gt], [et], "*", ms=13, color="#111111", zorder=4)
         ax.set_title(rf"$G^\star={gt:.3f}$, $|\eta^\star|={et:.2f}$" "\n"
-                     rf"posterior corr $={r:+.2f}$", fontsize=9.5)
+                     rf"posterior corr $={r:+.2f}$", fontsize=10)
         ax.set_xlabel(r"$G$")
         ax.grid(True, ls=":", alpha=0.4)
         for sp in ("top", "right"):
@@ -1465,14 +1487,18 @@ def latex_settings_table(df, out_tex, config=None):
             "smc_abc_eps10": "particles"}
     lines = [
         r"\begin{table}[t]\centering",
-        r"\caption{Per-sampler budgets, as run. The batched axis is the on-device "
-        r"\texttt{vmap} dimension --- particles for the SMC family, chains for the "
-        r"Metropolis family --- and is what Fig.~\ref{fig:smc_scaling} sweeps. Budgets "
-        r"differ between samplers by design, since each is run at a setting where it is "
-        r"usable rather than at an artificially common one; that is why every comparison "
-        r"in this paper is made per unit time (\ess/s) rather than per draw. Where a "
-        r"sampler appears at more than one budget, the widest-batch cell reported in "
-        r"Table~\ref{tab:cells:02} uses the last listed.}",
+        # Caption as Meysam rewrote it on Overleaf (2026-09-02). It lives HERE, not in
+        # tables/settings_table.tex, because that file is regenerated: editing it in the
+        # paper repo means the next regeneration silently reverts the prose.
+        r"\caption{Per-sampler computational budgets used in the experiments. The batched "
+        r"axis corresponds to the on-device \texttt{vmap} dimension---particles for the "
+        r"SMC family and chains for the Metropolis family---as shown in "
+        r"Fig.~\ref{fig:smc_scaling}. Budgets differ across samplers by design, since each "
+        r"method is run at a setting where it is practically usable rather than under an "
+        r"identical budget. Accordingly, comparisons are reported per unit wall-clock time "
+        r"(\ess/s) rather than per draw. Where a sampler is evaluated at more than one "
+        r"budget, the widest-batch entry reported in Table~\ref{tab:cells:02} corresponds "
+        r"to the last listed configuration.}",
         r"\label{tab:settings}\footnotesize\setlength{\tabcolsep}{4pt}",
         r"\begin{tabular}{llll}",
         r"\toprule",
@@ -1554,7 +1580,9 @@ def fig_recovery_vs_G(df, out_png):
               if not d[(d["which_stat"] == c[0]) & (d["platform"] == c[1])].empty]
     ncol = 2
     nrow = int(np.ceil(len(combos) / ncol))
-    fig, axes = plt.subplots(nrow, ncol, figsize=(5.2 * ncol, 3.9 * nrow),
+    paper_style.use()
+    fig, axes = plt.subplots(nrow, ncol,
+                             figsize=paper_style.grid_figsize(nrow, ncol, 0.8, 0.78),
                              sharex=True, sharey=True)
     axes = np.atleast_1d(axes).ravel()
 
@@ -1606,7 +1634,7 @@ def fig_recovery_vs_G(df, out_png):
                     alpha=0.45 if faded else 0.95,
                     zorder=2 if faded else 3,
                     label=_series_label(samp, fw), **st)
-        ax.set_title(f"{stat}, {plat.upper()}", fontsize=10)
+        ax.set_title(f"{stat}, {plat.upper()}", fontsize=10.5)
         ax.set_xlim(*lim); ax.set_ylim(*lim)
         ax.set_xticks(gs); ax.set_yticks(gs)
         ax.set_aspect("equal", adjustable="box")
@@ -1636,23 +1664,27 @@ def fig_recovery_vs_G(df, out_png):
             for s in _samplers_present(d) if s in FADED]
     # tight_layout first, then place both legends against the finished geometry: called
     # the other way round the algorithm key lands on top of the "true G*" x-label.
-    fig.tight_layout(rect=(0, 0.07, 1, 1))
-    leg = fig.legend(handles=alg, frameon=False, fontsize=9,
+    for _ax in axes[:len(combos)]:
+        _t = [t for t in _ax.get_xticks() if _ax.get_xlim()[0] <= t <= _ax.get_xlim()[1]]
+        if len(_t) > 2:                      # keep the ends only; the rest collided
+            _ax.set_xticks([_t[0], _t[-1]])
+    fig.tight_layout(rect=(0, 0.16, 1, 1))
+    leg = fig.legend(handles=alg, frameon=False, fontsize=10,
                      ncol=min(4, len(alg)), loc="lower center",
                      bbox_to_anchor=(0.5, -0.055), title="algorithm",
                      alignment="left")
     leg.get_title().set_fontsize(9)
     bh = _backend_legend_handles()
-    # Upper left of the last panel: the recovery curves all run bottom-left to top-right,
-    # so that corner is the one region guaranteed to be empty in every panel.
-    axes[len(combos) - 1].legend(handles=[h for h, _ in bh],
-                                 labels=[l for _, l in bh],
-                                 frameon=False, fontsize=8, loc="upper left",
-                                 title="backend", alignment="left",
-                                 handletextpad=0.6, borderpad=0.2)
+    # The backend key used to sit in the last panel's upper-left corner, which was empty
+    # when the panels were 5.2in wide. Authored at the on-page size that corner is no
+    # longer free and the key landed on the data, so both keys now go below the figure.
+    leg2 = fig.legend(handles=[h for h, _ in bh], labels=[l for _, l in bh],
+                      frameon=False, fontsize=9, ncol=3, loc="lower center",
+                      bbox_to_anchor=(0.5, -0.145), title="backend", alignment="left")
+    leg2.get_title().set_fontsize(9)
     # No second tight_layout: it would undo the rect reserved for the algorithm key.
     fig.savefig(out_png, dpi=300, bbox_inches="tight",
-                bbox_extra_artists=[leg]); plt.close(fig)
+                bbox_extra_artists=[leg, leg2]); plt.close(fig)
     print(f"wrote {out_png}")
 
 
@@ -1661,7 +1693,8 @@ def fig_throughput(df, out_png):
     d = df.dropna(subset=["batch", "ess_per_sec"])
     if d.empty:
         print("(throughput figure skipped: no data)"); return
-    fig, ax = plt.subplots(figsize=(7, 5))
+    paper_style.use()
+    fig, ax = plt.subplots(figsize=paper_style.figsize(1.0, aspect=0.60))
     for plat, g in d.groupby("platform"):
         g = g.sort_values("batch")
         ax.scatter(g["batch"].astype(float), g["ess_per_sec"].astype(float),
