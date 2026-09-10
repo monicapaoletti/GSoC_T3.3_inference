@@ -1,7 +1,8 @@
 """Two-GPU work-queue runner for the doslis GPU batching benchmark.
 
-doslis has NO SLURM, so this is a tiny scheduler: it runs up to 2 GPU jobs at
-once (one pinned to each L4 via CUDA_VISIBLE_DEVICES) plus a small CPU lane
+doslis has NO SLURM, so this is a tiny scheduler: it runs one GPU job per visible
+device at once (each pinned via CUDA_VISIBLE_DEVICES -- see visible_gpus(), which
+is also what makes it correct inside a 1-GPU Slurm allocation) plus a small CPU lane
 (JAX_PLATFORMS=cpu, no GPU contention). Jobs are ordered forward -> smc -> nuts
 so the cheap, fast results land first and the multi-hour NUTS cells grind last.
 
@@ -33,15 +34,24 @@ def results_dir():
     return d
 
 
-def forward_jobs(save):
+def forward_jobs(save, sc_size=10):
     return [
-        ("forward_gpu", "gpu", ["microbench_batch.py", "--outdir", save]),
+        ("forward_gpu", "gpu", ["microbench_batch.py", "--outdir", save,
+                                "--sc_size", str(sc_size)]),
         ("forward_cpu", "cpu", ["microbench_batch.py", "--outdir", save,
+                                "--sc_size", str(sc_size),
                                 "--timeout_per_batch", "60"]),
     ]
 
 
-def smc_jobs(save, n_stages, n_mcmc, g, stat, gpu_only=False, flavors=None, smc_move="rw"):
+# The batched axis is swept over these by default (n_particles for SMC, n_chains for the
+# chain-vmapped MCMC). Overridable per run via --batch_sizes so a single lost point can be
+# re-run on its own instead of redoing the three beside it that already landed.
+BATCHES = [64, 256, 1024, 4096]
+
+
+def smc_jobs(save, n_stages, n_mcmc, g, stat, gpu_only=False, flavors=None, smc_move="rw",
+             batches=None):
     jobs = []
     GS = ["--G", str(g), "--which_stat", stat]
     # tempered DE-MC is a separate algorithm -> separate job name and (via the driver)
@@ -50,7 +60,7 @@ def smc_jobs(save, n_stages, n_mcmc, g, stat, gpu_only=False, flavors=None, smc_
     sfx = "" if smc_move == "rw" else f"_{smc_move}"
     for flavor in (flavors or ["smc_lik", "smc_abc"]):
         # GPU: full particle sweep (batched axis -> ~free on GPU)
-        for npart in [64, 256, 1024, 4096]:
+        for npart in (batches or BATCHES):
             jobs.append((f"{flavor}{sfx}_gpu_np{npart}_G{g}_{stat}", "gpu",
                          ["mpr_jax_numpyro.py", "--sampler", flavor,
                           "--n_particles", str(npart), "--n_stages", str(n_stages),
@@ -67,14 +77,15 @@ def smc_jobs(save, n_stages, n_mcmc, g, stat, gpu_only=False, flavors=None, smc_
     return jobs
 
 
-def mcmc_jobs(save, n_tune, n_draws, g, stat, gpu_only=False, samplers=None):
+def mcmc_jobs(save, n_tune, n_draws, g, stat, gpu_only=False, samplers=None,
+              batches=None):
     """GPU chain-vmapped gradient-free samplers (rwmh/demc/slice): n_chains is the
     batched axis, swept like SMC's n_particles. slice is eval-heavy per step, so
     keep n_tune/n_draws modest (and typically run it only at one G)."""
     jobs = []
     GS = ["--G", str(g), "--which_stat", stat]
     for sampler in (samplers or ["rwmh", "demc", "slice"]):
-        for nc in [64, 256, 1024, 4096]:
+        for nc in (batches or BATCHES):
             jobs.append((f"{sampler}_gpu_nc{nc}_G{g}_{stat}", "gpu",
                          ["mpr_jax_numpyro.py", "--sampler", sampler, "--n_chains", str(nc),
                           "--n_warmup", str(n_tune), "--n_samples", str(n_draws),
@@ -108,12 +119,31 @@ def nuts_jobs(save, n_warmup, n_samples, g, stat, gpu_only=False):
     return jobs
 
 
-def run(jobs, save, gpu_slots=(0, 1), cpu_cap=1, poll=3.0):
+def visible_gpus():
+    """The device ids this process may hand out, one entry per GPU it actually owns.
+
+    A child is pinned with CUDA_VISIBLE_DEVICES=<slot>, and that variable is absolute:
+    setting it in the child REPLACES ours rather than indexing into it, so the ids have
+    to be the ones we can see, not 0..n-1. Under Slurm the allocation is already masked
+    into CUDA_VISIBLE_DEVICES (one entry per --gpus-per-node), so a 1-GPU job yields a
+    single slot. The old hardcoded (0, 1) assumed doslis's two L4s and, in a 1-GPU Slurm
+    job, sent every second cell to a device that was not there -- each died in ~6 s with
+    "FAILED_PRECONDITION: No visible GPU devices" while the job still exited 0.
+    """
+    vis = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if vis:
+        return tuple(d.strip() for d in vis.split(",") if d.strip())
+    n = int(os.environ.get("SLURM_GPUS_ON_NODE", 0) or 0)
+    return tuple(str(i) for i in range(n)) if n else ("0", "1")  # doslis: 2 L4s, no Slurm
+
+
+def run(jobs, save, gpu_slots=("0",), cpu_cap=1, poll=3.0):
     out = os.path.join(save, "out")
     free_gpu = list(gpu_slots)
     cpu_running = 0
     pending = list(jobs)
     running = []  # (name, popen, slot, logfh)
+    failed = []   # (name, returncode)
 
     def launch(job):
         nonlocal cpu_running
@@ -149,13 +179,24 @@ def run(jobs, save, gpu_slots=(0, 1), cpu_cap=1, poll=3.0):
             name, p, slot, fh = entry
             if p.poll() is not None:
                 fh.close()
-                print(f"[{time.strftime('%H:%M:%S')}] done  {name} exit={p.returncode}", flush=True)
+                verdict = "done " if p.returncode == 0 else "FAILED"
+                if p.returncode != 0:
+                    failed.append((name, p.returncode))
+                print(f"[{time.strftime('%H:%M:%S')}] {verdict} {name} exit={p.returncode}",
+                      flush=True)
                 running.remove(entry)
                 if slot is not None:
                     free_gpu.append(slot)
                 else:
                     cpu_running -= 1
-    print(f"[{time.strftime('%H:%M:%S')}] ALL JOBS DONE", flush=True)
+    print(f"[{time.strftime('%H:%M:%S')}] ALL JOBS DONE "
+          f"({len(jobs) - len(failed)}/{len(jobs)} ok)", flush=True)
+    # A cell that dies leaves no output file, and a pool that still exits 0 lets Slurm
+    # record the whole job COMPLETED -- which is how the first n=88 benchmark reported
+    # success on 16 of 80 runs. Fail loudly instead.
+    for name, rc in failed:
+        print(f"  FAILED {name} (exit {rc}) -> {os.path.join(out, name + '.log')}", flush=True)
+    return 1 if failed else 0
 
 
 def main():
@@ -189,29 +230,44 @@ def main():
                     choices=["smc_lik", "smc_abc"],
                     help="subset of SMC flavors for the smc suite (default both; "
                          "e.g. smc_abc only for the fixed-epsilon re-run).")
+    ap.add_argument("--SC_size", type=int, default=10,
+                    help="nodes in the network. 10 is the CPU-comparable small model the "
+                         "paper's matrix uses; 88 is the whole-brain connectome. Every "
+                         "cell in one campaign must share it -- see below.")
+    ap.add_argument("--batch_sizes", nargs="+", type=int, default=None,
+                    help="override the swept batched axis (n_particles for smc, n_chains "
+                         "for mcmc). Default 64 256 1024 4096. Use it to re-run a single "
+                         "lost point without redoing the ones beside it that landed.")
     ap.add_argument("--results_dir", default=None,
                     help="pin the output directory (avoids the midnight date-rollover "
                          "splitting a long campaign across two results/<date> folders).")
     args = ap.parse_args()
 
+    # SC_size is baked into COMMON rather than threaded per job the way G and which_stat
+    # are: those vary WITHIN a campaign and are part of what it compares, whereas the
+    # network is what the comparison is held fixed against. Rewriting it once, here,
+    # makes it impossible for one cell in a results dir to disagree with another.
+    COMMON[COMMON.index("--SC_size") + 1] = str(args.SC_size)
+
     save = args.results_dir if args.results_dir else results_dir()
     os.makedirs(os.path.join(save, "out"), exist_ok=True)
     jobs = []
     if "forward" in args.suite:      # forward throughput is G-/stat-independent -> run once
-        jobs += forward_jobs(save)
+        jobs += forward_jobs(save, args.SC_size)
     if "smc" in args.suite:
         jobs += smc_jobs(save, args.n_stages, args.n_mcmc, args.G, args.which_stat,
-                         args.gpu_only, args.smc_samplers, args.smc_move)
+                         args.gpu_only, args.smc_samplers, args.smc_move,
+                         batches=args.batch_sizes)
     if "mcmc" in args.suite:
         jobs += mcmc_jobs(save, args.n_warmup, args.n_samples, args.G, args.which_stat,
-                          args.gpu_only, args.mcmc_samplers)
+                          args.gpu_only, args.mcmc_samplers, batches=args.batch_sizes)
     if "nuts" in args.suite:
         jobs += nuts_jobs(save, args.n_warmup, args.n_samples, args.G, args.which_stat, args.gpu_only)
 
-    gpu_slots = tuple(d for d in (0, 1) for _ in range(max(1, args.gpu_concurrency)))
+    gpu_slots = tuple(d for d in visible_gpus() for _ in range(max(1, args.gpu_concurrency)))
     print(f"scheduling {len(jobs)} jobs -> {save}/out/  (gpu_slots={gpu_slots}, "
           f"cpu_cap={args.cpu_cap})", flush=True)
-    run(jobs, save, gpu_slots=gpu_slots, cpu_cap=args.cpu_cap)
+    raise SystemExit(run(jobs, save, gpu_slots=gpu_slots, cpu_cap=args.cpu_cap))
 
 
 if __name__ == "__main__":
