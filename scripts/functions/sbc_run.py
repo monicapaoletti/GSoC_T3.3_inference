@@ -70,9 +70,18 @@ def parse_args():
                         "SBC pass VACUOUS here: most truths land where the data is "
                         "uninformative, the posterior returns the prior, and the ranks "
                         "are uniform by construction rather than by calibration.")
+    p.add_argument("--adapt_rw", action="store_true",
+                   help="pass --adapt_rw to the inference: tune the SMC random-walk scale "
+                        "to ~0.234 acceptance. Needed at 88 nodes, where the fixed step "
+                        "left 6-10%% of the 2-D particle cloud unique and made the rank "
+                        "histogram a picture of the kernel rather than of the posterior.")
     p.add_argument("--eta_center", type=float, default=4.6,
-                   help="median |eta| of that prior; must match ETA_MAG_DEFAULT in the "
-                        "inference or the SBC draws from a different prior than it fits.")
+                   help="median |eta| of that prior. Passed straight through to the "
+                        "inference as --eta_center, which is what keeps the fitted prior "
+                        "identical across replicates. It used to be only OUR number: the "
+                        "inference derived its own centre from the replicate's --eta, so "
+                        "every posterior was scored against a prior sitting on its own "
+                        "truth and the 2-D SBC tested something other than calibration.")
     p.add_argument("--dry_run", action="store_true",
                    help="print the replicate commands and the prior draws, run nothing")
     return p.parse_args()
@@ -135,8 +144,16 @@ def run_replicate(i, G, a, eta=None):
            "--t_end", str(a.t_end), "--tr", str(a.tr), "--cut", str(a.cut),
            "--scale", str(a.scale), "--fast_bold"]
     if eta is not None:
+        # --eta is this replicate's TRUTH and varies; --eta_center is the FIXED median of
+        # the prior it is fitted under, and is the same number eta_prior_draws() sampled
+        # the truths from. Passing it is what makes the test SBC: before, the inference
+        # defaulted the prior centre to the run's own --eta, so each replicate was scored
+        # against a prior sitting on its own truth.
         cmd += ["--eta", str(eta), "--infer_eta",
-                "--eta_prior_scale", str(a.eta_prior_scale)]
+                "--eta_prior_scale", str(a.eta_prior_scale),
+                "--eta_center", str(a.eta_center)]
+    if a.adapt_rw:
+        cmd += ["--adapt_rw"]
     if a.fcd_band:
         cmd += ["--fcd_band", str(a.fcd_band)]
     if a.dry_run:

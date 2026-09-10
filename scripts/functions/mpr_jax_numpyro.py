@@ -113,6 +113,15 @@ def parse_args():
                     help="random-walk MH moves per SMC stage.")
     parser.add_argument("--rw_step", type=float, default=0.1,
                     help="log-space random-walk proposal scale for the SMC MH move.")
+    parser.add_argument("--adapt_rw", action="store_true",
+                    help="tune the SMC random-walk scale toward 0.234 acceptance instead "
+                         "of holding --rw_step fixed (--rw_step then only starts it). At "
+                         "88 nodes the fixed 0.1 accepted 0.2%% of smc_lik moves in the "
+                         "2-D run, leaving 254-419 unique particles of 4096 while the "
+                         "weight ESS still read ~4000. OFF by default: a run with it on "
+                         "is only comparable against other runs with it on.")
+    parser.add_argument("--adapt_rw_rate", type=float, default=1.0,
+                    help="Robbins-Monro gain of that adaptation (see --adapt_rw).")
     parser.add_argument("--abc_eps0", type=float, default=None,
                     help="smc_abc initial (large) epsilon; default = median prior distance.")
     parser.add_argument("--abc_eps_target", type=float, default=None,
@@ -171,6 +180,14 @@ def parse_args():
                         help="sigma of the LogNormal(log 4.6, sigma) prior on eta_mag. "
                              "LogNormal rather than HalfNormal: it is positive, centred "
                              "on the default |eta|=4.6, and does not pile mass at 0.")
+    parser.add_argument("--eta_center", type=float, default=4.6,
+                        help="MEDIAN |eta| of the LogNormal prior when eta is inferred. "
+                             "MUST be a fixed constant, never the run's own --eta: SBC "
+                             "requires every replicate to be fitted under the SAME prior "
+                             "the truths were drawn from. This used to default to the "
+                             "run's ground truth (ETA_MAG_DEFAULT), which re-centred the "
+                             "prior on the truth in every replicate and made the 2-D SBC "
+                             "test something other than calibration.")
     parser.add_argument("--save_draws", action="store_true",
                         help="Save the posterior draws of each parameter to draws_<TAG>.npz. "
                              "The run otherwise persists only the ArviZ SUMMARY, which is not "
@@ -613,9 +630,26 @@ def main():
     # --- inference ---
     # eta is stored negative in the model; the sampled quantity is its magnitude.
     ETA_MAG_DEFAULT = float(np.abs(np.asarray(params["eta"]).ravel()[0]))
+    # The TRUTH this replicate was generated at (above) and the CENTRE of the prior it is
+    # fitted under (below) are different things, and conflating them is what invalidated
+    # the 2-D SBC of 2026-09-09: the prior was rebuilt around ETA_MAG_DEFAULT, so every
+    # replicate got a prior sitting exactly on its own truth while sbc_run.py drew those
+    # truths from one fixed LogNormal(log 4.6, sigma). Keep them separate.
+    ETA_PRIOR_CENTER = float(args.eta_center)
     if args.infer_eta:
         theta_true = np.array([params["G"], ETA_MAG_DEFAULT])
         var_names = ["G", "eta_mag"]
+        # The green prior band was missing from the eta panel of every 2-D posterior plot.
+        # prior_predictions comes from Predictive(model, ...), and model_fc/model_fcd sample
+        # only G -- eta lives entirely outside the numpyro model, in the hand-written
+        # logprior_fn of the SMC/DE-MC branches. So `prm in prior_predictions` was simply
+        # False for eta_mag and the band was skipped. Inference was never affected: the
+        # LogNormal below IS the prior those branches sample and score against. Draw from
+        # it here so the panel shows what the sampler actually used.
+        prior_predictions = dict(prior_predictions)
+        prior_predictions["eta_mag"] = np.asarray(
+            dist.LogNormal(float(np.log(ETA_PRIOR_CENTER)), args.eta_prior_scale)
+            .sample(jax.random.PRNGKey(seed + 1), (n_prior,)))
     else:
         theta_true = np.array([params["G"]])
         var_names = ["G"]
@@ -783,7 +817,7 @@ def main():
         if args.infer_eta:
             # theta = [G, eta_mag]. Independent priors, so the joint log-prior is the
             # sum; both have positive support, which is what the log-space move needs.
-            _eta_prior = dist.LogNormal(float(np.log(ETA_MAG_DEFAULT)), args.eta_prior_scale)
+            _eta_prior = dist.LogNormal(float(np.log(ETA_PRIOR_CENTER)), args.eta_prior_scale)
             def logprior_fn(theta):
                 return (dist.HalfNormal(scale_G).log_prob(theta[0])
                         + _eta_prior.log_prob(theta[1]))
@@ -802,7 +836,9 @@ def main():
             start_time = time.time()
             parts, info = run_tempered_smc(k_smc, init_particles, logprior_fn, loglik_fn,
                                            n_stages=args.n_stages, n_mcmc=args.n_mcmc,
-                                           rw_step=args.rw_step, move=args.smc_move)
+                                           rw_step=args.rw_step, move=args.smc_move,
+                                           adapt_rw=args.adapt_rw,
+                                           adapt_rate=args.adapt_rw_rate)
             jax.block_until_ready(parts)
             runtime = time.time() - start_time
         else:  # smc_abc  (likelihood-free)
@@ -826,7 +862,8 @@ def main():
             start_time = time.time()
             parts, info = run_abc_smc(k_smc, init_particles, logprior_fn, distance_fn,
                                       eps_schedule, n_mcmc=args.n_mcmc, rw_step=args.rw_step,
-                                      move=args.smc_move)
+                                      move=args.smc_move, adapt_rw=args.adapt_rw,
+                                      adapt_rate=args.adapt_rw_rate)
             jax.block_until_ready(parts)
             runtime = time.time() - start_time
 
@@ -863,7 +900,7 @@ def main():
         obs = jnp.asarray(FC_obs_flat)
         scale_G = prior_specs["scale_G"]
         if args.infer_eta:
-            _eta_prior = dist.LogNormal(float(np.log(ETA_MAG_DEFAULT)), args.eta_prior_scale)
+            _eta_prior = dist.LogNormal(float(np.log(ETA_PRIOR_CENTER)), args.eta_prior_scale)
             def logprior_G(theta):
                 return (dist.HalfNormal(scale_G).log_prob(theta[0])
                         + _eta_prior.log_prob(theta[1]))
@@ -876,7 +913,7 @@ def main():
             k_g, k_e = jax.random.split(k_init)
             init_G = jnp.stack([
                 dist.HalfNormal(scale_G).sample(k_g, (n_chains,)),
-                dist.LogNormal(float(np.log(ETA_MAG_DEFAULT)),
+                dist.LogNormal(float(np.log(ETA_PRIOR_CENTER)),
                                args.eta_prior_scale).sample(k_e, (n_chains,)),
             ], axis=-1)                                   # (n_chains, 2)
         else:
@@ -915,8 +952,7 @@ def main():
     # --- diagnostics and plots ---
     summary = az.summary(mcmc, var_names=var_names)
     print(summary)
-    plot_trace_chains(mcmc, theta_true, var_names, savepath=fname_trace)
-    
+
     #az_obj = az.from_numpyro(mcmc)
     #print(mcmc['G'])
     #print(az_obj)
@@ -943,7 +979,7 @@ def main():
         # impoverishment directly, and is the one diagnostic recoverable from draws alone.
         _diag = {}
         if info is not None:
-            for _k in ("ess", "accept"):
+            for _k in ("ess", "accept", "step"):
                 if _k in info:
                     _diag[f"diag_{_k}"] = np.asarray(info[_k], dtype=np.float32)
         _g = np.asarray(posterior_samples.posterior["G"].values).ravel()
@@ -960,7 +996,21 @@ def main():
                for nm in var_names if nm != "G"},
         )
         print(f"saved posterior draws -> {fname_draws}")
-    try:  # plotting is non-essential; never let it crash the run before benchmarks save
+    # Both plots are non-essential and both sit AFTER the draws save and BEFORE the
+    # benchmark write, each guarded: a figure that cannot be drawn must never cost the
+    # cell it describes. plot_trace_chains used to run unguarded, hours earlier, right
+    # after az.summary -- and arviz's per-chain KDE raises
+    # `OverflowError: cannot convert float infinity to integer` on a degenerate chain,
+    # so 22 finished n=88 cells (2.5-3.5 h of sampling each) died with no benchmark row.
+    # Worse, it needs a stuck chain to fire, so it deleted exactly the worst-mixing cells
+    # (the lost G=0.33 FCD rwmh nc256 had r_hat 3.32) -- a silent bias toward flattering
+    # rwmh and demc, which is the one failure mode a sampler benchmark cannot tolerate.
+    try:
+        plot_trace_chains(mcmc, theta_true, var_names, savepath=fname_trace)
+    except Exception as _e:
+        print(f"WARNING: plot_trace_chains failed ({type(_e).__name__}: {_e}); "
+              f"continuing to benchmark save.")
+    try:
         plot_posterior_pooled(var_names, theta_true, prior_predictions, chains_pooled, "Pooled Posteriors", savepath=fname_posteriors)
     except Exception as _e:
         print(f"WARNING: plot_posterior_pooled failed ({type(_e).__name__}: {_e}); continuing to benchmark save.")
@@ -1000,7 +1050,7 @@ def main():
             # sd of LogNormal(mu, sigma) is exp(mu + sigma^2/2)*sqrt(exp(sigma^2)-1).
             # Using sigma itself (0.5) understates it by ~5x (true ~2.45 at mu=log 4.6),
             # which would make eta's `shrinkage` look far worse than it is.
-            _mu, _sg = float(np.log(ETA_MAG_DEFAULT)), float(args.eta_prior_scale)
+            _mu, _sg = float(np.log(ETA_PRIOR_CENTER)), float(args.eta_prior_scale)
             prior_sd["eta_mag"] = float(np.exp(_mu + 0.5 * _sg ** 2)
                                         * np.sqrt(np.expm1(_sg ** 2)))
         meta = {
@@ -1010,6 +1060,7 @@ def main():
             "n_warmup": n_warmup, "grad_method": args.grad_method, "clip_mode": args.clip_mode,
             "platform": backend, "chain_method": args.chain_method,
             "n_particles": args.n_particles,
+            "adapt_rw": bool(args.adapt_rw),
             "fcd_stride1": bool(args.fcd_stride1), "fisher_z": bool(args.fisher_z),
             "standardize_features": bool(args.standardize_features), "noisy_obs": bool(args.noisy_obs),
             "keep_negative_fc": bool(args.keep_negative_fc),
