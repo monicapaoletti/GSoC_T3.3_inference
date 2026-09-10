@@ -43,7 +43,21 @@ def _ess(logw):
     return 1.0 / jnp.sum(w ** 2)
 
 
-def _make_proposal(move, rw_step, demc_gamma, demc_jitter, d=1):
+RW_TARGET_ACCEPT = 0.234   # optimal acceptance for a random-walk Metropolis kernel
+
+
+def _adapt_log_step(log_step, acc, rate, target=RW_TARGET_ACCEPT):
+    """Robbins-Monro update of the log RW scale toward `target` acceptance.
+
+    Feedback, not a schedule: acceptance falls monotonically as the step grows, so
+    nudging log(step) by (acc - target) is a stable loop that finds the scale the stage
+    actually needs. Clamped to [1e-4, 10] so a stage that accepts nothing (or everything)
+    cannot drive the step to 0 or infinity before the loop recovers.
+    """
+    return jnp.clip(log_step + rate * (acc - target), jnp.log(1e-4), jnp.log(10.0))
+
+
+def _make_proposal(move, demc_gamma, demc_jitter, d=1):
     """Within-stage MCMC proposal on the particle cloud, in log-G space.
 
     move="rw"   : independent multiplicative random walk (one particle at a time).
@@ -63,10 +77,13 @@ def _make_proposal(move, rw_step, demc_gamma, demc_jitter, d=1):
     # original expression, so scalar runs stay bit-for-bit unchanged.
     gamma = float(2.38 / jnp.sqrt(2.0 * d)) if demc_gamma is None else demc_gamma
 
-    def rw(key, parts):
-        return parts * jnp.exp(rw_step * jax.random.normal(key, parts.shape))
+    def rw(key, parts, step):
+        return parts * jnp.exp(step * jax.random.normal(key, parts.shape))
 
-    def demc(key, parts):
+    def demc(key, parts, step):
+        # DE-MC draws its scale from the cloud itself, so the adaptive step does not
+        # apply; it is accepted and ignored to keep one proposal signature.
+        del step
         N = parts.shape[0]
         k1, k2, k3 = jax.random.split(key, 3)
         z = jnp.log(parts)
@@ -84,23 +101,33 @@ def _make_proposal(move, rw_step, demc_gamma, demc_jitter, d=1):
 
 def run_tempered_smc(key, init_particles, logprior_fn, loglik_fn,
                      n_stages=50, n_mcmc=5, rw_step=0.1,
-                     move="rw", demc_gamma=None, demc_jitter=1e-4):
+                     move="rw", demc_gamma=None, demc_jitter=1e-4,
+                     adapt_rw=False, adapt_rate=1.0):
     """Likelihood-tempered SMC. `loglik_fn(G)`/`logprior_fn(G)` are scalar->scalar
     (vmapped here). Returns (particles (N,), info dict with per-stage ess/accept).
 
     `move` selects the within-stage kernel: "rw" (default, unchanged behaviour) or
-    "demc" for tempered DE-MC. See _make_proposal."""
+    "demc" for tempered DE-MC. See _make_proposal.
+
+    `adapt_rw=True` tunes the RW scale toward RW_TARGET_ACCEPT after every MH move
+    instead of holding `rw_step` fixed (which is then only the starting value). Default
+    False so existing runs stay bit-for-bit reproducible -- see the note in run_abc_smc."""
     _d = 1 if init_particles.ndim == 1 else init_particles.shape[-1]
-    propose = _make_proposal(move, rw_step, demc_gamma, demc_jitter, _d)
+    propose = _make_proposal(move, demc_gamma, demc_jitter, _d)
+    # adapt_rw is static, so this resolves at trace time: with adaptation off the
+    # proposal receives the original Python float, not exp(log(rw_step)) -- that
+    # round-trip is inexact in float32 and would silently perturb every fixed-step run
+    # away from the results already in the paper.
+    _step_of = (lambda ls: jnp.exp(ls)) if adapt_rw else (lambda ls: rw_step)
     vprior = jax.vmap(logprior_fn)
     vloglik = jax.vmap(loglik_fn)
     lambdas = jnp.linspace(0.0, 1.0, n_stages + 1)
 
-    def mh_scan(key, parts, lp, ll, lmbda):
+    def mh_scan(key, parts, lp, ll, lmbda, log_step):
         def step(carry, k):
-            parts, lp, ll = carry
+            parts, lp, ll, log_step = carry
             k1, k2 = jax.random.split(k)
-            prop = propose(k1, parts)
+            prop = propose(k1, parts, _step_of(log_step))
             lp_p, ll_p = vprior(prop), vloglik(prop)   # N forward evals, vmapped
             # tempered target logprior + lambda*loglik; multiplicative RW is
             # symmetric in log-space -> Hastings correction is log(prop/parts).
@@ -122,13 +149,17 @@ def run_tempered_smc(key, init_particles, logprior_fn, loglik_fn,
             parts = jnp.where(_bcast(acc, parts), prop, parts)
             lp = jnp.where(acc, lp_p, lp)
             ll = jnp.where(acc, ll_p, ll)
-            return (parts, lp, ll), acc.mean()
+            a = acc.mean()
+            if adapt_rw:
+                log_step = _adapt_log_step(log_step, a, adapt_rate)
+            return (parts, lp, ll, log_step), a
         keys = jax.random.split(key, n_mcmc)
-        (parts, lp, ll), accs = jax.lax.scan(step, (parts, lp, ll), keys)
-        return parts, lp, ll, accs.mean()
+        (parts, lp, ll, log_step), accs = jax.lax.scan(
+            step, (parts, lp, ll, log_step), keys)
+        return parts, lp, ll, accs.mean(), log_step
 
     def stage(carry, lam_pair):
-        parts, lp, ll, key = carry
+        parts, lp, ll, key, log_step = carry
         lam_prev, lam = lam_pair
         key, kr, km = jax.random.split(key, 3)
         logw = (lam - lam_prev) * ll               # incremental importance weight
@@ -136,39 +167,54 @@ def run_tempered_smc(key, init_particles, logprior_fn, loglik_fn,
         ess = 1.0 / jnp.sum(w ** 2)
         idx = systematic_resample(kr, w)
         parts, lp, ll = parts[idx], lp[idx], ll[idx]
-        parts, lp, ll, acc = mh_scan(km, parts, lp, ll, lam)
-        return (parts, lp, ll, key), (ess, acc)
+        parts, lp, ll, acc, log_step = mh_scan(km, parts, lp, ll, lam, log_step)
+        return (parts, lp, ll, key, log_step), (ess, acc, jnp.exp(log_step))
 
     lp0, ll0 = vprior(init_particles), vloglik(init_particles)
     lam_pairs = (lambdas[:-1], lambdas[1:])
-    (parts, lp, ll, _), (ess, acc) = jax.lax.scan(
-        stage, (init_particles, lp0, ll0, key), lam_pairs)
-    return parts, {"ess": ess, "accept": acc}
+    (parts, lp, ll, _, _), (ess, acc, step_hist) = jax.lax.scan(
+        stage, (init_particles, lp0, ll0, key, jnp.log(rw_step)), lam_pairs)
+    return parts, {"ess": ess, "accept": acc, "step": step_hist}
 
 
 def run_abc_smc(key, init_particles, logprior_fn, distance_fn, eps_schedule,
                 n_mcmc=5, rw_step=0.1,
-                move="rw", demc_gamma=None, demc_jitter=1e-4):
+                move="rw", demc_gamma=None, demc_jitter=1e-4,
+                adapt_rw=False, adapt_rate=1.0):
     """ABC epsilon-tempered SMC (likelihood-free). `distance_fn(G)` -> scalar
     distance between simulated and observed features. `eps_schedule` is a
     decreasing (n_stages+1,) array eps0 -> eps_target. Gaussian ABC kernel
     pseudo-loglik = -0.5*(dist/eps)^2. Returns (particles, info).
 
     `move` selects the within-stage kernel: "rw" (default, unchanged behaviour) or
-    "demc" for tempered DE-MC. See _make_proposal."""
+    "demc" for tempered DE-MC. See _make_proposal.
+
+    ADAPT_RW EXISTS BECAUSE THE FIXED STEP COLLAPSES AT SCALE. At 88 nodes with 4096
+    particles the fixed rw_step=0.1 accepted 0.2% of moves for smc_lik in the 2-D run, so
+    the 250 rejuvenation moves separated nothing and the cloud held 254-419 unique values
+    out of 4096. The weight ESS still read ~4000, which is why this hid: resampled
+    DUPLICATES carry healthy weights. Adapting the scale to RW_TARGET_ACCEPT fixes the
+    kernel rather than the diagnostic. Default False so the paper's existing matrix stays
+    bit-for-bit reproducible; every run that turns it on must be compared only against
+    other runs that did."""
     _d = 1 if init_particles.ndim == 1 else init_particles.shape[-1]
-    propose = _make_proposal(move, rw_step, demc_gamma, demc_jitter, _d)
+    propose = _make_proposal(move, demc_gamma, demc_jitter, _d)
+    # adapt_rw is static, so this resolves at trace time: with adaptation off the
+    # proposal receives the original Python float, not exp(log(rw_step)) -- that
+    # round-trip is inexact in float32 and would silently perturb every fixed-step run
+    # away from the results already in the paper.
+    _step_of = (lambda ls: jnp.exp(ls)) if adapt_rw else (lambda ls: rw_step)
     vprior = jax.vmap(logprior_fn)
     vdist = jax.vmap(distance_fn)
 
     def pseudo_ll(dist, eps):
         return -0.5 * (dist / eps) ** 2
 
-    def mh_scan(key, parts, lp, dist, eps):
+    def mh_scan(key, parts, lp, dist, eps, log_step):
         def step(carry, k):
-            parts, lp, dist = carry
+            parts, lp, dist, log_step = carry
             k1, k2 = jax.random.split(k)
-            prop = propose(k1, parts)
+            prop = propose(k1, parts, _step_of(log_step))
             lp_p, dist_p = vprior(prop), vdist(prop)   # N forward evals, vmapped
             hast = jnp.log(prop) - jnp.log(parts)
             if parts.ndim > 1:
@@ -178,13 +224,17 @@ def run_abc_smc(key, init_particles, logprior_fn, distance_fn, eps_schedule,
             parts = jnp.where(_bcast(acc, parts), prop, parts)
             lp = jnp.where(acc, lp_p, lp)
             dist = jnp.where(acc, dist_p, dist)
-            return (parts, lp, dist), acc.mean()
+            a = acc.mean()
+            if adapt_rw:
+                log_step = _adapt_log_step(log_step, a, adapt_rate)
+            return (parts, lp, dist, log_step), a
         keys = jax.random.split(key, n_mcmc)
-        (parts, lp, dist), accs = jax.lax.scan(step, (parts, lp, dist), keys)
-        return parts, lp, dist, accs.mean()
+        (parts, lp, dist, log_step), accs = jax.lax.scan(
+            step, (parts, lp, dist, log_step), keys)
+        return parts, lp, dist, accs.mean(), log_step
 
     def stage(carry, eps_pair):
-        parts, lp, dist, key = carry
+        parts, lp, dist, key, log_step = carry
         eps_prev, eps = eps_pair
         key, kr, km = jax.random.split(key, 3)
         logw = pseudo_ll(dist, eps) - pseudo_ll(dist, eps_prev)
@@ -192,11 +242,11 @@ def run_abc_smc(key, init_particles, logprior_fn, distance_fn, eps_schedule,
         ess = 1.0 / jnp.sum(w ** 2)
         idx = systematic_resample(kr, w)
         parts, lp, dist = parts[idx], lp[idx], dist[idx]
-        parts, lp, dist, acc = mh_scan(km, parts, lp, dist, eps)
-        return (parts, lp, dist, key), (ess, acc)
+        parts, lp, dist, acc, log_step = mh_scan(km, parts, lp, dist, eps, log_step)
+        return (parts, lp, dist, key, log_step), (ess, acc, jnp.exp(log_step))
 
     lp0, dist0 = vprior(init_particles), vdist(init_particles)
     eps_pairs = (eps_schedule[:-1], eps_schedule[1:])
-    (parts, lp, dist, _), (ess, acc) = jax.lax.scan(
-        stage, (init_particles, lp0, dist0, key), eps_pairs)
-    return parts, {"ess": ess, "accept": acc, "final_dist": dist}
+    (parts, lp, dist, _, _), (ess, acc, step_hist) = jax.lax.scan(
+        stage, (init_particles, lp0, dist0, key, jnp.log(rw_step)), eps_pairs)
+    return parts, {"ess": ess, "accept": acc, "step": step_hist, "final_dist": dist}
