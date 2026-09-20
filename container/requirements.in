@@ -1,0 +1,30 @@
+# The pinned inference stack, identical to requirements-gpu.txt minus JAX itself.
+#
+# JAX is installed separately by the Dockerfile through the JAX_SPEC build arg, because
+# the laptop wants CPU wheels and the clusters want the CUDA-12 ones, from the same
+# definition. Everything else is the same on both.
+#
+# These are the versions the paper's benchmark was validated against. Changing one means
+# re-running the benchmark before trusting a comparison against the published numbers.
+
+numpyro==0.19.0
+pymc==5.20.0
+pytensor==2.26.4
+blackjax==1.2.4
+arviz==0.20.0
+flax==0.10.7
+seaborn==0.13.2
+numpy==1.26.4
+scipy==1.15.1
+networkx==3.4.2
+optax==0.2.4
+matplotlib==3.9.2
+pandas==2.0.3
+h5py==3.12.1
+scikit-learn==1.6.1
+tqdm==4.66.5
+xarray==2024.7.0
+jaxopt==0.8.3
+equinox==0.13.2
+chex==0.1.88
+orbax-checkpoint==0.11.25
