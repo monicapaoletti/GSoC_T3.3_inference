@@ -30,5 +30,28 @@ Mentors: Meysam Hashemi and Daniele Marinazzo
       - utils.py # Utilities
   - README.md  # Project documentation
   - GSoC_final_submission.md # Submission document
+  - container/  # Pinned environment: laptop dev container and the cluster Apptainer image
+
+## If you cloned this before 2026-09-20: the history was rewritten
+
+The commits written by Claude between 2026-08-05 and 2026-09-10 were re-authored from
+`Monica Paoletti` to `Claude <noreply@anthropic.com>`, so the record says who wrote what.
+**No file content changed** — every tree is byte-identical, and every commit message and
+date is the same — but the commit hashes from `Add SBC driver; FCD lag banding`
+(2026-08-05) onward are new.
+
+An existing clone will therefore not `git pull` cleanly. If you have no local commits:
+
+```bash
+git fetch origin
+git reset --hard origin/main      # discards local changes -- stash them first if you have any
+```
+
+If you do have local commits to keep, replay them onto the new history instead:
+
+```bash
+git fetch origin
+git rebase --onto origin/main <the-commit-you-branched-from> <your-branch>
+```
 
 
