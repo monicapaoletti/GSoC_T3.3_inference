@@ -51,12 +51,17 @@ BATCHES = [64, 256, 1024, 4096]
 
 
 def smc_jobs(save, n_stages, n_mcmc, g, stat, gpu_only=False, flavors=None, smc_move="rw",
-             batches=None):
+             batches=None, adapt_rw=False):
     jobs = []
     GS = ["--G", str(g), "--which_stat", stat]
     # tempered DE-MC is a separate algorithm -> separate job name and (via the driver)
     # a separate sampler label in the results, so it never collides with the rw cells.
     MOVE = [] if smc_move == "rw" else ["--smc_move", smc_move]
+    # Off by default so the 10-node matrix and the UGent n=88 matrix stay reproducible.
+    # It is recorded in each benchmark row (adapt_rw column), but NOT in the filename, so
+    # an adaptive and a fixed-step run must go to different --results_dir.
+    if adapt_rw:
+        MOVE = MOVE + ["--adapt_rw"]
     sfx = "" if smc_move == "rw" else f"_{smc_move}"
     for flavor in (flavors or ["smc_lik", "smc_abc"]):
         # GPU: full particle sweep (batched axis -> ~free on GPU)
@@ -208,6 +213,10 @@ def main():
     ap.add_argument("--smc_move", type=str, default="rw", choices=["rw", "demc"],
                     help="within-stage SMC kernel; 'demc' = tempered DE-MC, recorded as a "
                          "separate sampler row (<flavor>_demc)")
+    ap.add_argument("--adapt_rw", action="store_true",
+                    help="pass --adapt_rw to every SMC cell: tune the random-walk scale "
+                         "toward 0.234 acceptance. Without it the n=88 SMC/FC cloud "
+                         "collapses (sd 0). Not comparable with runs made without it.")
     ap.add_argument("--n_stages", type=int, default=50)
     ap.add_argument("--n_mcmc", type=int, default=5)
     ap.add_argument("--cpu_cap", type=int, default=1)
@@ -257,7 +266,7 @@ def main():
     if "smc" in args.suite:
         jobs += smc_jobs(save, args.n_stages, args.n_mcmc, args.G, args.which_stat,
                          args.gpu_only, args.smc_samplers, args.smc_move,
-                         batches=args.batch_sizes)
+                         batches=args.batch_sizes, adapt_rw=args.adapt_rw)
     if "mcmc" in args.suite:
         jobs += mcmc_jobs(save, args.n_warmup, args.n_samples, args.G, args.which_stat,
                           args.gpu_only, args.mcmc_samplers, batches=args.batch_sizes)
