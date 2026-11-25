@@ -19,9 +19,12 @@ LEO_GPU_MEM="${LEO_GPU_MEM:-120G}"     # host RAM per 1-GPU job
 
 LEO_HOME="${LEO_HOME:-/leonardo/home/userexternal/mpaolett}"
 GSOC_REPO="${GSOC_REPO:-$LEO_HOME/GSoC_T3.3_inference}"
-# Results default to $HOME next to the repo. If $HOME quota is tight, point this at
-# $WORK or $SCRATCH (scratch is purged, so copy results off before it is).
-LEO_RESULTS="${LEO_RESULTS:-$LEO_HOME/results}"
+# Code runs from the $HOME clone (the one wired to GitHub). Results go to a personal
+# folder in the project's $WORK, which has the space $HOME lacks. $WORK is shared with
+# the other EUHPC_B40_021 members -- and $WORK/GSoC_T3.3_inference is SOMEONE ELSE'S
+# clone (git reports dubious ownership), so never write into or run from it.
+LEO_RESULTS="${LEO_RESULTS:-${WORK:+$WORK/mpaolett/results}}"
+LEO_RESULTS="${LEO_RESULTS:-$LEO_HOME/results}"     # fallback if $WORK is unset
 
 # The pinned environment: identical package versions to doslis/UGent, which is what makes
 # the Leonardo numbers comparable to the UGent ones. JAX_MODULE swaps in a CINECA module
