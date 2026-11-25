@@ -54,7 +54,7 @@ source "$HERE/config.sh"
 STATS=("${@:-FCD}")
 GS=(0.2 0.33 0.5 0.7)
 NCS=(1 8 32 128)
-OUT="$LEO_RESULTS/nuts_n88_leonardo${JAX_MODULE:+_module_${JAX_MODULE//\//_}}"
+OUT="$LEO_RESULTS/nuts_n88_leonardo${JAX_MODULE:+_module_${JAX_MODULE//[\/ ]/_}}"
 mkdir -p "$OUT/logs"
 mapfile -t FLAGS < <(leo_sbatch_flags)
 

@@ -29,12 +29,24 @@ LEO_RESULTS="${LEO_RESULTS:-$LEO_HOME/results}"     # fallback if $WORK is unset
 # The pinned environment: identical package versions to doslis/UGent, which is what makes
 # the Leonardo numbers comparable to the UGent ones. JAX_MODULE swaps in a CINECA module
 # instead -- for the NUTS/module experiment only, never for the comparison runs.
+#
+# The activation runs with `set -u` suspended: jax_conda's own activate.d hook
+# (activate-binutils_linux-64.sh line 68) reads $ADDR2LINE unset, and under the drivers'
+# `set -u` that killed every job in 3 s (first probe, 2026-11-25). The caller's -u state
+# is restored afterwards. JAX_MODULE may be "profile/deeplrn cineca-ai/4.3.0": cineca-ai
+# is only visible once its profile is loaded.
+_LEO_SET_U='case $- in *u*) _leo_u=1;; *) _leo_u=;; esac; set +u'
+_LEO_RESTORE_U='if [ -n "$_leo_u" ]; then set -u; fi'
 if [ -n "${JAX_MODULE:-}" ]; then
-  LEO_ENV_SETUP="module load $JAX_MODULE"
+  LEO_ENV_SETUP="$_LEO_SET_U
+module load $JAX_MODULE
+$_LEO_RESTORE_U"
 else
-  LEO_ENV_SETUP='module load openblas
-eval "$(micromamba shell hook --shell=bash)"
-micromamba activate jax_conda'
+  LEO_ENV_SETUP="$_LEO_SET_U
+module load openblas
+eval \"\$(micromamba shell hook --shell=bash)\"
+micromamba activate jax_conda
+$_LEO_RESTORE_U"
 fi
 
 # Common sbatch flags for a one-GPU job. --qos only when set.

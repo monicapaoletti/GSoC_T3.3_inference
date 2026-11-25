@@ -59,13 +59,18 @@ rm -f /tmp/module_avail.$$
 
 echo
 echo "=== does any module-provided python already import a GPU jax? ==="
-# Try the modules actually found above, if any; this list is intentionally short and
-# will mostly fail -- that failure IS the answer (falls back to micromamba jax_conda).
-for CAND in cineca-ai jax python/3.11; do
-  module load "$CAND" >/dev/null 2>&1 || continue
-  echo "--- module: $CAND ---"
-  python3 -c "import jax; print('jax', jax.__version__, jax.devices())" 2>&1
-  module unload "$CAND" >/dev/null 2>&1
+# cineca-ai only appears after its profile is loaded (first run, 2026-11-25: deeplrn lists
+# cineca-ai/3.0.0-4.3.0, candidate lists cineca-ai/2026-09). python/3.11 alone has
+# jax 0.7.0 CPU-only. `set +u` because module/activate scripts read unset variables.
+set +u
+for CAND in "profile/deeplrn cineca-ai/4.3.0" "profile/deeplrn cineca-ai/4.1.1" \
+            "profile/candidate cineca-ai/2026-09"; do
+  echo "--- modules: $CAND ---"
+  ( module purge >/dev/null 2>&1
+    module load $CAND >/dev/null 2>&1 || { echo "(load failed)"; exit 0; }
+    which python3
+    python3 -c "import jax, jaxlib; print('jax', jax.__version__, 'jaxlib', jaxlib.__version__, jax.devices())" 2>&1 | tail -2
+    python3 -c "import numpyro; print('numpyro', numpyro.__version__)" 2>&1 | tail -1 )
 done
 
 echo
@@ -73,10 +78,9 @@ echo "=== baseline: the pinned env this campaign actually runs under ==="
 module load openblas
 eval "$(micromamba shell hook --shell=bash)"
 micromamba activate jax_conda
+set -u
 nvidia-smi -L
-python3 -c "import jax; print('jax_conda jax', jax.__version__, jax.devices())"
+python3 -c "import jax, numpyro; print('jax_conda jax', jax.__version__, 'numpyro', numpyro.__version__, jax.devices())"
 
 echo
-echo "[probe] done. If a module above printed a GPU device for jax, note its exact"
-echo "        name here and decide with Monica whether to switch; otherwise jax_conda"
-echo "        stays the env for bench_n88_submit.sh / nuts_n88_submit.sh."
+echo "[probe] done. The baseline must list a CudaDevice, or nothing else here will run."
