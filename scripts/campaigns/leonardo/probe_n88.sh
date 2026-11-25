@@ -1,75 +1,71 @@
 #!/usr/bin/env bash
-# Feasibility + cost probe for the 88-node campaign on Leonardo Booster (A100 64GB).
+# Cost + memory probe for the 88-node campaign on Leonardo Booster (A100 64 GB).
 #
-# WHY THIS RUNS BEFORE bench_n88_submit.sh / nuts_n88_submit.sh. The UGent hour budgets
-# (rwmh 11.2h, demc 11.5h, smc_abc/smc_abc_demc 1.4h, smc_lik 0.4h, per G per statistic --
-# see scripts/campaigns/ugent/bench_n88_submit.sh) were MEASURED on an H100 NVL. An A100
-# is a different card (less memory, different throughput curve) and copying those hour
-# budgets unchanged would be a guess, not a measurement -- exactly the mistake the UGent
-# README warns against repeating. Run this probe, read its batch-sweep + per-replicate
-# numbers, and scale the --time= values in bench_n88_submit.sh / nuts_n88_submit.sh from
-# THIS cluster's own cost model (runtime = n_steps x t_call(batch)) before submitting the
-# real matrix.
+# THIS IS scripts/campaigns/ugent/probe_n88.sh, TASK FOR TASK, so every number it prints
+# divides directly by the UGent (H100 NVL) one measured 2026-09-08:
+#   task 0  forward sweep, s/call:  1:3.08 4:4.61 16:4.71 64:4.84 256:4.18 1024:4.59
+#                                   4096:5.93 8192:7.72 16384:12.03; peak 30.9 GB
+#   task 1-4  one SBC replicate (smc_lik/abc x FC/FCD): 1658-1681 s;
+#             peak 5.1 GB (FC), 33.7-37.8 GB (FCD)
+# The ratio at batch 4096 and the replicate ratio are the A100/H100 factor that sets every
+# walltime and the GPU-hour budget. The peak memory says whether FCD at 4096 particles
+# fits in 64 GB.
 #
-# Task 0: batch sweep (forward throughput vs batch size) -- same sweep UGent ran, to find
-#   where the A100 saturates (64 GB is a third of the H100 NVL's; the occupancy point
-#   that forced CUDA MPS on doslis's 23 GB L4s may or may not reappear here).
-# Task 1-4: one real SMC/MCMC replicate each (FC/FCD x a cheap sampler + an expensive one),
-#   at the campaign's actual settings, to anchor the cost model with a real number instead
-#   of an extrapolation from the sweep alone.
+# NUTS is not here: its cost is unknown, and nuts_n88_submit.sh PILOT=1 is its probe.
 #
-#SBATCH --job-name=probe88_leo
-# account: pass it on the command line -- sbatch --account=EUHPC_B40_021 <this script>
+# Submit from anywhere:  sbatch --account=EUHPC_B40_021 probe_n88.sh
+# (the account cannot be set in an #SBATCH line from a variable; config.sh's default is
+# the same project)
+#SBATCH --job-name=probe88L
 #SBATCH --partition=boost_usr_prod
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=120G
-#SBATCH --time=06:00:00
+#SBATCH --time=02:00:00
 #SBATCH --array=0-4
 #SBATCH --output=%x-%A_%a.out
 set -uo pipefail
 
-module load openblas
-eval "$(micromamba shell hook --shell=bash)"
-micromamba activate jax_conda
+GSOC_REPO="${GSOC_REPO:-/leonardo/home/userexternal/mpaolett/GSoC_T3.3_inference}"
+source "$GSOC_REPO/scripts/campaigns/leonardo/config.sh"
+eval "$LEO_ENV_SETUP"
+cd "$GSOC_REPO/scripts/functions" || exit 1
 
-LEO_HOME="/leonardo/home/userexternal/mpaolett"
-GSOC_REPO="$LEO_HOME/GSoC_T3.3_inference"
-OUT="$LEO_HOME/results/probe_n88_leonardo"
+OUT="$LEO_RESULTS/probe_n88_leonardo"
 mkdir -p "$OUT"
 
-cd "$GSOC_REPO/scripts/functions" || exit 1
-echo "[probe] task $SLURM_ARRAY_TASK_ID on $(hostname) at $(date)"
-nvidia-smi -L
+# JAX does not report peak device memory once preallocation is off, so sample the card.
+MEMLOG="$OUT/gpumem_${SLURM_ARRAY_TASK_ID}.csv"
+( while true; do
+    nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits >> "$MEMLOG"
+    sleep 5
+  done ) &
+SAMPLER_PID=$!
+trap 'kill $SAMPLER_PID 2>/dev/null' EXIT
 
+COMMON="--L 100 --scale 0.5 --n_particles 4096 --SC_type data --SC_size 88 \
+        --t_end 30000 --tr 1 --cut 10 --out_dir $OUT --i_start 0 --i_end 1"
+
+echo "[probe] task $SLURM_ARRAY_TASK_ID on $(hostname) $(date)"
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+python -c 'import jax; print("jax", jax.__version__, jax.devices())'
+
+START=$SECONDS
 case "$SLURM_ARRAY_TASK_ID" in
-  0)
-    # batch sweep: forward-only throughput, G-/stat-independent
-    python run_gpu_pool.py --suite forward --SC_size 88 --gpu_only --gpu_concurrency 1 \
-      --results_dir "$OUT"
-    ;;
-  1)
-    time python mpr_jax_numpyro.py --sampler smc_lik --which_stat FCD --G 0.5 \
-      --n_stages 50 --n_mcmc 5 --SC_size 88 --save_dir "$OUT"
-    ;;
-  2)
-    time python mpr_jax_numpyro.py --sampler rwmh --which_stat FCD --G 0.5 \
-      --n_chains 1024 --n_warmup 1000 --n_samples 1000 --SC_size 88 --save_dir "$OUT"
-    ;;
-  3)
-    time python mpr_jax_numpyro.py --sampler smc_lik --which_stat FC --G 0.5 \
-      --n_stages 50 --n_mcmc 5 --SC_size 88 --save_dir "$OUT"
-    ;;
-  4)
-    # gradient-based arm: one NUTS replicate, fd gradient (default, safe -- see
-    # memory/grad-horizon-zeroes-gradient and gradient-based-inference-mpr; autodiff
-    # explodes/vanishes in the chaotic regime, do NOT default to it), FCD needs
-    # fc_eps>0 or the corrcoef gradient through a zero-variance window is NaN.
-    time python mpr_jax_numpyro.py --sampler nuts --chain_method vectorized \
-      --n_chains 32 --n_warmup 500 --n_samples 500 --which_stat FCD --fc_eps 1e-6 \
-      --G 0.5 --SC_size 88 --save_dir "$OUT"
-    ;;
+  0) python microbench_batch.py --sc_size 88 --reps 3 \
+            --batches 1 4 16 64 256 1024 4096 8192 16384 \
+            --outdir "$OUT" ;;
+  1) python sbc_run.py $COMMON --sampler smc_lik --which_stat FC  ;;
+  2) python sbc_run.py $COMMON --sampler smc_abc --which_stat FC  ;;
+  3) python sbc_run.py $COMMON --sampler smc_lik --which_stat FCD ;;
+  4) python sbc_run.py $COMMON --sampler smc_abc --which_stat FCD ;;
 esac
-echo "[probe] task $SLURM_ARRAY_TASK_ID done at $(date)"
+RC=$?
+ELAPSED=$((SECONDS - START))
+
+kill $SAMPLER_PID 2>/dev/null
+PEAK=$(sort -n "$MEMLOG" 2>/dev/null | tail -1)
+echo "[probe] task $SLURM_ARRAY_TASK_ID rc=$RC elapsed=${ELAPSED}s peak_gpu_mem=${PEAK}MiB"
+echo "$SLURM_ARRAY_TASK_ID,$RC,$ELAPSED,$PEAK" >> "$OUT/probe_summary.csv"
