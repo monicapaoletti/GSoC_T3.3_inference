@@ -42,7 +42,10 @@ if [ -n "${JAX_MODULE:-}" ]; then
 module load $JAX_MODULE
 $_LEO_RESTORE_U"
 else
+  # unset PYTHONPATH: the default-loaded python/3.11.7 module sets it to its own 3.11
+  # site-packages, which every job inherits and which jax_n88 (Python 3.10) must not see.
   LEO_ENV_SETUP="$_LEO_SET_U
+unset PYTHONPATH
 module load openblas
 eval \"\$(micromamba shell hook --shell=bash)\"
 micromamba activate ${LEO_CONDA_ENV:-jax_n88}

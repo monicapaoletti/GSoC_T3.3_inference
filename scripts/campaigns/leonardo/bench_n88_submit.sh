@@ -18,8 +18,9 @@
 # point per job (~3.4 h on H100 at nc4096) leaves room for a slower card, and a lost point
 # is a one-job resubmit. SMC cells stay as 4-point sweeps (~1.8 h on H100).
 #
-# The walltimes are ~3x the H100 measurements. Run probe_n88.sh first and tighten them if
-# the A100 is close to the H100: shorter requests start sooner.
+# Walltimes set from the Leonardo probe (2026-11-25): A100/H100 = 1.20-1.37 over batches
+# 64-4096, applied to UGent's recorded run times. Longest predicted job: MCMC point 4.6 h
+# (7 h asked), SMC cell 3.6 h (5 h), SMC-DEMC cell 1.8 h (3 h).
 #
 # SLICE IS ABSENT, as at UGent: at rwmh's 1000/1000 budget it costs ~64 h per batch size
 # at 88 nodes. Report its absence as a result about the sampler.
@@ -63,22 +64,22 @@ for STAT in "${STATS[@]}"; do
     if [ "${ONLY:-}" != "smc" ]; then
       for S in rwmh demc; do
         for B in "${BATCHES[@]}"; do
-          submit "b88L_${S}_${STAT}_G${G}_nc${B}" 10 "$OUT" \
+          submit "b88L_${S}_${STAT}_G${G}_nc${B}" 7 "$OUT" \
             --suite mcmc --mcmc_samplers "$S" --batch_sizes "$B" \
             --which_stat "$STAT" --G "$G" --n_warmup 1000 --n_samples 1000
         done
       done
     fi
     if [ "${ONLY:-}" != "mcmc" ]; then
-      submit "b88L_smc_${STAT}_G${G}"     6 "$OUT" --suite smc --smc_samplers smc_lik smc_abc \
+      submit "b88L_smc_${STAT}_G${G}"     5 "$OUT" --suite smc --smc_samplers smc_lik smc_abc \
         --adapt_rw --which_stat "$STAT" --G "$G" --n_stages 50 --n_mcmc 5
-      submit "b88L_smcdemc_${STAT}_G${G}" 5 "$OUT" --suite smc --smc_samplers smc_abc \
+      submit "b88L_smcdemc_${STAT}_G${G}" 3 "$OUT" --suite smc --smc_samplers smc_abc \
         --smc_move demc --adapt_rw --which_stat "$STAT" --G "$G" --n_stages 50 --n_mcmc 5
     fi
   done
   # Fixed-step control: same flags as UGent, no --adapt_rw, separate directory.
   if [ "${EXACT:-1}" = "1" ] && [ "${ONLY:-}" != "mcmc" ]; then
-    submit "b88L_smcFIXED_${STAT}_G0.5" 6 "$OUT_EXACT" --suite smc \
+    submit "b88L_smcFIXED_${STAT}_G0.5" 5 "$OUT_EXACT" --suite smc \
       --smc_samplers smc_lik smc_abc --which_stat "$STAT" --G 0.5 --n_stages 50 --n_mcmc 5
   fi
 done

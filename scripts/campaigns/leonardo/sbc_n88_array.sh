@@ -7,11 +7,10 @@
 # sbc_n88_{1d,2d}_FCD_adapt (sbc_run.py draws all L truths before slicing, so replicate k
 # has the same ground truth on both clusters).
 #
-# UGent measured 1658-1681 s per replicate on an H100 NVL, peak device memory 5.1 GB (FC)
-# and 37.8 GB (FCD). Both fit an A100 64 GB. The 2 h walltime allows for a card up to
-# ~4x slower.
+# Measured on Leonardo's A100 (probe, 2026-11-25): 2225-2290 s per replicate (H100: 1658-
+# 1681 s). FCD at 4096 particles fits the 64 GB card. 1h15 is ~2x the measured time.
 #SBATCH --job-name=sbc88L
-#SBATCH --time=02:00:00
+#SBATCH --time=01:15:00
 set -uo pipefail
 
 : "${GSOC_REPO:?}"; : "${STAT:?set STAT=FC or FCD}"; : "${MODE:?set MODE=1d or 2d}"; : "${OUT:?}"
