@@ -26,7 +26,7 @@ GSOC_REPO="${GSOC_REPO:-$LEO_HOME/GSoC_T3.3_inference}"
 LEO_RESULTS="${LEO_RESULTS:-${WORK:+$WORK/mpaolett/results}}"
 LEO_RESULTS="${LEO_RESULTS:-$LEO_HOME/results}"     # fallback if $WORK is unset
 
-# The pinned environment: identical package versions to doslis/UGent, which is what makes
+# The pinned environment `jax_n88` (built by setup_env.sh): the UGent package versions, which is what makes
 # the Leonardo numbers comparable to the UGent ones. JAX_MODULE swaps in a CINECA module
 # instead -- for the NUTS/module experiment only, never for the comparison runs.
 #
@@ -45,7 +45,7 @@ else
   LEO_ENV_SETUP="$_LEO_SET_U
 module load openblas
 eval \"\$(micromamba shell hook --shell=bash)\"
-micromamba activate jax_conda
+micromamba activate ${LEO_CONDA_ENV:-jax_n88}
 $_LEO_RESTORE_U"
 fi
 

@@ -77,10 +77,10 @@ echo
 echo "=== baseline: the pinned env this campaign actually runs under ==="
 module load openblas
 eval "$(micromamba shell hook --shell=bash)"
-micromamba activate jax_conda
+micromamba activate "${LEO_CONDA_ENV:-jax_n88}"
 set -u
 nvidia-smi -L
-python3 -c "import jax, numpyro; print('jax_conda jax', jax.__version__, 'numpyro', numpyro.__version__, jax.devices())"
+python3 -c "import jax, numpyro; print('env jax', jax.__version__, 'numpyro', numpyro.__version__, jax.devices())"
 
 echo
 echo "[probe] done. The baseline must list a CudaDevice, or nothing else here will run."
