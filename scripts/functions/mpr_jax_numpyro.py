@@ -163,6 +163,22 @@ def parse_args():
                     help="smc_abc initial (large) epsilon; default = median prior distance.")
     parser.add_argument("--abc_eps_target", type=float, default=None,
                     help="smc_abc final epsilon; default = obs_err * sqrt(n_features).")
+    parser.add_argument("--abc_fresh_noise", action="store_true",
+                    help="smc_abc only: every simulation draws NEW simulator noise instead of "
+                         "reusing the observed data's own noise seed (frozen noise, the "
+                         "default). The forward then no longer knows the noise that made "
+                         "the data, as on real data. With the Gaussian kernel at "
+                         "eps=obs_err this ABC targets the exact posterior of "
+                         "obs = sim(theta, fresh noise) + N(0, obs_err^2) (Wilkinson 2013), "
+                         "which is how --noisy_obs builds the observed -- but the kernel "
+                         "value now fluctuates with the noise, so expect low acceptance "
+                         "unless --abc_eps_target is raised or --abc_n_noise averaged. "
+                         "Recorded as sampler 'smc_abc_fresh'. OFF by default.")
+    parser.add_argument("--abc_n_noise", type=int, default=1,
+                    help="with --abc_fresh_noise: noise draws per particle. The kernel is "
+                         "averaged over them (log-mean-exp), an unbiased estimate of the ABC "
+                         "likelihood, so the sampler stays valid while its variance drops "
+                         "~1/K. Costs K forward runs per evaluation.")
     parser.add_argument("--smc_move", type=str, default="rw", choices=["rw", "demc"],
                     help="within-stage SMC kernel: 'rw' = multiplicative random walk "
                          "(default, unchanged); 'demc' = tempered DE-MC, i.e. the "
@@ -369,8 +385,10 @@ def feature_reference_scatter(par, which_stat, cut, tr, starts, nn,
 # ------------------ Forward model (shared by NumPyro NUTS + BlackJAX) ------------------
 def make_forward_fn(par, which_stat, cut, tr, starts, nn, grad_horizon=0, fcd_band=0,
                     fast_bold=False, eps=0.0, grad_method="fd", fd_h=1e-2,
-                    fisher_z=False, keep_negative=False, wwidth=30, olap=0.94):
+                    fisher_z=False, keep_negative=False, wwidth=30, olap=0.94,
+                    keyed=False):
     """Return forward_fn(G) -> flat FC/FCD statistic, matching wrapper_fc/fcd.
+    keyed=True returns forward(G, key) with the noise taken from `key` (no gradient).
 
     grad_method="autodiff": plain JAX forward (autodiff gradient — unreliable in
     the chaotic regime). grad_method="fd": wraps the forward in jax.custom_vjp so
@@ -380,9 +398,11 @@ def make_forward_fn(par, which_stat, cut, tr, starts, nn, grad_horizon=0, fcd_ba
     base = dict(par)
     _wwidth, _olap = wwidth, olap
 
-    def raw(G):
+    def raw(G, key=None):
+        # key=None: the noise comes from base["seed"] (frozen, the historical behaviour).
+        # A key draws that realisation instead (--abc_fresh_noise).
         p = _apply_theta(dict(base), G)
-        sde = mpr_jax.MPR_sde.create(p)
+        sde = mpr_jax.MPR_sde.create(p, key=key)
         bold = sde.run({}, record_rv=False, fast_bold=fast_bold, grad_horizon=grad_horizon)["bold_d"]
         if which_stat == "FC":
             F = get_fc(bold[int(cut):].T, eps=eps, keep_negative=keep_negative)
@@ -393,6 +413,8 @@ def make_forward_fn(par, which_stat, cut, tr, starts, nn, grad_horizon=0, fcd_ba
             v = F[_fcd_indices(F.shape[0], k=30, band=fcd_band)]
         return _fisher_z(v) if fisher_z else v
 
+    if keyed:
+        return raw
     if grad_method == "autodiff":
         return raw
 
@@ -547,6 +569,10 @@ def main():
     sampler_label = sampler
     if args.smc_move == "demc" and sampler in ("smc_lik", "smc_abc"):
         sampler_label = f"{sampler}_demc"
+    if args.abc_fresh_noise:
+        if sampler != "smc_abc":
+            raise SystemExit("--abc_fresh_noise applies to --sampler smc_abc only")
+        sampler_label += "_fresh" + (f"K{args.abc_n_noise}" if args.abc_n_noise > 1 else "")
 
     # eta enters the tag ONLY when it differs from the historical default, so every
     # filename produced before --eta existed stays byte-identical and sbc_run's resume
@@ -647,6 +673,19 @@ def main():
         _mu_j, _sd_j = jnp.asarray(feat_mu), jnp.asarray(feat_sd)
         _fwd0 = forward_fn
         forward_fn = lambda G, _f=_fwd0: (_f(G) - _mu_j) / _sd_j
+        _std = (_mu_j, _sd_j)
+    else:
+        _std = None
+    # Noise-keyed forward for --abc_fresh_noise, standardised exactly like forward_fn.
+    forward_keyed = None
+    if args.abc_fresh_noise:
+        _fk = make_forward_fn(params, which_stat, cut, tr, starts, nn,
+                              wwidth=args.wwidth, olap=args.olap, fcd_band=args.fcd_band,
+                              fast_bold=args.fast_bold, eps=args.fc_eps,
+                              fisher_z=args.fisher_z, keep_negative=args.keep_negative_fc,
+                              keyed=True)
+        forward_keyed = (_fk if _std is None else
+                         (lambda G, k, _f=_fk, _m=_std[0], _s=_std[1]: (_f(G, k) - _m) / _s))
         FC_obs_flat = (jnp.asarray(FC_obs_flat) - _mu_j) / _sd_j
 
     # --- optional observation noise: make the synthetic observed a real draw from
@@ -660,7 +699,7 @@ def main():
     print(FC_obs_flat)
     data = {"FC_obs": FC_obs_flat, "params": params, "obs_err": obs_err, "cut": cut, "tr":tr, "starts":starts, "nn":nn,
             "grad_horizon": args.grad_horizon, "fast_bold": args.fast_bold, "eps": args.fc_eps,
-            "forward_fn": forward_fn}
+            "forward_fn": forward_fn, "forward_keyed": forward_keyed}
     prior_specs = {"scale_G": scale}
 
     # --- diagnostic: profile the likelihood over G, then stop (see --profile_grid) ---
@@ -916,7 +955,19 @@ def main():
             jax.block_until_ready(parts)
             runtime = time.time() - start_time
         else:  # smc_abc  (likelihood-free)
-            distance_fn = lambda G: jnp.sqrt(jnp.sum((fwd(G) - obs) ** 2))
+            if args.abc_fresh_noise:
+                # Fresh noise: distance_fn(G, key) runs K new realisations and returns K
+                # distances. The key stream is folded off the run seed, so it never
+                # reproduces the observed data's own realisation (PRNGKey(seed)).
+                _fk, _K = data["forward_keyed"], int(args.abc_n_noise)
+                def distance_fn(G, key):
+                    ks = jax.random.split(key, _K)
+                    sims = jax.vmap(lambda k: _fk(G, k))(ks)
+                    return jnp.sqrt(jnp.sum((sims - obs) ** 2, axis=-1))       # (K,)
+                k_smc = jax.random.fold_in(k_smc, 0xF5E5)
+                print(f"  ABC with FRESH simulator noise, {_K} draw(s) per evaluation")
+            else:
+                distance_fn = lambda G: jnp.sqrt(jnp.sum((fwd(G) - obs) ** 2))
             n_feat = int(obs.shape[0])
             # target epsilon = the PER-FEATURE noise sd = obs_err (NOT obs_err*sqrt(n_feat)).
             # The Gaussian ABC kernel -0.5*(dist/eps)^2 with dist=||sim-obs|| EQUALS the
@@ -928,7 +979,11 @@ def main():
             if args.abc_eps0 is not None:
                 eps0 = args.abc_eps0
             else:
-                d0 = np.asarray(jax.vmap(distance_fn)(init_particles))
+                if args.abc_fresh_noise:
+                    _k0 = jax.random.split(jax.random.fold_in(k_smc, 1), init_particles.shape[0])
+                    d0 = np.asarray(jax.vmap(distance_fn)(init_particles, _k0)).min(-1)
+                else:
+                    d0 = np.asarray(jax.vmap(distance_fn)(init_particles))
                 eps0 = float(np.percentile(d0, 90))          # start loose
             eps0 = max(eps0, eps_target * 3.0)               # guarantee a real decreasing schedule
             eps_schedule = jnp.geomspace(eps0, eps_target, args.n_stages + 1)
@@ -937,7 +992,8 @@ def main():
             parts, info = run_abc_smc(k_smc, init_particles, logprior_fn, distance_fn,
                                       eps_schedule, n_mcmc=args.n_mcmc, rw_step=args.rw_step,
                                       move=args.smc_move, adapt_rw=args.adapt_rw,
-                                      adapt_rate=args.adapt_rw_rate)
+                                      adapt_rate=args.adapt_rw_rate,
+                                      fresh_noise=bool(args.abc_fresh_noise))
             jax.block_until_ready(parts)
             runtime = time.time() - start_time
 

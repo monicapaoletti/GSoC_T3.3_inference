@@ -180,8 +180,16 @@ def run_tempered_smc(key, init_particles, logprior_fn, loglik_fn,
 def run_abc_smc(key, init_particles, logprior_fn, distance_fn, eps_schedule,
                 n_mcmc=5, rw_step=0.1,
                 move="rw", demc_gamma=None, demc_jitter=1e-4,
-                adapt_rw=False, adapt_rate=1.0):
-    """ABC epsilon-tempered SMC (likelihood-free). `distance_fn(G)` -> scalar
+                adapt_rw=False, adapt_rate=1.0, fresh_noise=False):
+    """ABC epsilon-tempered SMC (likelihood-free).
+
+    fresh_noise=True: distance_fn(G, key) -> (K,) distances from K NEW noise draws, and
+    the pseudo-loglik is log mean_k exp(-0.5 (d_k/eps)^2), an unbiased estimate of the
+    ABC likelihood. Each particle keeps the distances it was simulated with (they are
+    re-weighted, never re-simulated, between stages), which is what keeps the
+    pseudo-marginal MH move exact. With False the code path is the historical one.
+
+    Frozen noise (default): `distance_fn(G)` -> scalar
     distance between simulated and observed features. `eps_schedule` is a
     decreasing (n_stages+1,) array eps0 -> eps_target. Gaussian ABC kernel
     pseudo-loglik = -0.5*(dist/eps)^2. Returns (particles, info).
@@ -205,17 +213,32 @@ def run_abc_smc(key, init_particles, logprior_fn, distance_fn, eps_schedule,
     # away from the results already in the paper.
     _step_of = (lambda ls: jnp.exp(ls)) if adapt_rw else (lambda ls: rw_step)
     vprior = jax.vmap(logprior_fn)
-    vdist = jax.vmap(distance_fn)
+    if fresh_noise:
+        _vd = jax.vmap(distance_fn)
+        def vdist(parts, key):
+            return _vd(parts, jax.random.split(key, parts.shape[0]))      # (N, K)
 
-    def pseudo_ll(dist, eps):
-        return -0.5 * (dist / eps) ** 2
+        def pseudo_ll(dist, eps):
+            k = -0.5 * (dist / eps) ** 2
+            return jax.scipy.special.logsumexp(k, axis=-1) - jnp.log(k.shape[-1])
+    else:
+        _vd = jax.vmap(distance_fn)
+        vdist = lambda parts, key: _vd(parts)          # key unused: frozen noise
+
+        def pseudo_ll(dist, eps):
+            return -0.5 * (dist / eps) ** 2
 
     def mh_scan(key, parts, lp, dist, eps, log_step):
         def step(carry, k):
             parts, lp, dist, log_step = carry
-            k1, k2 = jax.random.split(k)
+            # the frozen path keeps its historical 2-way split, so its random stream --
+            # and every result already produced with it -- is unchanged
+            if fresh_noise:
+                k1, k2, k3 = jax.random.split(k, 3)
+            else:
+                (k1, k2), k3 = jax.random.split(k), None
             prop = propose(k1, parts, _step_of(log_step))
-            lp_p, dist_p = vprior(prop), vdist(prop)   # N forward evals, vmapped
+            lp_p, dist_p = vprior(prop), vdist(prop, k3)   # N forward evals, vmapped
             hast = jnp.log(prop) - jnp.log(parts)
             if parts.ndim > 1:
                 hast = hast.sum(-1)          # see run_tempered_smc: per-coordinate
@@ -223,7 +246,7 @@ def run_abc_smc(key, init_particles, logprior_fn, distance_fn, eps_schedule,
             acc = jnp.log(jax.random.uniform(k2, (parts.shape[0],))) < logr
             parts = jnp.where(_bcast(acc, parts), prop, parts)
             lp = jnp.where(acc, lp_p, lp)
-            dist = jnp.where(acc, dist_p, dist)
+            dist = jnp.where(_bcast(acc, dist), dist_p, dist)
             a = acc.mean()
             if adapt_rw:
                 log_step = _adapt_log_step(log_step, a, adapt_rate)
@@ -245,7 +268,11 @@ def run_abc_smc(key, init_particles, logprior_fn, distance_fn, eps_schedule,
         parts, lp, dist, acc, log_step = mh_scan(km, parts, lp, dist, eps, log_step)
         return (parts, lp, dist, key, log_step), (ess, acc, jnp.exp(log_step))
 
-    lp0, dist0 = vprior(init_particles), vdist(init_particles)
+    if fresh_noise:
+        key, k0 = jax.random.split(key)
+    else:
+        k0 = None
+    lp0, dist0 = vprior(init_particles), vdist(init_particles, k0)
     eps_pairs = (eps_schedule[:-1], eps_schedule[1:])
     (parts, lp, dist, _, _), (ess, acc, step_hist) = jax.lax.scan(
         stage, (init_particles, lp0, dist0, key, jnp.log(rw_step)), eps_pairs)

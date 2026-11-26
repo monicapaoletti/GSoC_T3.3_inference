@@ -12,6 +12,12 @@
 #           for every replicate instead of at each one's own truth (calibration test 2,
 #           2026-11-26). Goes to its own _stdref<G> directory unless SUFFIX is set.
 #         LIK_ONLY=1 ...   # smc_lik only: a 100-task array, half the cost
+#         FRESH=1 ./sbc_n88_submit.sh FCD 1d   # smc_abc with FRESH simulator noise in every
+#           simulation (--abc_fresh_noise), smc_abc tasks only. FRESH=K>1 averages the ABC
+#           kernel over K noise draws per particle (K x the cost; walltime scaled). Goes to
+#           its own _freshK<K> directory unless SUFFIX is set.
+#         PILOT=4 ...  # only the first 4 replicates and NO aggregation (the aggregation
+#           pass would run every missing replicate serially in one job)
 #
 # Flags are built ONCE here and handed to both the array and the aggregation, so the two
 # cannot drift. That matters: the aggregation normally skips every replicate, but RUNS any
@@ -39,6 +45,7 @@ TAG=""; [ "${ADAPT:-1}" = "1" ] && TAG="_adapt"
 # The draws file names do not record the standardisation reference, so a pinned campaign
 # must never share a directory with an unpinned one.
 [ -n "${STD_REF_G:-}" ] && SUFFIX="${SUFFIX:-stdref${STD_REF_G}}"
+[ -n "${FRESH:-}" ] && SUFFIX="${SUFFIX:-freshK${FRESH}}"
 OUT="$LEO_RESULTS/sbc_n88_${MODE}_${STAT}${TAG}_leonardo${SUFFIX:+_${SUFFIX}}"
 
 # sbc_run.py RESUMES: replicates whose draws_*.npz exist are skipped. Submitting into a
@@ -61,9 +68,18 @@ SBC_FLAGS="--L 100 --scale 0.5 --n_particles 4096 --which_stat $STAT \
 # Tasks 0-99 are smc_lik, 100-199 smc_abc (sbc_n88_array.sh), so LIK_ONLY just stops at 99.
 LAST=199; SAMPLERS="smc_lik smc_abc"
 [ -n "${LIK_ONLY:-}" ] && { LAST=99; SAMPLERS="smc_lik"; }
+FIRST=0; TIMEARG=()
+if [ -n "${FRESH:-}" ]; then
+  [ -n "${LIK_ONLY:-}" ] && { echo "FRESH applies to smc_abc; drop LIK_ONLY" >&2; exit 2; }
+  SBC_FLAGS="$SBC_FLAGS --abc_fresh_noise --abc_n_noise $FRESH"
+  FIRST=100; LAST=199; SAMPLERS="smc_abc"          # tasks 100-199 are smc_abc
+  # ~40 min per replicate per noise draw on the A100, x2 margin
+  TIMEARG=(--time="$(( (FRESH * 80 + 59) / 60 )):00:00")
+fi
 
+[ -n "${PILOT:-}" ] && LAST=$(( FIRST + PILOT - 1 ))
 if [ -n "${DRY:-}" ]; then
-  echo "[dry] out: $OUT"; echo "[dry] array 0-${LAST}%$CONC, flags: $SBC_FLAGS"; exit 0
+  echo "[dry] out: $OUT"; echo "[dry] array ${FIRST}-${LAST}%$CONC ${TIMEARG[*]:-}, flags: $SBC_FLAGS"; exit 0
 fi
 mkdir -p "$OUT/logs"
 mapfile -t FLAGS < <(leo_sbatch_flags)
@@ -72,11 +88,14 @@ DEPARG=(); [ -n "${DEP:-}" ] && DEPARG=(--dependency="$DEP")
 export GSOC_REPO LEO_ACCOUNT LEO_PARTITION LEO_QOS LEO_MAXH LEO_HOME LEO_RESULTS JAX_MODULE
 export STAT MODE OUT SBC_FLAGS
 
-AID=$(sbatch --parsable "${DEPARG[@]}" "${FLAGS[@]}" --array="0-${LAST}%${CONC}" \
+AID=$(sbatch --parsable "${DEPARG[@]}" "${FLAGS[@]}" --array="${FIRST}-${LAST}%${CONC}" "${TIMEARG[@]}" \
         --output="$OUT/logs/sbc88L-%A_%a.out" --export=ALL \
         "$HERE/sbc_n88_array.sh" | cut -d';' -f1)
 echo "[submit] replicate array: $AID  ($STAT, $MODE, ${CONC} concurrent)"
 
+if [ -n "${PILOT:-}" ]; then
+  echo "[submit] PILOT: no aggregation. out_dir: $OUT"; echo "JOBIDS=${AID}"; exit 0
+fi
 AGG="$LEO_ENV_SETUP
 cd $GSOC_REPO/scripts/functions
 for S in $SAMPLERS; do python sbc_run.py $SBC_FLAGS --sampler \$S; done"

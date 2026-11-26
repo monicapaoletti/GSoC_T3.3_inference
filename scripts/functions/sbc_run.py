@@ -89,6 +89,13 @@ def parse_args():
                         "before 2026-11-26 ran). Use a fresh --out_dir: the draws file "
                         "names do not record it, so resuming into an old campaign would "
                         "mix the two.")
+    p.add_argument("--abc_fresh_noise", action="store_true",
+                   help="smc_abc only: pass --abc_fresh_noise (new simulator noise in every "
+                        "simulation instead of the observed data's frozen noise). The inner "
+                        "run records it as sampler smc_abc_fresh[K<n>], and so do the draws "
+                        "and ranks files here.")
+    p.add_argument("--abc_n_noise", type=int, default=1,
+                   help="noise draws per particle with --abc_fresh_noise.")
     p.add_argument("--dry_run", action="store_true",
                    help="print the replicate commands and the prior draws, run nothing")
     return p.parse_args()
@@ -113,13 +120,20 @@ def eta_prior_draws(L, center, sigma, seed):
     return np.exp(rng.normal(np.log(center), sigma, size=L))
 
 
+def sampler_label(a):
+    """The label the inner run writes into its file names (see sampler_label there)."""
+    if not getattr(a, "abc_fresh_noise", False):
+        return a.sampler
+    return a.sampler + "_fresh" + (f"K{a.abc_n_noise}" if a.abc_n_noise > 1 else "")
+
+
 def draws_path(out_dir, G, seed, a, eta=None):
     """Mirror the inner script's TAG so we can find what it wrote (and resume)."""
     backend = "gpu" if os.environ.get("JAX_PLATFORMS", "") != "cpu" else "cpu"
     # mirrors the inference's tag: eta appears only when it differs from the default
     _et = "" if (eta is None or abs(float(eta) - (-4.6)) < 1e-9) else f"_eta{eta}"
     tag = (f"G{G}{_et}_cut{a.cut}_tr{a.tr}_seed{seed}_tend{a.t_end}_ns20_nc1_"
-           f"SC_{a.SC_size}_sampler_{a.sampler}_which_stat_{a.which_stat}_"
+           f"SC_{a.SC_size}_sampler_{sampler_label(a)}_which_stat_{a.which_stat}_"
            f"{backend}_cmvectorized_np{a.n_particles}")
     exact = os.path.join(out_dir, f"draws_{tag}.npz")
     if os.path.exists(exact):
@@ -130,7 +144,7 @@ def draws_path(out_dir, G, seed, a, eta=None):
     # it "draws_G0.2_*seed1000_*" matches BOTH the 1-D file and any 2-D file at the same
     # G and seed, so a 2-D replicate would be reported "already done" and silently reuse
     # a 1-D result -- and a 1-D re-run could pick up a 2-D one.
-    hits = glob.glob(os.path.join(out_dir, f"draws_G{G}{_et}_cut*seed{seed}_*{a.sampler}_"
+    hits = glob.glob(os.path.join(out_dir, f"draws_G{G}{_et}_cut*seed{seed}_*_sampler_{sampler_label(a)}_"
                                            f"which_stat_{a.which_stat}_*.npz"))
     return hits[0] if hits else None
 
@@ -165,6 +179,8 @@ def run_replicate(i, G, a, eta=None):
         cmd += ["--fcd_band", str(a.fcd_band)]
     if a.std_ref_G is not None:
         cmd += ["--std_ref_G", str(a.std_ref_G)]
+    if a.abc_fresh_noise:
+        cmd += ["--abc_fresh_noise", "--abc_n_noise", str(a.abc_n_noise)]
     if a.dry_run:
         print("  " + " ".join(cmd))
         return None
@@ -254,7 +270,7 @@ def main():
 
     ranks = np.asarray(ranks); sizes = np.asarray(sizes)
     suffix = "_2d" if a.infer_eta else ""
-    out = os.path.join(a.out_dir, f"sbc_ranks_{a.sampler}_{a.which_stat}{suffix}.npz")
+    out = os.path.join(a.out_dir, f"sbc_ranks_{sampler_label(a)}_{a.which_stat}{suffix}.npz")
     payload = dict(ranks=ranks, sizes=sizes, G_true=np.asarray(used_G))
     if eta_ranks:
         payload.update(eta_ranks=np.asarray(eta_ranks), eta_sizes=np.asarray(eta_sizes),
@@ -292,13 +308,13 @@ def main():
         ax[0].axhline(exp, color="k", lw=1)
         ax[0].axhspan(exp - 2.576*sd, exp + 2.576*sd, color="k", alpha=0.12, lw=0)
         ax[0].set_xlabel("normalised rank"); ax[0].set_ylabel("count")
-        ax[0].set_title(f"SBC rank histogram ({a.sampler}, {a.which_stat}, L={len(u)})")
+        ax[0].set_title(f"SBC rank histogram ({sampler_label(a)}, {a.which_stat}, L={len(u)})")
         xs = np.sort(u); ecdf = np.arange(1, len(xs)+1) / len(xs)
         ax[1].plot(xs, ecdf - xs, color="#eb6834")
         ax[1].axhline(0, color="k", lw=1)
         ax[1].set_xlabel("normalised rank"); ax[1].set_ylabel("ECDF - uniform")
         ax[1].set_title("ECDF difference")
-        png = os.path.join(a.out_dir, f"sbc_{a.sampler}_{a.which_stat}.png")
+        png = os.path.join(a.out_dir, f"sbc_{sampler_label(a)}_{a.which_stat}.png")
         fig.savefig(png, dpi=300, bbox_inches="tight")
         print(f"[sbc] plot -> {png}")
     except Exception as e:
