@@ -8,6 +8,10 @@
 #         ./sbc_n88_submit.sh FCD 1d               # repeat of UGent sbc_n88_1d_FCD_adapt
 #         ./sbc_n88_submit.sh FCD 2d               # repeat of UGent sbc_n88_2d_FCD_adapt
 #         DRY=1 / DEP=afterany:<id> / ADAPT=0 / SUFFIX=<name> / RESUME=1
+#         STD_REF_G=0.33 ./sbc_n88_submit.sh FCD 1d   # standardisation pinned at G=0.33
+#           for every replicate instead of at each one's own truth (calibration test 2,
+#           2026-11-26). Goes to its own _stdref<G> directory unless SUFFIX is set.
+#         LIK_ONLY=1 ...   # smc_lik only: a 100-task array, half the cost
 #
 # Flags are built ONCE here and handed to both the array and the aggregation, so the two
 # cannot drift. That matters: the aggregation normally skips every replicate, but RUNS any
@@ -32,6 +36,9 @@ case "$MODE" in 1d|2d) ;; *) echo "MODE must be 1d or 2d" >&2; exit 2;; esac
 # can sit side by side under results/. Do NOT point make_paper_assets.py at both at once:
 # _sbc_files does not dedupe, and it would pool the two clusters as one sampler.
 TAG=""; [ "${ADAPT:-1}" = "1" ] && TAG="_adapt"
+# The draws file names do not record the standardisation reference, so a pinned campaign
+# must never share a directory with an unpinned one.
+[ -n "${STD_REF_G:-}" ] && SUFFIX="${SUFFIX:-stdref${STD_REF_G}}"
 OUT="$LEO_RESULTS/sbc_n88_${MODE}_${STAT}${TAG}_leonardo${SUFFIX:+_${SUFFIX}}"
 
 # sbc_run.py RESUMES: replicates whose draws_*.npz exist are skipped. Submitting into a
@@ -50,9 +57,13 @@ SBC_FLAGS="--L 100 --scale 0.5 --n_particles 4096 --which_stat $STAT \
 # Without adaptation the n=88 SMC kernel collapses (accept 0.002, 6-10% unique particles
 # in 2-D). On by default, as in the UGent _adapt campaigns this one is compared against.
 [ "${ADAPT:-1}" = "1" ] && SBC_FLAGS="$SBC_FLAGS --adapt_rw"
+[ -n "${STD_REF_G:-}" ] && SBC_FLAGS="$SBC_FLAGS --std_ref_G $STD_REF_G"
+# Tasks 0-99 are smc_lik, 100-199 smc_abc (sbc_n88_array.sh), so LIK_ONLY just stops at 99.
+LAST=199; SAMPLERS="smc_lik smc_abc"
+[ -n "${LIK_ONLY:-}" ] && { LAST=99; SAMPLERS="smc_lik"; }
 
 if [ -n "${DRY:-}" ]; then
-  echo "[dry] out: $OUT"; echo "[dry] array 0-199%$CONC, flags: $SBC_FLAGS"; exit 0
+  echo "[dry] out: $OUT"; echo "[dry] array 0-${LAST}%$CONC, flags: $SBC_FLAGS"; exit 0
 fi
 mkdir -p "$OUT/logs"
 mapfile -t FLAGS < <(leo_sbatch_flags)
@@ -61,14 +72,14 @@ DEPARG=(); [ -n "${DEP:-}" ] && DEPARG=(--dependency="$DEP")
 export GSOC_REPO LEO_ACCOUNT LEO_PARTITION LEO_QOS LEO_MAXH LEO_HOME LEO_RESULTS JAX_MODULE
 export STAT MODE OUT SBC_FLAGS
 
-AID=$(sbatch --parsable "${DEPARG[@]}" "${FLAGS[@]}" --array="0-199%${CONC}" \
+AID=$(sbatch --parsable "${DEPARG[@]}" "${FLAGS[@]}" --array="0-${LAST}%${CONC}" \
         --output="$OUT/logs/sbc88L-%A_%a.out" --export=ALL \
         "$HERE/sbc_n88_array.sh" | cut -d';' -f1)
 echo "[submit] replicate array: $AID  ($STAT, $MODE, ${CONC} concurrent)"
 
 AGG="$LEO_ENV_SETUP
 cd $GSOC_REPO/scripts/functions
-for S in smc_lik smc_abc; do python sbc_run.py $SBC_FLAGS --sampler \$S; done"
+for S in $SAMPLERS; do python sbc_run.py $SBC_FLAGS --sampler \$S; done"
 BID=$(sbatch --parsable --dependency="afterany:${AID}" "${FLAGS[@]}" \
         --job-name="sbc88Lagg" --time=02:00:00 \
         --output="$OUT/logs/sbc88Lagg-%j.out" --wrap="$AGG" | cut -d';' -f1)

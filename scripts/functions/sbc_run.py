@@ -82,6 +82,13 @@ def parse_args():
                         "inference derived its own centre from the replicate's --eta, so "
                         "every posterior was scored against a prior sitting on its own "
                         "truth and the 2-D SBC tested something other than calibration.")
+    p.add_argument("--std_ref_G", type=float, default=None,
+                   help="pass --std_ref_G to the inference: compute the feature "
+                        "standardisation at this FIXED G for every replicate instead of at "
+                        "each replicate's own truth (the default, and what every campaign "
+                        "before 2026-11-26 ran). Use a fresh --out_dir: the draws file "
+                        "names do not record it, so resuming into an old campaign would "
+                        "mix the two.")
     p.add_argument("--dry_run", action="store_true",
                    help="print the replicate commands and the prior draws, run nothing")
     return p.parse_args()
@@ -156,6 +163,8 @@ def run_replicate(i, G, a, eta=None):
         cmd += ["--adapt_rw"]
     if a.fcd_band:
         cmd += ["--fcd_band", str(a.fcd_band)]
+    if a.std_ref_G is not None:
+        cmd += ["--std_ref_G", str(a.std_ref_G)]
     if a.dry_run:
         print("  " + " ".join(cmd))
         return None

@@ -63,9 +63,19 @@ def parse_args():
                         help="slice shrinkage bound; see --slice_max_expand. Old 10/20 "
                              "defaults = 40 evals/step and left R-hat ~2.95 unconverged")
 
-    parser.add_argument("--wwidth", type=int, default=30)
+    # These three were DEAD: wrapper_fcd, make_forward_fn and the starts precompute all
+    # hardcoded wwidth=30, olap=0.94, so the flags parsed and were ignored. They are live
+    # now, and the defaults are set to the hardcoded values (NOT the old --olap 0.5, which
+    # never took effect) so every existing result reproduces byte-for-byte.
+    parser.add_argument("--wwidth", type=int, default=30,
+                        help="FCD sliding-window length, in samples of the decimated BOLD.")
     parser.add_argument("--maxWindows", type=int, default=200)
-    parser.add_argument("--olap", type=float, default=0.5)
+    parser.add_argument("--olap", type=float, default=0.94,
+                        help="FCD window overlap. At the 0.94 default the shift is 2 "
+                             "samples, so neighbouring windows share 28 of 30 points and "
+                             "the FCD matrix is largely redundant -- which the Gaussian "
+                             "likelihood then treats as independent evidence. Lowering it "
+                             "trades feature count for independence.")
 
     # Inference settings
     parser.add_argument("--obs_err", type=float, default=1.0,
@@ -113,6 +123,33 @@ def parse_args():
                     help="random-walk MH moves per SMC stage.")
     parser.add_argument("--rw_step", type=float, default=0.1,
                     help="log-space random-walk proposal scale for the SMC MH move.")
+    parser.add_argument("--std_ref_G", type=float, default=None,
+                    help="Compute the feature standardisation at THIS fixed G instead of "
+                         "the run's own --G. Default (None) reproduces the historical "
+                         "behaviour, which derives the centring and scaling from the "
+                         "replicate's ground truth -- a quantity SBC requires to be the "
+                         "same for every replicate. Set it to a fixed reference to test "
+                         "whether that dependence is what breaks calibration at 88 nodes.")
+    parser.add_argument("--profile_grid", type=int, default=0,
+                    help="DIAGNOSTIC, no sampling: evaluate the exact log-likelihood and "
+                         "the ABC distance on this many values of G, write them beside the "
+                         "other outputs, and exit. It answers a question no sampler can: "
+                         "where does the LIKELIHOOD itself peak relative to the truth? If "
+                         "its optimum sits off G_true, the miscalibration is in the "
+                         "forward/statistic/likelihood and every sampler is exonerated. "
+                         "Uses the identical obs, standardisation, seed and forward as a "
+                         "real run, which is why it lives here and not in a separate "
+                         "script that could drift from the pipeline.")
+    parser.add_argument("--profile_gmax", type=float, default=None,
+                    help="upper end of the --profile_grid sweep (default 4x --G, min 0.05).")
+    parser.add_argument("--profile_gmin", type=float, default=None,
+                    help="lower end of the sweep (default 1e-4). The default [1e-4, 4G] "
+                         "window is USELESS for measuring a small displacement: at 61 "
+                         "points its spacing is 0.02-0.08, coarser than the ~0.011 bias "
+                         "it would be measuring, and worse, linspace(1e-4, 4G, 61) has a "
+                         "node at exactly G+7.5e-5, so it reports 'peak at the truth' "
+                         "whenever the peak is merely near it. Pass a tight window around "
+                         "the truth to resolve the offset instead.")
     parser.add_argument("--adapt_rw", action="store_true",
                     help="tune the SMC random-walk scale toward 0.234 acceptance instead "
                          "of holding --rw_step fixed (--rw_step then only starts it). At "
@@ -285,7 +322,7 @@ def wrapper_fc(G, par, cut, tr, starts, nn, grad_horizon=0, fast_bold=False, eps
 
 @timer
 def wrapper_fcd(G, par, cut, tr, starts, nn, grad_horizon=0, fast_bold=False, eps=0.0,
-                fisher_z=False, keep_negative=False, fcd_band=0):
+                fisher_z=False, keep_negative=False, fcd_band=0, wwidth=30, olap=0.94):
     par = deepcopy(par)
     par = _apply_theta(par, G)
     sde = mpr_jax.MPR_sde.create(par)
@@ -296,7 +333,7 @@ def wrapper_fcd(G, par, cut, tr, starts, nn, grad_horizon=0, fast_bold=False, ep
 
     # non-jitted extract (we're already inside numpyro's traced/jitted model, and
     # this lets eps be a concrete float for the stabilised correlation)
-    FCD_full = extract_FCD_jax(bold_d_sub, starts, nn, wwidth=30, olap=0.94, eps=eps, keep_negative=keep_negative)
+    FCD_full = extract_FCD_jax(bold_d_sub, starts, nn, wwidth=wwidth, olap=olap, eps=eps, keep_negative=keep_negative)
     #print(FCD_full)
     tri_idx = _fcd_indices(FCD_full.shape[0], k=30, band=fcd_band)
     v = FCD_full[tri_idx]
@@ -306,7 +343,7 @@ def wrapper_fcd(G, par, cut, tr, starts, nn, grad_horizon=0, fast_bold=False, ep
 # ------------------ per-feature scatter (for --standardize_features) ------------------
 def feature_reference_scatter(par, which_stat, cut, tr, starts, nn,
                               fast_bold=False, eps=0.0, n_ref=8, base_seed=10_000,
-                              fcd_band=0,
+                              fcd_band=0, wwidth=30, olap=0.94,
                               fisher_z=False, keep_negative=False):
     """Per-feature mean/std of the FC/FCD statistic over n_ref noise seeds. Mirrors
     mpr_jax_pymc.feature_reference_scatter; extraction matches wrapper_fc/fcd so the
@@ -318,7 +355,8 @@ def feature_reference_scatter(par, which_stat, cut, tr, starts, nn,
         # fcd_band MUST match the model's: this scatter standardises the features, so
         # an unbanded reference against a banded forward is a straight shape mismatch
         # (345696 vs 24495 at t_end=300000) that only appears at long horizons.
-        v = wrap(G=p["G"], par=p, cut=cut, tr=tr, starts=starts, nn=nn, fcd_band=fcd_band,
+        _kw = {} if which_stat == "FC" else {"wwidth": wwidth, "olap": olap}
+        v = wrap(G=p["G"], par=p, cut=cut, tr=tr, starts=starts, nn=nn, fcd_band=fcd_band, **_kw,
                  grad_horizon=0, fast_bold=fast_bold, eps=eps, fisher_z=fisher_z,
                  keep_negative=keep_negative)
         reps.append(np.asarray(v, dtype=np.float32))
@@ -331,7 +369,7 @@ def feature_reference_scatter(par, which_stat, cut, tr, starts, nn,
 # ------------------ Forward model (shared by NumPyro NUTS + BlackJAX) ------------------
 def make_forward_fn(par, which_stat, cut, tr, starts, nn, grad_horizon=0, fcd_band=0,
                     fast_bold=False, eps=0.0, grad_method="fd", fd_h=1e-2,
-                    fisher_z=False, keep_negative=False):
+                    fisher_z=False, keep_negative=False, wwidth=30, olap=0.94):
     """Return forward_fn(G) -> flat FC/FCD statistic, matching wrapper_fc/fcd.
 
     grad_method="autodiff": plain JAX forward (autodiff gradient — unreliable in
@@ -340,6 +378,7 @@ def make_forward_fn(par, which_stat, cut, tr, starts, nn, grad_horizon=0, fcd_ba
     noise is frozen). This lets NumPyro/BlackJAX NUTS run on-device with the
     reliable FD gradient instead of the exploding autodiff one."""
     base = dict(par)
+    _wwidth, _olap = wwidth, olap
 
     def raw(G):
         p = _apply_theta(dict(base), G)
@@ -350,7 +389,7 @@ def make_forward_fn(par, which_stat, cut, tr, starts, nn, grad_horizon=0, fcd_ba
             v = F[jnp.triu_indices(F.shape[0], k=1)]
         else:
             sub = bold[cut::tr].T
-            F = extract_FCD_jax(sub, starts, nn, wwidth=30, olap=0.94, eps=eps, keep_negative=keep_negative)
+            F = extract_FCD_jax(sub, starts, nn, wwidth=_wwidth, olap=_olap, eps=eps, keep_negative=keep_negative)
             v = F[_fcd_indices(F.shape[0], k=30, band=fcd_band)]
         return _fisher_z(v) if fisher_z else v
 
@@ -568,7 +607,8 @@ def main():
         T = int(_ref_bold[cut::tr].shape[0])
     else:
         T = (t_end - cut) // tr
-    shift, starts = precompute_shift_and_starts(T, wwidth=30, olap=0.94, stride1=args.fcd_stride1)
+    shift, starts = precompute_shift_and_starts(T, wwidth=args.wwidth, olap=args.olap,
+                                                stride1=args.fcd_stride1)
 
     # observed data uses fast_bold/eps/fisher_z for consistency with the model;
     # grad_horizon is irrelevant here (no gradient) so we leave it at 0.
@@ -579,6 +619,7 @@ def main():
     # Single config-baked forward used by the model (custom_vjp FD gradient by
     # default so NUTS/BlackJAX get the reliable finite-difference gradient).
     forward_fn = make_forward_fn(params, which_stat, cut, tr, starts, nn,
+                                 wwidth=args.wwidth, olap=args.olap,
                                  grad_horizon=args.grad_horizon, fcd_band=args.fcd_band,
                                  fast_bold=args.fast_bold,
                                  eps=args.fc_eps, grad_method=args.grad_method, fd_h=args.fd_h,
@@ -588,8 +629,17 @@ def main():
     # both the model forward and the observed, so a scalar obs_err is a unit-scale
     # sigma. Identity when off -> unchanged behaviour. ---
     if args.standardize_features:
+        # The reference simulations default to params (hence to the run's own true G).
+        # --std_ref_G pins them to a fixed G so the standardisation is identical across
+        # replicates, which is what SBC's uniformity result assumes.
+        _std_par = dict(params)
+        if args.std_ref_G is not None:
+            _std_par["G"] = float(args.std_ref_G)
+            print(f"Standardisation reference pinned to G={args.std_ref_G} "
+                  f"(run's own G_true={float(params['G']):.6f})")
         feat_mu, feat_sd = feature_reference_scatter(
-            params, which_stat, cut, tr, starts, nn, fast_bold=args.fast_bold,
+            _std_par, which_stat, cut, tr, starts, nn, fast_bold=args.fast_bold,
+            wwidth=args.wwidth, olap=args.olap,
             eps=args.fc_eps, n_ref=args.n_ref_seeds, fisher_z=args.fisher_z,
             keep_negative=args.keep_negative_fc, fcd_band=args.fcd_band)
         print(f"Standardizing {which_stat} features over {args.n_ref_seeds} noise seeds: "
@@ -612,6 +662,30 @@ def main():
             "grad_horizon": args.grad_horizon, "fast_bold": args.fast_bold, "eps": args.fc_eps,
             "forward_fn": forward_fn}
     prior_specs = {"scale_G": scale}
+
+    # --- diagnostic: profile the likelihood over G, then stop (see --profile_grid) ---
+    if args.profile_grid > 0:
+        _gmax = args.profile_gmax if args.profile_gmax is not None else max(4.0 * G, 0.05)
+        _gmin = args.profile_gmin if args.profile_gmin is not None else 1e-4
+        _grid = jnp.linspace(max(_gmin, 1e-6), _gmax, args.profile_grid)
+        _obs = jnp.asarray(FC_obs_flat)
+        _ll = jax.vmap(lambda g: jnp.sum(dist.Normal(forward_fn(g), obs_err).log_prob(_obs)))(_grid)
+        _d = jax.vmap(lambda g: jnp.sqrt(jnp.sum((forward_fn(g) - _obs) ** 2)))(_grid)
+        _grid, _ll, _d = (np.asarray(x) for x in (_grid, _ll, _d))
+        _fin = np.isfinite(_ll)
+        _gml = float(_grid[_fin][np.argmax(_ll[_fin])]) if _fin.any() else float("nan")
+        _gmd = float(_grid[np.argmin(_d)])
+        os.makedirs(resultspath, exist_ok=True)
+        _fp = os.path.join(resultspath, f"profile_{tag}.csv")
+        pd.DataFrame({"G": _grid, "loglik": _ll, "abc_dist": _d}).to_csv(_fp, index=False)
+        print(f"[profile] stat={which_stat} SC={SC_size} std_ref_G={args.std_ref_G} "
+              f"window=[{float(_grid[0]):.6f},{float(_grid[-1]):.6f}] "
+              f"spacing={float(_grid[1]-_grid[0]):.6f}")
+        print(f"[profile] G_true={G:.6f}  argmax loglik={_gml:.6f}  argmin dist={_gmd:.6f}  "
+              f"rel_err_ll={(_gml - G) / max(G, 1e-12):+.4f}  "
+              f"rel_err_dist={(_gmd - G) / max(G, 1e-12):+.4f}")
+        print(f"[profile] wrote {_fp}")
+        return
 
     os.makedirs(resultspath, exist_ok=True)
 
@@ -1018,6 +1092,7 @@ def main():
     # --- comprehensive benchmark metrics (same schema/file as mpr_jax_pymc.py) ---
     try:
         fwd_eval = make_forward_fn(params, which_stat, cut, tr, starts, nn,
+                                   wwidth=args.wwidth, olap=args.olap,
                                    grad_horizon=0, fcd_band=args.fcd_band,
                                    fast_bold=args.fast_bold,
                                    eps=args.fc_eps, grad_method="autodiff")
