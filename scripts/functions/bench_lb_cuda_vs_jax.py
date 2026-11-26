@@ -88,8 +88,12 @@ def parse_args():
     ap.add_argument("--eq_steps", type=int, default=20000, help="T1/T2 length (steps)")
     ap.add_argument("--stat_steps", type=int, default=200000, help="T3 length (steps)")
     ap.add_argument("--stat_reps", type=int, default=8, help="T3 independent runs per code")
-    ap.add_argument("--time_steps", type=int, default=10000, help="timing length (steps)")
-    ap.add_argument("--batches", type=int, nargs="+", default=[1, 16, 256, 1024, 4096])
+    ap.add_argument("--time_steps", type=int, default=10000,
+                    help="timing length (steps): the SAME simulated time at every batch size")
+    ap.add_argument("--batches", type=int, nargs="+",
+                    default=[1, 4, 16, 64, 256, 1024, 4096, 16384],
+                    help="number of simulations run at once (geometric sweep)")
+    ap.add_argument("--reps", type=int, default=3, help="timed repeats per point (median kept)")
     ap.add_argument("--jax_cpu_batches", type=int, nargs="*", default=[1, 16],
                     help="also time JAX on the CPU at these batch sizes")
     ap.add_argument("--skip", nargs="*", default=[], choices=["T1", "T2", "T3", "timing"])
@@ -251,15 +255,18 @@ def make_jax(lb, P, chunk, n_chunks, coupling, rng_mode):
     return f, (lambda: setattr(lb, "_coupling", orig))
 
 
-def jax_run(f, restore, *args):
+def jax_run(f, restore, *args, reps=1):
     import jax
     try:
         t0 = time.perf_counter()
         out = jax.block_until_ready(f(*args))
         first = time.perf_counter() - t0
-        t0 = time.perf_counter()
-        out = jax.block_until_ready(f(*args))
-        run = time.perf_counter() - t0
+        runs = []
+        for _ in range(reps):
+            t0 = time.perf_counter()
+            out = jax.block_until_ready(f(*args))
+            runs.append(time.perf_counter() - t0)
+        run = float(np.median(runs))
     finally:
         restore()
     return np.asarray(out), first - run, run         # compile ~= first call - steady call
@@ -355,6 +362,13 @@ def summary_stats(tj, tk, a):
 
 
 def timing(lb, cuda, P, a, nn, results):
+    """Fixed simulated time (a.time_steps steps), growing number of simulations.
+
+    Fair-comparison rules: both codes run the SAME equations (lb_jax with the kernel's
+    coupling), the same float32, the same GPU, and produce the same output (V averaged
+    per `chunk` window). Compile time is reported separately and excluded from the run
+    time; each point is the median of a.reps runs. The CUDA time includes its Python
+    launch loop (one launch per window), because that is how the kernel is driven."""
     import jax
     import jax.numpy as jnp
     n_chunks = a.time_steps // a.chunk
@@ -363,13 +377,27 @@ def timing(lb, cuda, P, a, nn, results):
     for B in a.batches:
         V, W, Z, eta = shared_init(rng, nn, B)
         p = cuda.params(B, a)
-        cuda.run(p, a.chunk, a.chunk)                                  # warm-up launch
-        t0 = time.perf_counter()
-        cuda.run(p, a.time_steps, a.chunk)
-        tc = time.perf_counter() - t0
+        try:
+            cuda.run(p, a.chunk, a.chunk)                              # warm-up launch
+            tcs = []
+            for _ in range(a.reps):
+                t0 = time.perf_counter()
+                cuda.run(p, a.time_steps, a.chunk)
+                tcs.append(time.perf_counter() - t0)
+            tc = float(np.median(tcs))
+        except Exception as e:                       # e.g. out of memory at the largest batch
+            print(f"[timing] B={B}: CUDA failed: {e!r}"[:300], flush=True)
+            break
+        finally:
+            cuda.cp.get_default_memory_pool().free_all_blocks()
         keys = jax.random.split(jax.random.PRNGKey(0), B)
         f, restore = make_jax(lb, P, a.chunk, n_chunks, "kernel", "key")
-        _, comp, tj = jax_run(f, restore, jnp.full(B, a.G, jnp.float32), V, W, Z, eta, keys)
+        try:
+            _, comp, tj = jax_run(f, restore, jnp.full(B, a.G, jnp.float32), V, W, Z, eta,
+                                  keys, reps=a.reps)
+        except Exception as e:
+            print(f"[timing] B={B}: JAX failed: {e!r}"[:300], flush=True)
+            break
         row = {"batch": B, "cuda_s": tc, "jax_gpu_s": tj, "jax_gpu_compile_s": comp}
         if B in a.jax_cpu_batches:
             try:
@@ -388,8 +416,43 @@ def timing(lb, cuda, P, a, nn, results):
         rows.append(row)
         print(f"[timing] B={B:5d}  cuda {tc:8.2f}s  jax-gpu {tj:8.2f}s"
               + (f"  jax-cpu {row['jax_cpu_s']:8.2f}s" if "jax_cpu_s" in row else ""), flush=True)
-    results["timing"] = {"steps": a.time_steps, "cuda_compile_s_both_modules": cuda.compile_s,
-                         "rows": rows}
+    results["timing"] = {"steps": a.time_steps, "simulated_ms": a.time_steps * a.dt,
+                         "cuda_compile_s_both_modules": cuda.compile_s, "rows": rows}
+    plot_timing(results["timing"], a.out)
+
+
+def plot_timing(t, out):
+    """time per run and simulations per second vs batch size, log-log."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return
+    rows = t["rows"]
+    if not rows:
+        return
+    B = [r["batch"] for r in rows]
+    fig, ax = plt.subplots(1, 2, figsize=(10, 4))
+    for key, lab, mk in (("cuda_s", "CUDA kernel", "o"), ("jax_gpu_s", "JAX GPU", "s"),
+                         ("jax_cpu_s", "JAX CPU", "^")):
+        pts = [(r["batch"], r[key]) for r in rows if key in r]
+        if not pts:
+            continue
+        b, s = zip(*pts)
+        ax[0].loglog(b, s, mk + "-", label=lab)
+        ax[1].loglog(b, np.array(b) / np.array(s), mk + "-", label=lab)
+    ax[0].set(xlabel="simulations per run (batch)", ylabel="wall time per run [s]",
+              title=f"{t['simulated_ms']:.0f} ms simulated, 88 nodes")
+    ax[1].set(xlabel="simulations per run (batch)", ylabel="simulations / s",
+              title="throughput")
+    for x in ax:
+        x.set_xticks(B)
+        x.set_xticklabels([str(b) for b in B], rotation=45)
+        x.grid(True, which="both", alpha=0.3)
+        x.legend()
+    fig.tight_layout()
+    fig.savefig(os.path.join(out, "timing.png"), dpi=130)
 
 
 # --------------------------------------------------------------------------- main

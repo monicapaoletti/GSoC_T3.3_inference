@@ -58,6 +58,13 @@ OUT="$LEO_RESULTS/nuts_n88_leonardo${JAX_MODULE:+_module_${JAX_MODULE//[\/ ]/_}}
 mkdir -p "$OUT/logs"
 mapfile -t FLAGS < <(leo_sbatch_flags)
 
+# The SAME model/data settings as the gradient-free benchmark (run_gpu_pool.py COMMON),
+# so NUTS is comparable cell for cell. Without them mpr_jax_numpyro.py falls back to its
+# own defaults (t_end=3000, tr=5), whose BOLD series is too short for a 30-sample FCD
+# window: the first pilot (65244747) died in 17 s on exactly that. --grad_horizon is left
+# at 0 on purpose: a non-zero horizon zeroes the autodiff gradient, and fd ignores it.
+MODEL="--SC_type data --fast_bold --cut 10 --tr 1 --t_end 30000 --seed 42"
+
 SUBMITTED=""
 submit () {          # submit <name> <hours> <mpr_jax_numpyro.py args...>
   local name="$1" hours; hours=$(leo_hours "$2"); shift 2
@@ -65,7 +72,7 @@ submit () {          # submit <name> <hours> <mpr_jax_numpyro.py args...>
   local cmd="$LEO_ENV_SETUP
 python -c 'import jax; print(\"jax\", jax.__version__, jax.devices())'
 cd $GSOC_REPO/scripts/functions
-python mpr_jax_numpyro.py --sampler nuts --chain_method vectorized $* --SC_size 88 --save_dir $OUT"
+python mpr_jax_numpyro.py --sampler nuts --chain_method vectorized $MODEL $* --SC_size 88 --save_dir $OUT"
   if [ -n "${DRY:-}" ]; then echo "[dry] ${name} (${hours}h): $*"; return; fi
   local id
   id=$(sbatch --parsable "${dep[@]}" "${FLAGS[@]}" --job-name="$name" --time="${hours}:00:00" \
@@ -78,8 +85,12 @@ eps_flag () { [ "$1" = "FCD" ] && echo "--fc_eps 1e-6" || echo ""; }
 
 if [ -n "${PILOT:-}" ]; then
   STAT="${STATS[0]}"
+  # Short on purpose: 100+100 draws and trees capped at depth 6 (<= 63 leapfrog steps,
+  # each an fd gradient = forward simulations at 88 nodes, ~5-6 s per batched call on the
+  # A100). The point is the cost per iteration and the tree depth NUTS picks, which
+  # calibrate the full sweep -- not a converged posterior.
   submit "nutsL_pilot_${STAT}" 12 \
-    --n_chains 32 --n_warmup 500 --n_samples 500 --grad_method fd \
+    --n_chains 32 --n_warmup 100 --n_samples 100 --max_tree_depth 6 --grad_method fd \
     --which_stat "$STAT" --G 0.5 $(eps_flag "$STAT")
   if [ -n "${JAX_MODULE:-}" ]; then
     submit "nutsL_pilot_autodiff_${STAT}" 6 \
